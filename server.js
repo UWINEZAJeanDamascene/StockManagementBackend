@@ -69,6 +69,7 @@ if (process.env.NODE_ENV === 'development') {
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/companies', require('./routes/companyRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/products', require('./routes/productRoutes'));
 app.use('/api/categories', require('./routes/categoryRoutes'));
@@ -97,6 +98,7 @@ app.get('/', (req, res) => {
     message: 'Stock Management System API',
     endpoints: [
       '/api/auth',
+      '/api/companies',
       '/api/users',
       '/api/products',
       '/api/categories',
