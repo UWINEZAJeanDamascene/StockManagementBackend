@@ -6,7 +6,9 @@ const {
   createUser,
   updateUser,
   deleteUser,
-  getUserActionLogs
+  getUserActionLogs,
+  resetPassword,
+  toggleUserStatus
 } = require('../controllers/userController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
@@ -22,6 +24,10 @@ router.route('/:id')
   .get(getUser)
   .put(logAction('user'), updateUser)
   .delete(logAction('user'), deleteUser);
+
+// Admin-only special actions
+router.post('/:id/reset-password', logAction('user'), resetPassword);
+router.put('/:id/toggle-status', logAction('user'), toggleUserStatus);
 
 router.get('/:id/action-logs', getUserActionLogs);
 

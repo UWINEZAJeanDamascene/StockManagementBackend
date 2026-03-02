@@ -20,17 +20,17 @@ router.use(protect);
 
 router.route('/')
   .get(getProducts)
-  .post(authorize('admin', 'stock_manager'), logAction('product'), createProduct);
+  .post(authorize('admin'), logAction('product'), createProduct);
 
 router.get('/low-stock', getLowStockProducts);
 
 router.route('/:id')
   .get(getProduct)
-  .put(authorize('admin', 'stock_manager'), logAction('product'), updateProduct)
-  .delete(authorize('admin', 'stock_manager'), logAction('product'), deleteProduct);
+  .put(authorize('admin'), logAction('product'), updateProduct)
+  .delete(authorize('admin'), logAction('product'), deleteProduct);
 
-router.put('/:id/archive', authorize('admin', 'stock_manager'), logAction('product'), archiveProduct);
-router.put('/:id/restore', authorize('admin', 'stock_manager'), logAction('product'), restoreProduct);
+router.put('/:id/archive', authorize('admin'), logAction('product'), archiveProduct);
+router.put('/:id/restore', authorize('admin'), logAction('product'), restoreProduct);
 router.get('/:id/history', getProductHistory);
 router.get('/:id/lifecycle', getProductLifecycle);
 

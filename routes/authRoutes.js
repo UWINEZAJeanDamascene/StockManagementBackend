@@ -7,9 +7,10 @@ const {
   updatePassword,
   logout
 } = require('../controllers/authController');
-const { protect } = require('../middleware/auth');
+const { protect, authorize } = require('../middleware/auth');
 
-router.post('/register', register);
+// Admin-only routes for user management
+router.post('/register', protect, authorize('admin'), register);
 router.post('/login', login);
 router.get('/me', protect, getMe);
 router.put('/update-password', protect, updatePassword);

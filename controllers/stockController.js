@@ -15,10 +15,23 @@ exports.getStockMovements = async (req, res, next) => {
       productId,
       supplierId,
       startDate,
-      endDate
+      endDate,
+      search
     } = req.query;
 
     const query = {};
+
+    // Search by product name
+    if (search && search.trim()) {
+      const products = await Product.find({
+        name: { $regex: search, $options: 'i' }
+      }).select('_id');
+      
+      if (products.length > 0) {
+        const productIds = products.map(p => p._id);
+        query.product = { $in: productIds };
+      }
+    }
 
     if (type) query.type = type;
     if (reason) query.reason = reason;

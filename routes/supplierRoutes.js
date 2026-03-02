@@ -16,15 +16,15 @@ router.use(protect);
 
 router.route('/')
   .get(getSuppliers)
-  .post(authorize('admin', 'stock_manager'), logAction('supplier'), createSupplier);
+  .post(authorize('admin'), logAction('supplier'), createSupplier);
 
 router.route('/:id')
   .get(getSupplier)
-  .put(authorize('admin', 'stock_manager'), logAction('supplier'), updateSupplier)
+  .put(authorize('admin'), logAction('supplier'), updateSupplier)
   .delete(authorize('admin'), logAction('supplier'), deleteSupplier);
 
 router.get('/:id/purchase-history', getSupplierPurchaseHistory);
 
-router.put('/:id/toggle-status', authorize('admin', 'stock_manager'), logAction('supplier'), toggleSupplierStatus);
+router.put('/:id/toggle-status', authorize('admin'), logAction('supplier'), toggleSupplierStatus);
 
 module.exports = router;

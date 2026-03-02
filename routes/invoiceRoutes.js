@@ -21,18 +21,18 @@ router.use(protect);
 
 router.route('/')
   .get(getInvoices)
-  .post(authorize('admin', 'stock_manager', 'sales'), logAction('invoice'), createInvoice);
+  .post(authorize('admin', 'sales'), logAction('invoice'), createInvoice);
 
 router.route('/:id')
   .get(getInvoice)
-  .put(authorize('admin', 'stock_manager', 'sales'), logAction('invoice'), updateInvoice)
-  .delete(authorize('admin', 'user_manager'), logAction('invoice'), deleteInvoice);
+  .put(authorize('admin', 'sales'), logAction('invoice'), updateInvoice)
+  .delete(authorize('admin'), logAction('invoice'), deleteInvoice);
 
 // Confirm invoice (deducts stock)
-router.put('/:id/confirm', authorize('admin', 'stock_manager'), logAction('invoice'), confirmInvoice);
+router.put('/:id/confirm', authorize('admin'), logAction('invoice'), confirmInvoice);
 
 // Record payment
-router.post('/:id/payment', authorize('admin', 'stock_manager', 'sales'), logAction('invoice'), recordPayment);
+router.post('/:id/payment', authorize('admin', 'sales'), logAction('invoice'), recordPayment);
 
 // Cancel invoice (reverses stock)
 router.put('/:id/cancel', authorize('admin'), logAction('invoice'), cancelInvoice);

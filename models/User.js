@@ -36,6 +36,19 @@ const userSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
+  },
+  // Password management fields
+  mustChangePassword: {
+    type: Boolean,
+    default: false
+  },
+  passwordChangedAt: {
+    type: Date,
+    default: null
+  },
+  tempPassword: {
+    type: Boolean,
+    default: false
   }
 }, {
   timestamps: true

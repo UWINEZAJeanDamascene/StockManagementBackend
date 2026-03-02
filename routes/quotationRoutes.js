@@ -19,18 +19,18 @@ router.use(protect);
 
 router.route('/')
   .get(getQuotations)
-  .post(authorize('admin', 'stock_manager', 'sales'), logAction('quotation'), createQuotation);
+  .post(authorize('admin', 'sales'), logAction('quotation'), createQuotation);
 
 // PDF route must come BEFORE :id route
 router.get('/:id/pdf', generateQuotationPDF);
 
 router.route('/:id')
   .get(getQuotation)
-  .put(authorize('admin', 'stock_manager', 'sales'), logAction('quotation'), updateQuotation)
+  .put(authorize('admin', 'sales'), logAction('quotation'), updateQuotation)
   .delete(authorize('admin', 'sales'), logAction('quotation'), deleteQuotation);
 
-router.put('/:id/approve', authorize('admin', 'stock_manager'), logAction('quotation'), approveQuotation);
-router.post('/:id/convert-to-invoice', authorize('admin', 'stock_manager', 'sales'), logAction('quotation'), convertToInvoice);
+router.put('/:id/approve', authorize('admin'), logAction('quotation'), approveQuotation);
+router.post('/:id/convert-to-invoice', authorize('admin', 'sales'), logAction('quotation'), convertToInvoice);
 router.get('/client/:clientId', getClientQuotations);
 router.get('/product/:productId', getProductQuotations);
 

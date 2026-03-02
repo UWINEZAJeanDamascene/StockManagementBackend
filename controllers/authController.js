@@ -8,12 +8,12 @@ const generateToken = (id) => {
   });
 };
 
-// @desc    Register user
+// @desc    Register user (Admin only - for creating users)
 // @route   POST /api/auth/register
-// @access  Public (but should be restricted in production)
+// @access  Private (Admin)
 exports.register = async (req, res, next) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, mustChangePassword } = req.body;
 
     // Check if user exists
     const userExists = await User.findOne({ email });
@@ -30,7 +30,9 @@ exports.register = async (req, res, next) => {
       email,
       password,
       role: role || 'viewer',
-      createdBy: req.user?._id
+      createdBy: req.user?._id,
+      mustChangePassword: mustChangePassword || false,
+      tempPassword: mustChangePassword || false
     });
 
     // Generate token
@@ -89,6 +91,9 @@ exports.login = async (req, res, next) => {
       });
     }
 
+    // Check if account requires password change (first login with temp password)
+    const requirePasswordChange = user.mustChangePassword;
+
     // Update last login
     user.lastLogin = new Date();
     await user.save();
@@ -99,7 +104,8 @@ exports.login = async (req, res, next) => {
     res.json({
       success: true,
       data: user,
-      token
+      token,
+      requirePasswordChange
     });
   } catch (error) {
     next(error);
@@ -149,6 +155,9 @@ exports.updatePassword = async (req, res, next) => {
     }
 
     user.password = newPassword;
+    user.passwordChangedAt = new Date();
+    user.mustChangePassword = false;
+    user.tempPassword = false;
     await user.save();
 
     const token = generateToken(user._id);

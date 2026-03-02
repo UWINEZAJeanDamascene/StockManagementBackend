@@ -1,6 +1,16 @@
 const User = require('../models/User');
 const ActionLog = require('../models/ActionLog');
 
+// Generate a random temporary password
+const generateTempPassword = (length = 8) => {
+  const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+  let password = '';
+  for (let i = 0; i < length; i++) {
+    password += charset.charAt(Math.floor(Math.random() * charset.length));
+  }
+  return password;
+};
+
 // @desc    Get all users
 // @route   GET /api/users
 // @access  Private (admin)
@@ -61,18 +71,40 @@ exports.getUser = async (req, res, next) => {
   }
 };
 
-// @desc    Create new user
+// @desc    Create new user (Admin only with temp password)
 // @route   POST /api/users
 // @access  Private (admin)
 exports.createUser = async (req, res, next) => {
   try {
-    req.body.createdBy = req.user.id;
+    const { name, email, role, generateTemp } = req.body;
 
-    const user = await User.create(req.body);
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'User with this email already exists'
+      });
+    }
+
+    // Generate temporary password or use provided one
+    const tempPassword = generateTemp ? generateTempPassword() : req.body.password || generateTempPassword();
+    const mustChangePassword = generateTemp || !req.body.password;
+
+    const user = await User.create({
+      name,
+      email,
+      password: tempPassword,
+      role: role || 'viewer',
+      createdBy: req.user.id,
+      mustChangePassword,
+      tempPassword: mustChangePassword
+    });
 
     res.status(201).json({
       success: true,
-      data: user
+      data: user,
+      tempPassword // Only returned once during creation
     });
   } catch (error) {
     next(error);
@@ -139,6 +171,90 @@ exports.deleteUser = async (req, res, next) => {
     res.json({
       success: true,
       message: 'User deleted successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reset user password (Admin only)
+// @route   POST /api/users/:id/reset-password
+// @access  Private (admin)
+exports.resetPassword = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const { newPassword, temporary } = req.body;
+    let tempPassword;
+    
+    if (newPassword) {
+      // Set permanent password
+      user.password = newPassword;
+      user.mustChangePassword = false;
+      user.tempPassword = false;
+      user.passwordChangedAt = new Date();
+      await user.save();
+      
+      res.json({
+        success: true,
+        message: 'Password updated successfully'
+      });
+    } else {
+      // Generate temporary password (requires user to change on next login)
+      tempPassword = generateTempPassword();
+      user.password = tempPassword;
+      user.mustChangePassword = true;
+      user.tempPassword = true;
+      user.passwordChangedAt = null;
+      await user.save();
+
+      res.json({
+        success: true,
+        message: 'Password reset successfully',
+        tempPassword
+      });
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Toggle user active status (Admin only)
+// @route   PUT /api/users/:id/toggle-status
+// @access  Private (admin)
+exports.toggleUserStatus = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Prevent deactivating yourself
+    if (user._id.toString() === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot deactivate your own account'
+      });
+    }
+
+    user.isActive = !user.isActive;
+    await user.save();
+
+    res.json({
+      success: true,
+      data: user,
+      message: user.isActive ? 'User activated successfully' : 'User deactivated successfully'
     });
   } catch (error) {
     next(error);

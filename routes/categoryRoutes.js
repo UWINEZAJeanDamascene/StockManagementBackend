@@ -14,11 +14,11 @@ router.use(protect);
 
 router.route('/')
   .get(getCategories)
-  .post(authorize('admin', 'stock_manager'), logAction('category'), createCategory);
+  .post(authorize('admin'), logAction('category'), createCategory);
 
 router.route('/:id')
   .get(getCategory)
-  .put(authorize('admin', 'stock_manager'), logAction('category'), updateCategory)
+  .put(authorize('admin'), logAction('category'), updateCategory)
   .delete(authorize('admin'), logAction('category'), deleteCategory);
 
 module.exports = router;

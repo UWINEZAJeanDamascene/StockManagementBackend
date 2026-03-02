@@ -24,7 +24,11 @@ exports.getProducts = async (req, res, next) => {
     const query = { isArchived };
 
     if (search && search.trim()) {
-      query.$text = { $search: search };
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { sku: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
     }
 
     if (category && category.trim()) {

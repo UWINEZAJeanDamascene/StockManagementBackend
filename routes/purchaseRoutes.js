@@ -19,18 +19,18 @@ router.use(protect);
 
 router.route('/')
   .get(getPurchases)
-  .post(authorize('admin', 'stock_manager', 'purchases'), logAction('purchase'), createPurchase);
+  .post(authorize('admin'), logAction('purchase'), createPurchase);
 
 router.route('/:id')
   .get(getPurchase)
-  .put(authorize('admin', 'stock_manager'), logAction('purchase'), updatePurchase)
-  .delete(authorize('admin', 'user_manager'), logAction('purchase'), deletePurchase);
+  .put(authorize('admin'), logAction('purchase'), updatePurchase)
+  .delete(authorize('admin'), logAction('purchase'), deletePurchase);
 
 // Receive purchase (add stock)
-router.put('/:id/receive', authorize('admin', 'stock_manager'), logAction('purchase'), receivePurchase);
+router.put('/:id/receive', authorize('admin'), logAction('purchase'), receivePurchase);
 
 // Record payment
-router.post('/:id/payment', authorize('admin', 'stock_manager', 'purchases'), logAction('purchase'), recordPayment);
+router.post('/:id/payment', authorize('admin'), logAction('purchase'), recordPayment);
 
 // Cancel purchase
 router.put('/:id/cancel', authorize('admin'), logAction('purchase'), cancelPurchase);

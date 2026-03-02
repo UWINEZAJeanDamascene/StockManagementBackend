@@ -17,13 +17,13 @@ router.use(protect);
 
 router.route('/movements')
   .get(getStockMovements)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), receiveStock);
+  .post(authorize('admin'), logAction('stock'), receiveStock);
 
 router.get('/movements/:id', getStockMovement);
-router.put('/movements/:id', authorize('admin', 'stock_manager'), logAction('stock'), updateStockMovement);
-router.delete('/movements/:id', authorize('admin', 'stock_manager'), logAction('stock'), deleteStockMovement);
+router.put('/movements/:id', authorize('admin'), logAction('stock'), updateStockMovement);
+router.delete('/movements/:id', authorize('admin'), logAction('stock'), deleteStockMovement);
 router.get('/product/:productId/movements', getProductStockMovements);
-router.post('/adjust', authorize('admin', 'stock_manager'), logAction('stock'), adjustStock);
+router.post('/adjust', authorize('admin'), logAction('stock'), adjustStock);
 router.get('/summary', getStockSummary);
 
 module.exports = router;
