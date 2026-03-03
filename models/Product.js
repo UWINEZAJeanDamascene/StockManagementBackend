@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueCode } = require('./utils/autoIncrement');
 
 const productHistorySchema = new mongoose.Schema({
   action: {
@@ -105,8 +106,20 @@ productSchema.virtual('isLowStock').get(function() {
 });
 
 // Add history entry before save
-productSchema.pre('save', function(next) {
+productSchema.pre('save', async function(next) {
   if (this.isNew) {
+    // Handle SKU conflicts - if SKU already exists, generate a unique one
+    if (this.sku) {
+      const existing = await mongoose.model('Product').findOne({
+        company: this.company,
+        sku: this.sku.toUpperCase()
+      });
+      
+      if (existing) {
+        this.sku = await generateUniqueCode('PRD', mongoose.model('Product'), this.company, 'sku');
+      }
+    }
+    
     this.history.push({
       action: 'created',
       changedBy: this.createdBy,

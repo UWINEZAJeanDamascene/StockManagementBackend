@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueNumber } = require('./utils/autoIncrement');
 
 const invoiceItemSchema = new mongoose.Schema({
   product: {
@@ -213,9 +214,7 @@ invoiceSchema.index({ company: 1 });
 // Auto-generate invoice number
 invoiceSchema.pre('save', async function(next) {
   if (this.isNew && !this.invoiceNumber) {
-    const count = await mongoose.model('Invoice').countDocuments({ company: this.company });
-    const year = new Date().getFullYear();
-    this.invoiceNumber = `INV-${year}-${String(count + 1).padStart(5, '0')}`;
+    this.invoiceNumber = await generateUniqueNumber('INV', mongoose.model('Invoice'), this.company, 'invoiceNumber');
   }
   next();
 });

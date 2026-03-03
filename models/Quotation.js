@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueNumber } = require('./utils/autoIncrement');
 
 const quotationItemSchema = new mongoose.Schema({
   product: {
@@ -109,9 +110,7 @@ quotationSchema.index({ company: 1 });
 // Auto-generate quotation number
 quotationSchema.pre('save', async function(next) {
   if (this.isNew && !this.quotationNumber) {
-    const count = await mongoose.model('Quotation').countDocuments({ company: this.company });
-    const year = new Date().getFullYear();
-    this.quotationNumber = `QUO-${year}-${String(count + 1).padStart(5, '0')}`;
+    this.quotationNumber = await generateUniqueNumber('QUO', mongoose.model('Quotation'), this.company, 'quotationNumber');
   }
   next();
 });

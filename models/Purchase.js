@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueNumber } = require('./utils/autoIncrement');
 
 const purchaseItemSchema = new mongoose.Schema({
   product: {
@@ -213,9 +214,7 @@ purchaseSchema.index({ company: 1 });
 // Auto-generate purchase number
 purchaseSchema.pre('save', async function(next) {
   if (this.isNew && !this.purchaseNumber) {
-    const count = await mongoose.model('Purchase').countDocuments({ company: this.company });
-    const year = new Date().getFullYear();
-    this.purchaseNumber = `PO-${year}-${String(count + 1).padStart(5, '0')}`;
+    this.purchaseNumber = await generateUniqueNumber('PO', mongoose.model('Purchase'), this.company, 'purchaseNumber');
   }
   next();
 });

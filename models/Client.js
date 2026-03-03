@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueCode } = require('./utils/autoIncrement');
 
 const clientSchema = new mongoose.Schema({
   // Multi-tenancy: company reference
@@ -73,9 +74,8 @@ clientSchema.index({ company: 1 });
 clientSchema.pre('save', async function(next) {
   if (this.isNew) {
     if (!this.code) {
-      // Auto-generate code if not provided
-      const count = await mongoose.model('Client').countDocuments({ company: this.company });
-      this.code = `CLI${String(count + 1).padStart(5, '0')}`;
+      // Auto-generate unique code if not provided
+      this.code = await generateUniqueCode('CLI', mongoose.model('Client'), this.company, 'code');
     } else {
       // Check if provided code already exists for this company
       const existingClient = await mongoose.model('Client').findOne({
@@ -84,8 +84,8 @@ clientSchema.pre('save', async function(next) {
       });
       
       if (existingClient) {
-        const error = new Error(`Client code "${this.code}" already exists`);
-        return next(error);
+        // Auto-generate a new unique code instead of throwing error
+        this.code = await generateUniqueCode('CLI', mongoose.model('Client'), this.company, 'code');
       }
     }
   }
