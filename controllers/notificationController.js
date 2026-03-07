@@ -1,5 +1,167 @@
 const NotificationSettings = require('../models/NotificationSettings');
+const Notification = require('../models/Notification');
+const smsService = require('../services/smsService');
 
+// @desc    Get all notifications for user
+// @route   GET /api/notifications
+// @access  Private
+exports.getNotifications = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    const { page = 1, limit = 20, unreadOnly } = req.query;
+    
+    const query = {
+      company: companyId,
+      user: userId
+    };
+    
+    if (unreadOnly === 'true') {
+      query.isRead = false;
+    }
+    
+    const notifications = await Notification.find(query)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip((parseInt(page) - 1) * parseInt(limit));
+    
+    const total = await Notification.countDocuments(query);
+    const unreadCount = await Notification.countDocuments({
+      company: companyId,
+      user: userId,
+      isRead: false
+    });
+    
+    res.json({
+      success: true,
+      data: notifications,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      },
+      unreadCount
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get unread notifications count
+// @route   GET /api/notifications/unread-count
+// @access  Private
+exports.getUnreadCount = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    
+    const count = await Notification.countDocuments({
+      company: companyId,
+      user: userId,
+      isRead: false
+    });
+    
+    res.json({
+      success: true,
+      count
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Mark notification as read
+// @route   PUT /api/notifications/:id/read
+// @access  Private
+exports.markAsRead = async (req, res, next) => {
+  try {
+    const notification = await Notification.findById(req.params.id);
+    
+    if (!notification) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+    
+    // Verify ownership
+    if (notification.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+    
+    notification.isRead = true;
+    notification.readAt = new Date();
+    await notification.save();
+    
+    res.json({
+      success: true,
+      data: notification
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Mark all notifications as read
+// @route   PUT /api/notifications/read-all
+// @access  Private
+exports.markAllAsRead = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    
+    await Notification.updateMany(
+      { company: companyId, user: userId, isRead: false },
+      { isRead: true, readAt: new Date() }
+    );
+    
+    res.json({
+      success: true,
+      message: 'All notifications marked as read'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Delete a notification
+// @route   DELETE /api/notifications/:id
+// @access  Private
+exports.deleteNotification = async (req, res, next) => {
+  try {
+    const notification = await Notification.findById(req.params.id);
+    
+    if (!notification) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+    
+    // Verify ownership
+    if (notification.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+    
+    await notification.deleteOne();
+    
+    res.json({
+      success: true,
+      message: 'Notification deleted'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Create a notification (helper for other parts of the app)
 // @desc    Get notification settings
 // @route   GET /api/notifications/settings
 // @access  Private (admin)
@@ -68,9 +230,17 @@ exports.updateSettings = async (req, res, next) => {
     }
     
     if (smsNotifications) {
+      // Normalize and validate admin phone numbers before saving
+      const adminPhones = Array.isArray(smsNotifications.adminPhones)
+        ? smsNotifications.adminPhones
+            .map(p => smsService.normalizePhoneNumber(String(p || '')))
+            .filter(Boolean)
+        : undefined;
+
       settings.smsNotifications = {
         ...settings.smsNotifications,
-        ...smsNotifications
+        ...smsNotifications,
+        ...(adminPhones ? { adminPhones: [...new Set(adminPhones)].slice(0, 50) } : {})
       };
     }
     
@@ -82,7 +252,14 @@ exports.updateSettings = async (req, res, next) => {
     }
     
     if (criticalAlertPhones) {
-      settings.criticalAlertPhones = criticalAlertPhones;
+      // Normalize critical alert phone numbers
+      const critical = Array.isArray(criticalAlertPhones)
+        ? criticalAlertPhones
+            .map(p => smsService.normalizePhoneNumber(String(p || '')))
+            .filter(Boolean)
+        : [];
+
+      settings.criticalAlertPhones = [...new Set(critical)].slice(0, 50);
     }
     
     await settings.save();

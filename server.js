@@ -16,6 +16,7 @@ connectDB();
 // Load all models to ensure they're registered with mongoose
 require('./models/IPWhitelist');
 require('./models/Role');
+require('./models/Backup');
 
 const app = express();
 
@@ -112,6 +113,9 @@ app.use('/api/credit-notes', require('./routes/creditNoteRoutes'));
 // Notification settings
 app.use('/api/notifications', require('./routes/notificationRoutes'));
 
+// Backup & Restore
+app.use('/api/backups', require('./routes/backupRoutes'));
+
 // Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 
@@ -172,6 +176,15 @@ try {
   notify.startScheduler();
 } catch (err) {
   console.warn('Could not start recurring invoice scheduler', err);
+}
+
+// Start backup scheduler (automated backups, verification)
+try {
+  const backupScheduler = require('./services/backupScheduler');
+  backupScheduler.startBackupScheduler();
+  backupScheduler.startVerificationScheduler();
+} catch (err) {
+  console.warn('Could not start backup scheduler', err);
 }
 
 const server = app.listen(PORT, () => {
