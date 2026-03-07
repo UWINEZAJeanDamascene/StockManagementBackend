@@ -55,7 +55,27 @@ const sendEmail = async (to, subject, html, text = null) => {
       return true;
     }
   } catch (error) {
-    console.error('Error sending email:', error);
+    // Log detailed Mailgun error when available
+    try {
+      const mgErr = error && error.message ? error.message : null;
+      const status = error && error.statusCode ? error.statusCode : (error && error.status ? error.status : null);
+      console.error('Error sending email:', { message: mgErr, status, error });
+    } catch (logErr) {
+      console.error('Error sending email (logging failed):', logErr);
+    }
+
+    // If Mailgun failed and SMTP settings exist, try SMTP fallback
+    const transporter = createTransporter();
+    if (transporter && process.env.SMTP_USER && process.env.SMTP_PASS) {
+      try {
+        await transporter.sendMail(mailOptions);
+        console.log(`📧 Email sent via SMTP fallback to: ${to}`);
+        return true;
+      } catch (smtpErr) {
+        console.error('SMTP fallback failed:', smtpErr);
+      }
+    }
+
     return false;
   }
 };

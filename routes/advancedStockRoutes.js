@@ -144,12 +144,13 @@ router.route('/reorder-points')
   .get(getReorderPoints)
   .post(authorize('admin', 'stock_manager'), logAction('stock'), createReorderPoint);
 
+// Place static/specific routes before the parameterized :id route to avoid route conflicts
+router.get('/reorder-points/needing-reorder', getProductsNeedingReorder);
+
 router.route('/reorder-points/:id')
   .get(getReorderPoint)
   .put(authorize('admin', 'stock_manager'), logAction('stock'), updateReorderPoint)
   .delete(authorize('admin'), logAction('stock'), deleteReorderPoint);
-
-router.get('/reorder-points/needing-reorder', getProductsNeedingReorder);
 router.post('/reorder-points/bulk', authorize('admin', 'stock_manager'), logAction('stock'), bulkCreateReorderPoints);
 
 // Auto-reorder routes

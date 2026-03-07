@@ -254,6 +254,14 @@ exports.approveCompany = async (req, res, next) => {
       await sendApprovalEmail(adminUser.email, company.name, adminUser.name);
     }
 
+    // Create a system notification for company approval
+    try {
+      const { notifyCompanyApproved } = require('../services/notificationHelper');
+      await notifyCompanyApproved(company._id, company);
+    } catch (e) {
+      console.error('notifyCompanyApproved failed', e);
+    }
+
     res.json({
       success: true,
       message: 'Company approved successfully',

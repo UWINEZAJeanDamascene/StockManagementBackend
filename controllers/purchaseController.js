@@ -3,6 +3,7 @@ const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const StockMovement = require('../models/StockMovement');
 const PDFDocument = require('pdfkit');
+const { notifyStockReceived, notifyLowStock, notifyOutOfStock } = require('../services/notificationHelper');
 
 // @desc    Get all purchases
 // @route   GET /api/purchases
@@ -288,6 +289,26 @@ exports.receivePurchase = async (req, res, next) => {
         }
         
         await product.save();
+
+        // Send stock received notification
+        try {
+          await notifyStockReceived(
+            companyId,
+            product,
+            item.quantity,
+            supplier
+          );
+
+          // Check if stock is now low or out after adding
+          if (product.reorderPoint && newStock <= product.reorderPoint) {
+            await notifyLowStock(companyId, product, newStock);
+          }
+          if (newStock === 0) {
+            await notifyOutOfStock(companyId, product);
+          }
+        } catch (notifError) {
+          console.error('Failed to send stock notification:', notifError);
+        }
       }
     }
 
@@ -399,6 +420,26 @@ exports.recordPayment = async (req, res, next) => {
             product.averageCost = item.unitCost;
           }
           await product.save();
+
+          // Send stock received notification
+          try {
+            await notifyStockReceived(
+              companyId,
+              product,
+              item.quantity,
+              supplier
+            );
+
+            // Check if stock is now low or out after adding
+            if (product.reorderPoint && newStock <= product.reorderPoint) {
+              await notifyLowStock(companyId, product, newStock);
+            }
+            if (newStock === 0) {
+              await notifyOutOfStock(companyId, product);
+            }
+          } catch (notifError) {
+            console.error('Failed to send stock notification:', notifError);
+          }
         }
       }
 

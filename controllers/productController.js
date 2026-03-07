@@ -5,6 +5,7 @@ const Invoice = require('../models/Invoice');
 const Supplier = require('../models/Supplier');
 const bwipjs = require('bwip-js');
 const QRCode = require('qrcode');
+const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
 
 // @desc    Get all products
 // @route   GET /api/products
@@ -181,6 +182,23 @@ exports.updateProduct = async (req, res, next) => {
     });
 
     await product.save();
+
+    // Check for low stock / out of stock and send notifications
+    if (product.currentStock !== undefined) {
+      if (product.currentStock === 0) {
+        try {
+          await notifyOutOfStock(companyId, product);
+        } catch (err) {
+          console.error('Failed to send out of stock notification:', err);
+        }
+      } else if (product.lowStockThreshold && product.currentStock <= product.lowStockThreshold) {
+        try {
+          await notifyLowStock(companyId, product, product.currentStock);
+        } catch (err) {
+          console.error('Failed to send low stock notification:', err);
+        }
+      }
+    }
 
     // Handle supplier linking
     // If supplier changed or newly assigned
@@ -447,6 +465,55 @@ exports.getLowStockProducts = async (req, res, next) => {
       success: true,
       count: products.length,
       data: products
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Check low stock and send notifications for all products
+// @route   POST /api/products/check-low-stock
+// @access  Private (admin)
+exports.checkLowStockAndNotify = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    // Find all products that are low stock or out of stock
+    const products = await Product.find({
+      company: companyId,
+      isArchived: false
+    });
+
+    let outOfStockCount = 0;
+    let lowStockCount = 0;
+    let alreadyNotified = [];
+
+    // Check each product
+    for (const product of products) {
+      if (product.currentStock === 0) {
+        outOfStockCount++;
+        try {
+          await notifyOutOfStock(companyId, product);
+        } catch (err) {
+          console.error('Failed to send out of stock notification:', err);
+        }
+      } else if (product.lowStockThreshold && product.currentStock <= product.lowStockThreshold) {
+        lowStockCount++;
+        try {
+          await notifyLowStock(companyId, product, product.currentStock);
+        } catch (err) {
+          console.error('Failed to send low stock notification:', err);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Notifications sent: ${outOfStockCount} out of stock, ${lowStockCount} low stock`,
+      data: {
+        outOfStockCount,
+        lowStockCount
+      }
     });
   } catch (error) {
     next(error);

@@ -2,6 +2,11 @@ const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const PDFDocument = require('pdfkit');
+const {
+  notifyQuotationCreated,
+  notifyQuotationApproved,
+  notifyQuotationExpired
+} = require('../services/notificationHelper');
 
 // @desc    Get all quotations
 // @route   GET /api/quotations
@@ -110,6 +115,12 @@ exports.createQuotation = async (req, res, next) => {
       success: true,
       data: quotation
     });
+    // Notify quotation created
+    try {
+      await notifyQuotationCreated(companyId, quotation);
+    } catch (e) {
+      console.error('notifyQuotationCreated failed', e);
+    }
   } catch (error) {
     next(error);
   }
@@ -234,6 +245,12 @@ exports.approveQuotation = async (req, res, next) => {
       message: 'Quotation approved successfully',
       data: quotation
     });
+    // Notify quotation approved
+    try {
+      await notifyQuotationApproved(companyId, quotation, quotation.convertedToInvoice || null);
+    } catch (e) {
+      console.error('notifyQuotationApproved failed', e);
+    }
   } catch (error) {
     next(error);
   }
@@ -288,12 +305,17 @@ exports.convertToInvoice = async (req, res, next) => {
     await quotation.save();
 
     await invoice.populate('client items.product createdBy');
-
     res.status(201).json({
       success: true,
       message: 'Quotation converted to invoice successfully',
       data: invoice
     });
+    // Notify quotation approved/converted
+    try {
+      await notifyQuotationApproved(companyId, quotation, invoice.invoiceNumber);
+    } catch (e) {
+      console.error('notifyQuotationApproved (convert) failed', e);
+    }
   } catch (error) {
     next(error);
   }

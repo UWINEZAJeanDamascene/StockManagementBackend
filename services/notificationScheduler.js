@@ -6,6 +6,7 @@ const User = require('../models/User');
 const NotificationSettings = require('../models/NotificationSettings');
 const emailService = require('./emailService');
 const smsService = require('./smsService');
+const { notifyLowStock, notifyOutOfStock } = require('./notificationHelper');
 
 // ============================================
 // HELPER FUNCTIONS
@@ -141,13 +142,27 @@ async function checkLowStock() {
       const companyThreshold = settings?.preferences?.lowStockThreshold || threshold;
 
       // Find low stock products
+      // Use `defaultWarehouse` field (if present) instead of `warehouse` which is not in the schema
       const products = await Product.find({
         company: company._id,
         currentStock: { $lte: companyThreshold }
-      }).populate('company warehouse');
+      }).populate('company');
 
       for (const p of products) {
         const isCritical = p.currentStock <= Math.floor(companyThreshold / 2);
+        
+        // Create in-app database notification
+        try {
+          if (p.currentStock === 0) {
+            await notifyOutOfStock(company._id, p);
+            console.log(`🔔 In-app notification created: ${p.name} is out of stock`);
+          } else {
+            await notifyLowStock(company._id, p, p.currentStock);
+            console.log(`🔔 In-app notification created: ${p.name} is low stock (${p.currentStock})`);
+          }
+        } catch (err) {
+          console.error('Failed to create in-app notification:', err);
+        }
         
         // Send email alert
         if (settings?.emailNotifications?.enabled && 

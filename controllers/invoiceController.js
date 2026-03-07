@@ -5,6 +5,12 @@ const StockMovement = require('../models/StockMovement');
 const InvoiceReceiptMetadata = require('../models/InvoiceReceiptMetadata');
 const PDFDocument = require('pdfkit');
 const notificationService = require('../services/notificationService');
+const {
+  notifyInvoiceCreated,
+  notifyPaymentReceived,
+  notifyPaymentOverdue,
+  notifyInvoiceSent
+} = require('../services/notificationHelper');
 const emailService = require('../services/emailService');
 const Company = require('../models/Company');
 
@@ -161,9 +167,18 @@ exports.createInvoice = async (req, res, next) => {
         const company = await Company.findById(companyId);
         const clientData = await Client.findById(clientId);
         await emailService.sendInvoiceEmail(invoice, company, clientData);
+        // Notify that invoice was sent
+        try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
       } catch (emailErr) {
         console.error('Invoice email error:', emailErr);
       }
+    }
+
+    // Notify invoice created
+    try {
+      await notifyInvoiceCreated(companyId, invoice);
+    } catch (e) {
+      console.error('notifyInvoiceCreated failed', e);
     }
 
     res.status(201).json({
@@ -358,7 +373,12 @@ exports.confirmInvoice = async (req, res, next) => {
     invoice.confirmedDate = new Date();
     invoice.confirmedBy = req.user.id;
     await invoice.save();
-
+    // Notify payment received
+    try {
+      await notifyPaymentReceived(companyId, invoice, amount);
+    } catch (e) {
+      console.error('notifyPaymentReceived failed', e);
+    }
     // Update linked quotation if exists
     if (invoice.quotation) {
       const Quotation = require('../models/Quotation');
@@ -484,6 +504,13 @@ exports.recordPayment = async (req, res, next) => {
     }
 
     await invoice.save();
+
+    // Notify payment recorded
+    try {
+      await notifyPaymentReceived(companyId, invoice, amount);
+    } catch (e) {
+      console.error('notifyPaymentReceived failed', e);
+    }
 
     res.json({
       success: true,
@@ -830,7 +857,8 @@ exports.sendInvoiceEmail = async (req, res, next) => {
 
     // Send the invoice email
     await emailService.sendInvoiceEmail(invoice, company, clientData);
-
+    // Notify invoice sent
+    try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
     res.json({
       success: true,
       message: 'Invoice sent to ' + clientEmail

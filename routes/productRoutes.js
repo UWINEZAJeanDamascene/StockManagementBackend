@@ -10,7 +10,8 @@ const {
   restoreProduct,
   getProductHistory,
   getProductLifecycle,
-  getLowStockProducts
+  getLowStockProducts,
+  checkLowStockAndNotify
 } = require('../controllers/productController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
@@ -23,6 +24,9 @@ router.route('/')
   .post(authorize('admin'), logAction('product'), createProduct);
 
 router.get('/low-stock', getLowStockProducts);
+
+// Check low stock and send notifications
+router.post('/check-low-stock', authorize('admin'), checkLowStockAndNotify);
 
 router.route('/:id')
   .get(getProduct)

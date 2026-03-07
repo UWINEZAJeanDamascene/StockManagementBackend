@@ -8,6 +8,7 @@ const { promisify } = require('util');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { google } = require('googleapis');
+const { notifyBackupSuccess, notifyBackupFailed } = require('../services/notificationHelper');
 
 // Get list of all models that can be backed up
 const getBackupableCollections = () => {
@@ -231,6 +232,9 @@ const performBackup = async (backupId, companyId, collections) => {
     backup.status = 'failed';
     backup.errorMessage = error.message;
     await backup.save();
+    
+    // Send notification for failed backup
+    await notifyBackupFailed(companyId, backup, error.message);
   }
 };
 

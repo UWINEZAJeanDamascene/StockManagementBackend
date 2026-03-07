@@ -69,6 +69,14 @@ async function generateForTemplate(templateId) {
 
   const created = await Invoice.create(invoiceData);
 
+  // Notify that a recurring invoice was generated
+  try {
+    const { notifyInvoiceGenerated } = require('./notificationHelper');
+    await notifyInvoiceGenerated(created.company, created);
+  } catch (e) {
+    console.error('notifyInvoiceGenerated failed', e);
+  }
+
   const next = computeNextRunDate(r.schedule, r.nextRunDate || r.startDate || new Date());
   r.nextRunDate = next;
   await r.save();

@@ -15,7 +15,15 @@ const notificationSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['low_stock', 'invoice', 'payment', 'reorder', 'expiry', 'system', 'alert'],
+    enum: [
+      'low_stock', 'out_of_stock', 'stock_received',
+      'invoice_created', 'payment_received', 'payment_overdue', 'invoice_sent',
+      'quotation_created', 'quotation_approved', 'quotation_expired',
+      'user_created', 'company_approved', 'password_changed', 'failed_login',
+      'backup_success', 'backup_failed',
+      'invoice_generated', 'recurring_paused',
+      'system', 'alert'
+    ],
     required: true
   },
   title: {

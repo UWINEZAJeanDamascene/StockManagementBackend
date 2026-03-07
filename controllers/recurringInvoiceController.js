@@ -53,6 +53,7 @@ exports.createRecurringInvoice = async (req, res, next) => {
 exports.updateRecurringInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const recOld = await RecurringInvoice.findOne({ _id: req.params.id, company: companyId });
     const rec = await RecurringInvoice.findOneAndUpdate({ _id: req.params.id, company: companyId }, req.body, { new: true, runValidators: true });
     if (!rec) return res.status(404).json({ success: false, message: 'Not found' });
     try {
@@ -60,6 +61,15 @@ exports.updateRecurringInvoice = async (req, res, next) => {
       rec.nextRunDate = next;
       await rec.save();
     } catch (e) {}
+    // If template was active and is now paused, notify
+    try {
+      if (recOld && recOld.active && rec && rec.active === false) {
+        const { notifyRecurringPaused } = require('../services/notificationHelper');
+        await notifyRecurringPaused(companyId, rec);
+      }
+    } catch (e) {
+      console.error('notifyRecurringPaused failed', e);
+    }
     res.json({ success: true, data: rec });
   } catch (err) {
     next(err);

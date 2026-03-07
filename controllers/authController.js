@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Company = require('../models/Company');
+const { notifyPasswordChanged, notifyFailedLogin } = require('../services/notificationHelper');
 
 // Generate JWT Token with company and role info
 const generateToken = (id, companyId, role) => {
@@ -81,6 +82,18 @@ exports.login = async (req, res, next) => {
     const isMatch = await user.comparePassword(password);
 
     if (!isMatch) {
+      // Notify about failed login attempt
+      try {
+        await notifyFailedLogin(
+          user.company?._id || user.company,
+          user._id,
+          email,
+          req.ip || req.connection?.remoteAddress
+        );
+      } catch (notifyErr) {
+        console.error('Failed to send login notification:', notifyErr);
+      }
+      
       return res.status(401).json({ 
         success: false, 
         message: 'Invalid credentials' 
@@ -159,6 +172,13 @@ exports.updatePassword = async (req, res, next) => {
     user.mustChangePassword = false;
     user.tempPassword = false;
     await user.save();
+
+    // Notify about password change
+    try {
+      await notifyPasswordChanged(req.user.company._id, user._id);
+    } catch (notifyErr) {
+      console.error('Failed to send password change notification:', notifyErr);
+    }
 
     const token = generateToken(user._id, req.user.company._id, user.role);
 

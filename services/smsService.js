@@ -17,22 +17,36 @@ const getNexmoConfig = () => ({
 });
 
 // Normalize phone number to E.164 format
+// Uses DEFAULT_COUNTRY_CODE env var if provided (e.g. '1' for US)
 const normalizePhoneNumber = (phone) => {
   if (!phone) return null;
-  
+
   // Remove all non-digit characters
-  let cleaned = phone.replace(/\D/g, '');
-  
-  // If it doesn't start with country code, assume +1 (US)
-  if (!cleaned.startsWith('1') && cleaned.length === 10) {
-    cleaned = '1' + cleaned;
-  }
-  
-  // Add + prefix if not present
-  if (!cleaned.startsWith('+')) {
+  let cleaned = String(phone).replace(/\D/g, '');
+
+  // If user provided leading + in original string, keep it
+  if (String(phone).trim().startsWith('+')) {
     cleaned = '+' + cleaned;
+  } else {
+    // If number already contains country code (length > 10), assume it's full
+    if (cleaned.length > 10) {
+      cleaned = '+' + cleaned;
+    } else {
+      // If default country code is configured, prepend it
+      const defaultCountry = process.env.DEFAULT_COUNTRY_CODE || process.env.TWILIO_DEFAULT_COUNTRY || null;
+      if (defaultCountry) {
+        cleaned = '+' + String(defaultCountry).replace(/\D/g, '') + cleaned;
+      } else {
+        // Cannot safely guess country code — return null so caller can handle
+        return null;
+      }
+    }
   }
-  
+
+  // Basic length validation for E.164 (max 15 digits excluding +)
+  const digitsOnly = cleaned.replace(/^\+/, '');
+  if (digitsOnly.length < 8 || digitsOnly.length > 15) return null;
+
   return cleaned;
 };
 
@@ -64,8 +78,10 @@ const sendViaTwilio = async (to, message) => {
     console.log(`📱 SMS sent via Twilio to: ${to}`);
     return { success: true, messageId: response.data.sid };
   } catch (error) {
-    console.error('Twilio SMS error:', error.response?.data || error.message);
-    return { success: false, error: error.message };
+    // Prefer returning Twilio's structured error when available
+    const twErr = error.response && error.response.data ? error.response.data : null;
+    console.error('Twilio SMS error:', twErr || error.message);
+    return { success: false, error: twErr || error.message };
   }
 };
 

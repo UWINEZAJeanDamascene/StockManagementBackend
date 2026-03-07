@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const ActionLog = require('../models/ActionLog');
+const { notifyUserCreated, notifyPasswordChanged } = require('../services/notificationHelper');
 
 // Generate a random temporary password
 const generateTempPassword = (length = 8) => {
@@ -113,6 +114,13 @@ exports.createUser = async (req, res, next) => {
       data: user,
       tempPassword // Only returned once during creation
     });
+
+    // Notify new user created
+    try {
+      await notifyUserCreated(companyId, user, req.user);
+    } catch (e) {
+      console.error('notifyUserCreated failed', e);
+    }
   } catch (error) {
     next(error);
   }
@@ -221,6 +229,11 @@ exports.resetPassword = async (req, res, next) => {
         success: true,
         message: 'Password updated successfully'
       });
+      try {
+        await notifyPasswordChanged(companyId, user._id);
+      } catch (e) {
+        console.error('notifyPasswordChanged failed', e);
+      }
     } else {
       // Generate temporary password (requires user to change on next login)
       tempPassword = generateTempPassword();

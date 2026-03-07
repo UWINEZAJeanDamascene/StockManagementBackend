@@ -210,4 +210,12 @@ server.on('error', (err) => {
   }
 });
 
+// Initialize Socket.io for real-time notifications
+try {
+  const socketService = require('./services/socketService');
+  socketService.init(server);
+} catch (err) {
+  console.warn('Could not initialize socket service', err.message || err);
+}
+
 module.exports = app;
