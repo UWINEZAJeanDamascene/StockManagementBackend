@@ -241,7 +241,8 @@ const uploadToCloud = async (backup) => {
     if (backup.storageLocation === 's3') {
       // TODO: implement real S3 upload with AWS SDK
       backup.cloudUrl = `s3://backups/${path.basename(backup.filePath)}`;
-    } else if (backup.storageLocation === 'google-drive') {
+    } else if (backup.storageLocation === 'google-drive' || backup.storageLocation === 'cloud') {
+      // Handle both 'google-drive' and 'cloud' (default to Google Drive) storage types
       try {
         let serviceAccount = null;
         
@@ -260,12 +261,21 @@ const uploadToCloud = async (backup) => {
           }
         }
 
+        // Also check GOOGLE_SERVICE_ACCOUNT_FILE env var (path to credentials file)
+        if (!serviceAccount && process.env.GOOGLE_SERVICE_ACCOUNT_FILE) {
+          const credPath = path.resolve(process.cwd(), process.env.GOOGLE_SERVICE_ACCOUNT_FILE);
+          if (fs.existsSync(credPath)) {
+            serviceAccount = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+            console.log('Found Google credentials from GOOGLE_SERVICE_ACCOUNT_FILE:', credPath);
+          }
+        }
+
         if (!serviceAccount && process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
           serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
         }
 
         if (!serviceAccount) {
-          throw new Error('Google Service Account credentials not found');
+          throw new Error('Google Service Account credentials not found. Please ensure google-credentials.json exists in config folder or GOOGLE_SERVICE_ACCOUNT_KEY is set.');
         }
 
         const auth = new google.auth.GoogleAuth({
@@ -277,6 +287,7 @@ const uploadToCloud = async (backup) => {
 
         const fileMetadata = {
           name: path.basename(backup.filePath),
+          owners: process.env.GOOGLE_DRIVE_OWNER_EMAIL ? [process.env.GOOGLE_DRIVE_OWNER_EMAIL] : undefined,
         };
 
         // Optionally upload into a specific folder
@@ -289,23 +300,121 @@ const uploadToCloud = async (backup) => {
           body: fs.createReadStream(backup.filePath)
         };
 
+        console.log('Starting Google Drive upload for:', backup.filePath);
+        
         const response = await drive.files.create({
           resource: fileMetadata,
           media,
-          fields: 'id, webViewLink'
+          fields: 'id, webViewLink',
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
         });
 
         const fileId = response.data.id;
         const webViewLink = response.data.webViewLink || (fileId ? `https://drive.google.com/file/d/${fileId}/view` : null);
 
         backup.cloudUrl = webViewLink || `gdrive://${path.basename(backup.filePath)}`;
+        
+        console.log('Google Drive upload successful! File ID:', fileId);
       } catch (err) {
         console.error('Google Drive upload failed:', err.message || err);
+        // Set failed status - this indicates the backup itself succeeded but cloud upload failed
         backup.cloudUrl = `gdrive-failed://${path.basename(backup.filePath)}`;
+        // Log additional error details for debugging
+        if (err.response) {
+          console.error('Google API Error Response:', err.response.data);
+        }
+        // Don't re-throw - the local backup is still valid
       }
     } else if (backup.storageLocation === 'dropbox') {
-      // TODO: implement real Dropbox upload
-      backup.cloudUrl = `dropbox://backups/${path.basename(backup.filePath)}`;
+      try {
+        const axios = require('axios');
+        const dropboxToken = process.env.DROPBOX_ACCESS_TOKEN;
+        
+        if (!dropboxToken) {
+          throw new Error('Dropbox access token not configured');
+        }
+        
+        // Read the backup file
+        const fileContent = fs.readFileSync(backup.filePath);
+        const fileName = path.basename(backup.filePath);
+        
+        console.log('Starting Dropbox upload for:', fileName);
+        
+        // Upload to Dropbox using their API
+        const response = await axios.post(
+          'https://content.dropboxapi.com/2/files/upload',
+          fileContent,
+          {
+            headers: {
+              'Authorization': `Bearer ${dropboxToken}`,
+              'Dropbox-API-Arg': JSON.stringify({
+                path: `/${fileName}`,
+                mode: 'add',
+                autorename: true,
+                mute: false
+              }),
+              'Content-Type': 'application/octet-stream'
+            }
+          }
+        );
+        
+        // Get the shared link for the file
+        try {
+          const shareResponse = await axios.post(
+            'https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings',
+            {
+              path: response.data.path_lower,
+              settings: {
+                requested_visibility: 'public'
+              }
+            },
+            {
+              headers: {
+                'Authorization': `Bearer ${dropboxToken}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          backup.cloudUrl = shareResponse.data.url;
+        } catch (shareErr) {
+          // If shared link already exists, get existing links or use direct link
+          if (shareErr.response?.data?.error?.['.tag'] === 'shared_link_already_exists') {
+            try {
+              const listResponse = await axios.post(
+                'https://api.dropboxapi.com/2/sharing/list_shared_links',
+                { path: response.data.path_lower },
+                {
+                  headers: {
+                    'Authorization': `Bearer ${dropboxToken}`,
+                    'Content-Type': 'application/json'
+                  }
+                }
+              );
+              if (listResponse.data.links.length > 0) {
+                backup.cloudUrl = listResponse.data.links[0].url;
+              } else {
+                backup.cloudUrl = `https://www.dropbox.com/home${response.data.path_display}`;
+              }
+            } catch (listErr) {
+              backup.cloudUrl = `https://www.dropbox.com/home${response.data.path_display}`;
+            }
+          } else {
+            backup.cloudUrl = `https://www.dropbox.com/home${response.data.path_display}`;
+          }
+        }
+        
+        console.log('Dropbox upload successful! Path:', response.data.path_display);
+      } catch (err) {
+        console.error('Dropbox upload failed:', err.message || err);
+        if (err.response) {
+          console.error('Dropbox Error Response:', err.response.data);
+        }
+        backup.cloudUrl = `dropbox-failed://${path.basename(backup.filePath)}`;
+      }
+    } else {
+      console.warn('Unknown storage location:', backup.storageLocation);
+      backup.cloudUrl = null;
     }
 
     await backup.save();
