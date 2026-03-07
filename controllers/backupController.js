@@ -7,6 +7,7 @@ const path = require('path');
 const { promisify } = require('util');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { google } = require('googleapis');
 
 // Get list of all models that can be backed up
 const getBackupableCollections = () => {
@@ -235,19 +236,78 @@ const performBackup = async (backupId, companyId, collections) => {
 
 // Upload backup to cloud storage
 const uploadToCloud = async (backup) => {
-  // For now, we'll simulate cloud upload
-  // In production, this would integrate with AWS S3, Google Cloud Storage, etc.
+  // Upload to configured cloud provider. Implements Google Drive support.
   try {
     if (backup.storageLocation === 's3') {
-      // Simulate S3 upload (would use AWS SDK in production)
+      // TODO: implement real S3 upload with AWS SDK
       backup.cloudUrl = `s3://backups/${path.basename(backup.filePath)}`;
     } else if (backup.storageLocation === 'google-drive') {
-      // Simulate Google Drive upload
-      backup.cloudUrl = `gdrive://backups/${path.basename(backup.filePath)}`;
+      try {
+        let serviceAccount = null;
+        
+        // Try multiple sources for credentials
+        const possiblePaths = [
+          path.join(process.cwd(), 'config', 'google-credentials.json'),
+          path.join(process.env.USERPROFILE || process.env.HOME || '', 'Downloads', 'stockmanager-backup-92c9f04a5d8d.json'),
+          path.join(process.cwd(), '..', 'Downloads', 'stockmanager-backup-92c9f04a5d8d.json')
+        ];
+
+        for (const credPath of possiblePaths) {
+          if (fs.existsSync(credPath)) {
+            serviceAccount = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+            console.log('Found Google credentials at:', credPath);
+            break;
+          }
+        }
+
+        if (!serviceAccount && process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+          serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+        }
+
+        if (!serviceAccount) {
+          throw new Error('Google Service Account credentials not found');
+        }
+
+        const auth = new google.auth.GoogleAuth({
+          credentials: serviceAccount,
+          scopes: ['https://www.googleapis.com/auth/drive.file']
+        });
+
+        const drive = google.drive({ version: 'v3', auth });
+
+        const fileMetadata = {
+          name: path.basename(backup.filePath),
+        };
+
+        // Optionally upload into a specific folder
+        if (process.env.GOOGLE_DRIVE_FOLDER_ID) {
+          fileMetadata.parents = [process.env.GOOGLE_DRIVE_FOLDER_ID];
+        }
+
+        const media = {
+          mimeType: 'application/gzip',
+          body: fs.createReadStream(backup.filePath)
+        };
+
+        const response = await drive.files.create({
+          resource: fileMetadata,
+          media,
+          fields: 'id, webViewLink'
+        });
+
+        const fileId = response.data.id;
+        const webViewLink = response.data.webViewLink || (fileId ? `https://drive.google.com/file/d/${fileId}/view` : null);
+
+        backup.cloudUrl = webViewLink || `gdrive://${path.basename(backup.filePath)}`;
+      } catch (err) {
+        console.error('Google Drive upload failed:', err.message || err);
+        backup.cloudUrl = `gdrive-failed://${path.basename(backup.filePath)}`;
+      }
     } else if (backup.storageLocation === 'dropbox') {
-      // Simulate Dropbox upload
+      // TODO: implement real Dropbox upload
       backup.cloudUrl = `dropbox://backups/${path.basename(backup.filePath)}`;
     }
+
     await backup.save();
   } catch (error) {
     console.error('Cloud upload failed:', error);
