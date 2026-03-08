@@ -85,27 +85,47 @@ const createRedisClient = () => {
 // Create Redis client instance
 const redisClient = createRedisClient();
 
-// Event handlers for monitoring
-redisClient.on('connect', () => {
-  console.log('Redis connected successfully');
-});
+// Event handlers for monitoring (only for clients that support EventEmitter style)
+if (redisClient && typeof redisClient.on === 'function') {
+  redisClient.on('connect', () => {
+    console.log('Redis connected successfully');
+  });
 
-redisClient.on('ready', () => {
-  console.log('Redis client ready');
-});
+  redisClient.on('ready', () => {
+    console.log('Redis client ready');
+  });
 
-redisClient.on('error', (err) => {
-  console.error('Redis error:', err.message);
-});
+  redisClient.on('error', (err) => {
+    console.error('Redis error:', err && err.message ? err.message : err);
+  });
 
-redisClient.on('close', () => {
-  console.log('Redis connection closed');
-});
+  redisClient.on('close', () => {
+    console.log('Redis connection closed');
+  });
+} else {
+  console.log('Redis client does not support event handlers (likely Upstash REST client).');
+}
 
 // Graceful shutdown
 const gracefulShutdown = async () => {
   console.log('Closing Redis connection...');
-  await redisClient.quit();
+  try {
+    if (redisClient) {
+      if (typeof redisClient.quit === 'function') {
+        await redisClient.quit();
+      } else if (typeof redisClient.disconnect === 'function') {
+        await redisClient.disconnect();
+      } else if (typeof redisClient.close === 'function') {
+        await redisClient.close();
+      } else if (typeof redisClient.flush === 'function') {
+        // best-effort
+        try { await redisClient.flush(); } catch (e) {}
+      }
+    }
+  } catch (e) {
+    console.error('Error while closing Redis client:', e);
+  }
+
   process.exit(0);
 };
 
