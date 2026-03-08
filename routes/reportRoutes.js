@@ -12,12 +12,14 @@ const {
   
   // new reports
   getProfitAndLossReport,
+  getProfitAndLossDetailed,
   getAgingReport,
   getVATSummaryReport,
   getProductPerformanceReport,
   getCLVReport,
   getCashFlowStatement,
-  getBudgetVsActualReport
+  getBudgetVsActualReport,
+  getBalanceSheet
 } = require('../controllers/reportController');
 const { protect, authorize } = require('../middleware/auth');
 const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
@@ -33,11 +35,13 @@ router.get('/supplier-purchase', cacheMiddleware({ type: 'report', ttl: 900 }), 
 router.get('/export/excel/:reportType', exportReportToExcel);
 router.get('/export/pdf/:reportType', exportReportToPDF);
 router.get('/profit-and-loss', cacheMiddleware({ type: 'report', ttl: 900 }), getProfitAndLossReport);
+router.get('/profit-and-loss-detailed', getProfitAndLossDetailed);
 router.get('/aging', cacheMiddleware({ type: 'report', ttl: 900 }), getAgingReport);
 router.get('/vat-summary', cacheMiddleware({ type: 'report', ttl: 900 }), getVATSummaryReport);
 router.get('/product-performance', cacheMiddleware({ type: 'report', ttl: 900 }), getProductPerformanceReport);
 router.get('/clv', cacheMiddleware({ type: 'report', ttl: 900 }), getCLVReport);
 router.get('/cash-flow', cacheMiddleware({ type: 'report', ttl: 900 }), getCashFlowStatement);
 router.get('/budget-vs-actual', cacheMiddleware({ type: 'report', ttl: 900 }), getBudgetVsActualReport);
+router.get('/balance-sheet', cacheMiddleware({ type: 'report', ttl: 300 }), getBalanceSheet);
 
 module.exports = router;

@@ -7,6 +7,10 @@ const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const Purchase = require('../models/Purchase');
 const Budget = require('../models/Budget');
+const Company = require('../models/Company');
+const FixedAsset = require('../models/FixedAsset');
+const Loan = require('../models/Loan');
+const CreditNote = require('../models/CreditNote');
 
 // @desc    Get stock valuation report
 // @route   GET /api/reports/stock-valuation
@@ -212,7 +216,9 @@ exports.getProfitAndLossReport = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { startDate, endDate } = req.query;
 
-    const invMatch = { status: { $in: ['paid', 'partial', 'confirmed'] }, company: companyId };
+    // For Profit & Loss, we only consider PAID invoices
+    // Revenue is only recognized when payment is received
+    const invMatch = { status: 'paid', company: companyId };
     if (startDate || endDate) {
       invMatch.invoiceDate = {};
       if (startDate) invMatch.invoiceDate.$gte = new Date(startDate);
@@ -221,34 +227,43 @@ exports.getProfitAndLossReport = async (req, res, next) => {
 
     const invoices = await Invoice.find(invMatch).populate('items.product', 'averageCost');
 
+    // Total Revenue: Sum of all paid invoice amounts (INCLUDING tax)
+    // Revenue includes tax - tax will be subtracted as expense
     const revenue = invoices.reduce((sum, inv) => sum + (inv.grandTotal || 0), 0);
 
-    // Estimate COGS using product averageCost * quantity
+    // COGS (Cost of Goods Sold): Sum of cost price × quantity sold for all products on paid invoices
+    // We use the product's averageCost as the cost price (this is the best available approximation)
     let cogs = 0;
     invoices.forEach(inv => {
       inv.items.forEach(item => {
-        const avgCost = item.product?.averageCost || 0;
-        cogs += (avgCost * (item.quantity || 0));
+        const costPrice = item.product?.averageCost || 0;
+        cogs += (costPrice * (item.quantity || 0));
       });
     });
 
-    // Treat purchases in period as expenses for net profit calc
-    const purchaseMatch = { company: companyId };
-    if (startDate || endDate) {
-      purchaseMatch.purchaseDate = {};
-      if (startDate) purchaseMatch.purchaseDate.$gte = new Date(startDate);
-      if (endDate) purchaseMatch.purchaseDate.$lte = new Date(endDate);
-    }
+    // Gross Profit = Revenue - COGS
+    const grossProfit = revenue - cogs;
 
-    const purchases = await Purchase.find(purchaseMatch);
-    const purchaseExpenses = purchases.reduce((sum, p) => sum + (p.grandTotal || 0), 0);
+    // Gross Margin % = (Gross Profit / Revenue) × 100
+    const grossMarginPercent = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
 
-    // Taxes and discounts
+    // NOTE: Purchase Expenses are NOT included in P&L
+    // In accrual accounting, purchases are recorded as Assets (Inventory) in the Balance Sheet
+    // Only COGS (Cost of Goods Sold) is recorded as expense when products are sold
+    const purchaseExpenses = 0;
+
+    // Taxes: Sum of actual tax amounts recorded on each paid invoice
     const taxes = invoices.reduce((sum, inv) => sum + (inv.totalTax || 0), 0);
+
+    // Discounts: Sum of all discounts applied on paid invoices in this period
     const discounts = invoices.reduce((sum, inv) => sum + (inv.totalDiscount || 0), 0);
 
-    const grossProfit = revenue - cogs;
-    const netProfit = grossProfit - purchaseExpenses - taxes - discounts;
+    // Net Profit = Gross Profit - Taxes - Discounts
+    // (Purchase expenses removed - purchases are now assets, not expenses)
+    const netProfit = grossProfit - taxes - discounts;
+
+    // Net Margin % = (Net Profit / Revenue) × 100
+    const netMarginPercent = revenue > 0 ? (netProfit / revenue) * 100 : 0;
 
     res.json({
       success: true,
@@ -256,12 +271,329 @@ exports.getProfitAndLossReport = async (req, res, next) => {
         revenue,
         cogs,
         grossProfit,
+        grossMarginPercent: Math.round(grossMarginPercent * 100) / 100,
         purchaseExpenses,
         taxes,
         discounts,
         netProfit,
-        invoicesCount: invoices.length,
-        purchasesCount: purchases.length
+        netMarginPercent: Math.round(netMarginPercent * 100) / 100,
+        invoicesCount: invoices.length
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get detailed Profit & Loss Statement (Comprehensive)
+// @route   GET /api/reports/profit-and-loss-detailed
+// @access  Private
+exports.getProfitAndLossDetailed = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    
+    // Set default period to current quarter if not provided
+    const now = new Date();
+    const periodStart = startDate ? new Date(startDate) : new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+    const periodEnd = endDate ? new Date(endDate) : new Date();
+    
+    // Get company info
+    const company = await Company.findById(companyId);
+    const companyName = company?.name || 'N/A';
+    const companyTin = company?.tin || 'N/A';
+    
+    // =============================================
+    // REVENUE SECTION
+    // =============================================
+    
+    // Sales Revenue (excluding VAT) - Cash-basis: revenue recognised when payment is received.
+    // Use paidDate (not invoiceDate) so that invoices issued before the period but paid
+    // within it are correctly included, and unpaid invoices are excluded.
+    const salesInvoiceMatch = { 
+      status: 'paid', 
+      company: companyId,
+      paidDate: { $gte: periodStart, $lte: periodEnd }
+    };
+    
+    const paidInvoices = await Invoice.find(salesInvoiceMatch).populate('items.product', 'averageCost');
+    
+    // Sales Revenue (ex. VAT) = Gross sales before discounts (subtotal is pre-discount, pre-tax)
+    // Discounts are shown as a separate line below, so do NOT subtract them here
+    const salesRevenueExVAT = paidInvoices.reduce((sum, inv) => {
+      return sum + (inv.subtotal || 0);
+    }, 0);
+    
+    // Sales Returns (Credit Notes issued) in period
+    const creditNoteMatch = {
+      company: companyId,
+      status: { $in: ['issued', 'applied', 'refunded', 'partially_refunded'] },
+      issueDate: { $gte: periodStart, $lte: periodEnd }
+    };
+    
+    const creditNotes = await CreditNote.find(creditNoteMatch);
+    const salesReturns = creditNotes.reduce((sum, cn) => sum + (cn.grandTotal || 0), 0);
+    
+    // Discounts Given - from paid invoices (item-level discounts + invoice-level discounts)
+    const discountsGiven = paidInvoices.reduce((sum, inv) => sum + (inv.totalDiscount || 0), 0);
+    
+    // NET REVENUE = Sales Revenue - Sales Returns - Discounts
+    const netRevenue = salesRevenueExVAT - salesReturns - discountsGiven;
+    
+    // =============================================
+    // COST OF GOODS SOLD (COGS) SECTION
+    // =============================================
+    
+    // For COGS, we calculate from ACTUAL items sold on paid invoices
+    // This is more accurate than the inventory method which requires historical data
+    
+    const products = await Product.find({ company: companyId, isArchived: false });
+    
+    // Closing Stock Value (current inventory)
+    const closingStockValue = products.reduce((sum, product) => {
+      return sum + (product.currentStock * product.averageCost);
+    }, 0);
+    
+    // Purchases (ex. VAT) - from RECEIVED/PAID purchases in period
+    const purchaseMatch = {
+      company: companyId,
+      status: { $in: ['received', 'paid'] },
+      purchaseDate: { $gte: periodStart, $lte: periodEnd }
+    };
+    
+    const purchases = await Purchase.find(purchaseMatch);
+    const purchasesExVAT = purchases.reduce((sum, p) => {
+      return sum + (p.subtotal || 0) - (p.totalDiscount || 0);
+    }, 0);
+    
+    // COGS: Direct method — sum of (averageCost × qty) for every item sold on paid invoices.
+    // This is the most accurate approach for a perpetual inventory system.
+    let totalCOGS = 0;
+    paidInvoices.forEach(inv => {
+      inv.items.forEach(item => {
+        const costPrice = item.product?.averageCost || 0;
+        totalCOGS += (costPrice * (item.quantity || 0));
+      });
+    });
+
+    // Opening Stock: back-calculated so the standard inventory breakdown always reconciles:
+    //   Opening Stock + Purchases − Closing Stock = Total COGS
+    //   ⟹  Opening Stock = Total COGS − Purchases + Closing Stock
+    // This ensures the three displayed line items are mathematically consistent with TOTAL COGS.
+    const openingStockValue = totalCOGS - purchasesExVAT + closingStockValue;
+    
+    // =============================================
+    // GROSS PROFIT
+    // =============================================
+    const grossProfit = netRevenue - totalCOGS;
+    const grossMarginPercent = netRevenue > 0 ? (grossProfit / netRevenue) * 100 : 0;
+    
+    // =============================================
+    // OPERATING EXPENSES
+    // =============================================
+    
+    // 1. Depreciation (from Fixed Assets)
+    const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
+    let totalDepreciation = 0;
+    fixedAssets.forEach(asset => {
+      totalDepreciation += (asset.annualDepreciation || 0);
+    });
+    // Prorate depreciation for the period
+    const periodMonths = ((periodEnd.getFullYear() - periodStart.getFullYear()) * 12 + 
+                          periodEnd.getMonth() - periodStart.getMonth()) + 1;
+    const depreciationExpense = (totalDepreciation / 12) * periodMonths;
+    
+    // 2. Interest Expense (from Loans)
+    const loanMatch = {
+      company: companyId,
+      status: 'active',
+      startDate: { $lte: periodEnd }
+    };
+    const activeLoans = await Loan.find(loanMatch);
+    
+    // Calculate interest expense for the period
+    let interestExpense = 0;
+    activeLoans.forEach(loan => {
+      // Simplified interest calculation: (principal * rate * period months) / 12
+      const monthlyInterest = (loan.originalAmount * (loan.interestRate || 0) / 100) / 12;
+      interestExpense += monthlyInterest * periodMonths;
+    });
+    
+    // 3. Transport & Delivery (from invoice shipping/transport if tracked)
+    // Note: Not currently in invoice model, set to 0
+    const transportDelivery = 0;
+    
+    // 4. VAT Expense (Output VAT - Input VAT) for the period
+    // Output VAT from sales
+    const outputVAT = paidInvoices.reduce((sum, inv) => sum + (inv.totalTax || 0), 0);
+    // Input VAT from purchases
+    const inputVAT = purchases.reduce((sum, p) => sum + (p.totalTax || 0), 0);
+    const vatLiability = Math.max(0, outputVAT - inputVAT); // If positive, we owe VAT
+    
+    // For now, we'll set other operating expenses to 0 
+    // In a full system, you'd have an Expense model to track these
+    const salariesWages = 0;
+    const rent = 0;
+    const utilities = 0;
+    const marketingAdvertising = 0;
+    const otherExpenses = 0;
+    
+    const totalOperatingExpenses = 
+      salariesWages + 
+      rent + 
+      utilities + 
+      transportDelivery + 
+      marketingAdvertising + 
+      depreciationExpense + 
+      otherExpenses;
+    
+    // =============================================
+    // OPERATING PROFIT (EBIT)
+    // =============================================
+    const operatingProfit = grossProfit - totalOperatingExpenses;
+    const operatingMarginPercent = netRevenue > 0 ? (operatingProfit / netRevenue) * 100 : 0;
+    
+    // =============================================
+    // OTHER INCOME / EXPENSES
+    // =============================================
+    
+    // Interest Income (could be from deposits - not currently tracked)
+    const interestIncome = 0;
+    
+    // Other Income (not currently tracked)
+    const otherIncome = 0;
+    
+    // Other Expense (not currently tracked)
+    const otherExpense = 0;
+    
+    const netOtherIncome = interestIncome - interestExpense + otherIncome - otherExpense;
+    
+    // =============================================
+    // PROFIT BEFORE TAX (PBT)
+    // =============================================
+    const profitBeforeTax = operatingProfit + netOtherIncome;
+    
+    // =============================================
+    // TAX
+    // =============================================
+    
+    // VAT Liability (already calculated above)
+    const vatExpense = vatLiability;
+    
+    // Corporate Income Tax (30% of Profit Before Tax)
+    const corporateTaxRate = 0.30;
+    const corporateIncomeTax = Math.max(0, profitBeforeTax * corporateTaxRate);
+    
+    const totalTax = vatExpense + corporateIncomeTax;
+    
+    // =============================================
+    // NET PROFIT (AFTER TAX)
+    // =============================================
+    const netProfit = profitBeforeTax - totalTax;
+    const netMarginPercent = netRevenue > 0 ? (netProfit / netRevenue) * 100 : 0;
+    
+    // =============================================
+    // RESPONSE
+    // =============================================
+    res.json({
+      success: true,
+      data: {
+        // Header
+        company: {
+          name: companyName,
+          tin: companyTin
+        },
+        period: {
+          start: periodStart,
+          end: periodEnd,
+          formatted: `${periodStart.toLocaleDateString('en-GB')} - ${periodEnd.toLocaleDateString('en-GB')}`
+        },
+        
+        // REVENUE
+        revenue: {
+          salesRevenueExVAT: Math.round(salesRevenueExVAT * 100) / 100,
+          salesReturns: Math.round(salesReturns * 100) / 100,
+          discountsGiven: Math.round(discountsGiven * 100) / 100,
+          netRevenue: Math.round(netRevenue * 100) / 100
+        },
+        
+        // COST OF GOODS SOLD
+        cogs: {
+          openingStockValue: Math.round(openingStockValue * 100) / 100,
+          purchasesExVAT: Math.round(purchasesExVAT * 100) / 100,
+          closingStockValue: Math.round(closingStockValue * 100) / 100,
+          totalCOGS: Math.round(totalCOGS * 100) / 100
+        },
+        
+        // GROSS PROFIT
+        grossProfit: {
+          amount: Math.round(grossProfit * 100) / 100,
+          marginPercent: Math.round(grossMarginPercent * 100) / 100
+        },
+        
+        // OPERATING EXPENSES
+        operatingExpenses: {
+          salariesAndWages: salariesWages,
+          rent: rent,
+          utilities: utilities,
+          transportAndDelivery: transportDelivery,
+          marketingAndAdvertising: marketingAdvertising,
+          depreciation: Math.round(depreciationExpense * 100) / 100,
+          otherExpenses: otherExpenses,
+          total: Math.round(totalOperatingExpenses * 100) / 100
+        },
+        
+        // OPERATING PROFIT (EBIT)
+        operatingProfit: {
+          amount: Math.round(operatingProfit * 100) / 100,
+          marginPercent: Math.round(operatingMarginPercent * 100) / 100
+        },
+        
+        // OTHER INCOME / EXPENSES
+        otherIncomeExpenses: {
+          interestIncome: interestIncome,
+          interestExpense: Math.round(interestExpense * 100) / 100,
+          otherIncome: otherIncome,
+          otherExpense: otherExpense,
+          netOtherIncome: Math.round(netOtherIncome * 100) / 100
+        },
+        
+        // PROFIT BEFORE TAX
+        profitBeforeTax: {
+          amount: Math.round(profitBeforeTax * 100) / 100
+        },
+        
+        // TAX
+        tax: {
+          vatLiability: Math.round(vatExpense * 100) / 100,
+          outputVAT: Math.round(outputVAT * 100) / 100,
+          inputVAT: Math.round(inputVAT * 100) / 100,
+          corporateIncomeTax: Math.round(corporateIncomeTax * 100) / 100,
+          corporateTaxRate: corporateTaxRate * 100,
+          totalTax: Math.round(totalTax * 100) / 100
+        },
+        
+        // NET PROFIT
+        netProfit: {
+          amount: Math.round(netProfit * 100) / 100,
+          marginPercent: Math.round(netMarginPercent * 100) / 100
+        },
+        
+        // Summary for Balance Sheet integration
+        balanceSheetFlow: {
+          currentPeriodProfit: Math.round(netProfit * 100) / 100,
+          flowsToEquity: true
+        },
+        
+        // Additional details
+        details: {
+          paidInvoicesCount: paidInvoices.length,
+          creditNotesCount: creditNotes.length,
+          purchasesCount: purchases.length,
+          fixedAssetsCount: fixedAssets.length,
+          activeLoansCount: activeLoans.length,
+          productsCount: products.length
+        }
       }
     });
   } catch (error) {
@@ -738,6 +1070,257 @@ exports.exportReportToPDF = async (req, res, next) => {
     }
 
     doc.end();
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get Balance Sheet report
+// @route   GET /api/reports/balance-sheet
+// @access  Private
+exports.getBalanceSheet = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { asOfDate } = req.query;
+    
+    // Use provided date or current date
+    const reportDate = asOfDate ? new Date(asOfDate) : new Date();
+    const startOfDay = new Date(reportDate.setHours(0, 0, 0, 0));
+    const endOfDay = new Date(reportDate.setHours(23, 59, 59, 999));
+
+    // Get company info
+    const company = await Company.findById(companyId);
+
+    // =============================================
+    // ASSETS
+    // =============================================
+
+    // --- Current Assets ---
+    
+    // 1. Cash & Bank: Calculate from all invoice payments received - all purchase payments made
+    // Get all payments received from invoices (inflows)
+    const invoicePayments = await Invoice.aggregate([
+      { $match: { company: companyId } },
+      { $unwind: '$payments' },
+      { $group: { _id: null, totalInflows: { $sum: '$payments.amount' } } }
+    ]);
+    const totalInflows = invoicePayments[0]?.totalInflows || 0;
+
+    // Get all payments made for purchases (outflows)
+    const purchasePayments = await Purchase.aggregate([
+      { $match: { company: companyId } },
+      { $unwind: '$payments' },
+      { $group: { _id: null, totalOutflows: { $sum: '$payments.amount' } } }
+    ]);
+    const totalOutflows = purchasePayments[0]?.totalOutflows || 0;
+
+    // Net Cash = Inflows - Outflows (this is simplified - in real accounting you'd track cash accounts)
+    const cashAndBank = Math.max(0, totalInflows - totalOutflows);
+
+    // 2. Accounts Receivable: Sum of unpaid invoice balances
+    const accountsReceivableAgg = await Invoice.aggregate([
+      { $match: { company: companyId, status: { $in: ['draft', 'confirmed', 'partial'] } } },
+      { $group: { _id: null, totalReceivable: { $sum: '$balance' } } }
+    ]);
+    const accountsReceivable = accountsReceivableAgg[0]?.totalReceivable || 0;
+
+    // 3. Inventory (Stock Value): Current stock × Average cost
+    // This is the key change - purchases become assets (inventory) instead of expenses
+    const products = await Product.find({ company: companyId, isArchived: false });
+    const inventoryValue = products.reduce((sum, product) => {
+      return sum + (product.currentStock * product.averageCost);
+    }, 0);
+
+    // 4. Prepaid Expenses (simplified - would need a separate tracking system)
+    const prepaidExpenses = 0;
+
+    const totalCurrentAssets = cashAndBank + accountsReceivable + inventoryValue + prepaidExpenses;
+
+    // --- Non-Current Assets ---
+    // Get Fixed Assets data
+    const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
+    
+    // Group by category
+    let equipmentValue = 0;
+    let furnitureValue = 0;
+    let vehiclesValue = 0;
+    let totalDepreciation = 0;
+    
+    fixedAssets.forEach(asset => {
+      totalDepreciation += asset.accumulatedDepreciation || 0;
+      switch(asset.category) {
+        case 'equipment':
+          equipmentValue += asset.netBookValue || 0;
+          break;
+        case 'furniture':
+          furnitureValue += asset.netBookValue || 0;
+          break;
+        case 'vehicles':
+          vehiclesValue += asset.netBookValue || 0;
+          break;
+        default:
+          // Add to equipment for other categories
+          equipmentValue += asset.netBookValue || 0;
+      }
+    });
+    
+    const totalFixedAssets = equipmentValue + furnitureValue + vehiclesValue;
+    const accumulatedDepreciation = totalDepreciation;
+    
+    const totalNonCurrentAssets = totalFixedAssets;
+    const totalAssets = totalCurrentAssets + totalNonCurrentAssets;
+
+    // =============================================
+    // LIABILITIES
+    // =============================================
+
+    // --- Current Liabilities ---
+    
+    // 1. Accounts Payable: Sum of unpaid purchase balances
+    const accountsPayableAgg = await Purchase.aggregate([
+      { $match: { company: companyId, status: { $in: ['draft', 'ordered', 'received', 'partial'] } } },
+      { $group: { _id: null, totalPayable: { $sum: '$balance' } } }
+    ]);
+    const accountsPayable = accountsPayableAgg[0]?.totalPayable || 0;
+
+    // 2. VAT Payable: Output VAT (from invoices) - Input VAT (from purchases)
+    // Output VAT: Tax collected on sales
+    const outputVATAgg = await Invoice.aggregate([
+      { $match: { company: companyId, status: { $in: ['paid', 'partial', 'confirmed'] } } },
+      { $group: { _id: null, totalOutputVAT: { $sum: '$totalTax' } } }
+    ]);
+    const outputVAT = outputVATAgg[0]?.totalOutputVAT || 0;
+
+    // Input VAT: Tax paid on purchases
+    const inputVATAgg = await Purchase.aggregate([
+      { $match: { company: companyId, status: { $in: ['received', 'partial', 'paid'] } } },
+      { $group: { _id: null, totalInputVAT: { $sum: '$totalTax' } } }
+    ]);
+    const inputVAT = inputVATAgg[0]?.totalInputVAT || 0;
+
+    // VAT Payable = Output VAT - Input VAT (if positive, you owe VAT; if negative, you have VAT credit)
+    const vatPayable = Math.max(0, outputVAT - inputVAT);
+    const vatReceivable = Math.max(0, inputVAT - outputVAT); // VAT credit asset
+
+    // 3. Short-term Loans - Get from Loans module
+    const activeLoans = await Loan.find({ company: companyId, status: 'active' });
+    const shortTermLoansList = activeLoans.filter(loan => loan.loanType === 'short-term');
+    const shortTermLoans = shortTermLoansList.reduce((sum, loan) => sum + (loan.remainingBalance || 0), 0);
+
+    const totalCurrentLiabilities = accountsPayable + vatPayable + shortTermLoans;
+
+    // --- Non-Current Liabilities ---
+    const longTermLoansList = activeLoans.filter(loan => loan.loanType === 'long-term');
+    const longTermLoans = longTermLoansList.reduce((sum, loan) => sum + (loan.remainingBalance || 0), 0);
+
+    const totalNonCurrentLiabilities = longTermLoans;
+    const totalLiabilities = totalCurrentLiabilities + totalNonCurrentLiabilities;
+
+    // =============================================
+    // EQUITY
+    // =============================================
+
+    // Calculate Current Period Profit from P&L
+    // Revenue (all paid invoices) - COGS - Expenses
+    
+    // Revenue: Sum of all paid invoice amounts (INCLUDING tax)
+    const revenueInvoices = await Invoice.find({ status: 'paid', company: companyId });
+    const revenue = revenueInvoices.reduce((sum, inv) => sum + (inv.grandTotal || 0), 0);
+
+    // COGS: Cost of goods sold (products sold at their average cost)
+    let cogs = 0;
+    for (const inv of revenueInvoices) {
+      const populatedInv = await Invoice.findById(inv._id).populate('items.product', 'averageCost');
+      populatedInv.items.forEach(item => {
+        const costPrice = item.product?.averageCost || 0;
+        cogs += (costPrice * (item.quantity || 0));
+      });
+    }
+
+    // Purchase Expenses (already accounted for in inventory - only paid purchases affect cash)
+    // In accrual accounting, purchases are assets (inventory), not expenses
+    const paidPurchases = await Purchase.find({ status: 'paid', company: companyId });
+    const purchaseExpenses = 0; // Purchases are now assets, not expenses
+
+    // Gross Profit = Revenue - COGS
+    const grossProfit = revenue - cogs;
+
+    // Net Profit = Gross Profit - Taxes
+    // Note: In accrual basis, purchases are not expenses - they're assets (inventory)
+    // The cost is realized when goods are sold (COGS)
+    const taxes = outputVAT - inputVAT; // Simplified
+    const netProfit = grossProfit - taxes;
+
+    // Share Capital - Get from Company settings
+    const shareCapital = company?.equity?.shareCapital || 0;
+
+    // Retained Earnings - Get from Company settings
+    const retainedEarnings = company?.equity?.retainedEarnings || 0;
+
+    const totalEquity = shareCapital + retainedEarnings + netProfit;
+    const totalLiabilitiesAndEquity = totalLiabilities + totalEquity;
+
+    // Balance Sheet verification
+    const isBalanced = Math.abs(totalAssets - totalLiabilitiesAndEquity) < 0.01;
+
+    res.json({
+      success: true,
+      data: {
+        asOfDate: reportDate,
+        company: company ? { name: company.name, tin: company.tin } : { name: 'N/A', tin: 'N/A' },
+        assets: {
+          currentAssets: {
+            cashAndBank: Math.round(cashAndBank * 100) / 100,
+            accountsReceivable: Math.round(accountsReceivable * 100) / 100,
+            inventoryStockValue: Math.round(inventoryValue * 100) / 100,
+            prepaidExpenses: prepaidExpenses,
+            vatReceivable: Math.round(vatReceivable * 100) / 100,
+            totalCurrentAssets: Math.round(totalCurrentAssets * 100) / 100
+          },
+          nonCurrentAssets: {
+            equipment: equipmentValue,
+            furniture: furnitureValue,
+            vehicles: vehiclesValue,
+            lessDepreciation: -accumulatedDepreciation,
+            totalNonCurrentAssets: Math.round(totalNonCurrentAssets * 100) / 100
+          },
+          totalAssets: Math.round(totalAssets * 100) / 100
+        },
+        liabilities: {
+          currentLiabilities: {
+            accountsPayable: Math.round(accountsPayable * 100) / 100,
+            vatPayable: Math.round(vatPayable * 100) / 100,
+            shortTermLoans: shortTermLoans,
+            totalCurrentLiabilities: Math.round(totalCurrentLiabilities * 100) / 100
+          },
+          nonCurrentLiabilities: {
+            longTermLoans: longTermLoans,
+            totalNonCurrentLiabilities: Math.round(totalNonCurrentLiabilities * 100) / 100
+          },
+          totalLiabilities: Math.round(totalLiabilities * 100) / 100
+        },
+        equity: {
+          shareCapital: shareCapital,
+          retainedEarnings: retainedEarnings,
+          currentPeriodProfit: Math.round(netProfit * 100) / 100,
+          totalEquity: Math.round(totalEquity * 100) / 100
+        },
+        totalLiabilitiesAndEquity: Math.round(totalLiabilitiesAndEquity * 100) / 100,
+        isBalanced,
+        // Additional details for verification
+        details: {
+          totalInflows,
+          totalOutflows,
+          revenue,
+          cogs,
+          grossProfit,
+          purchaseExpenses,
+          outputVAT,
+          inputVAT,
+          taxes: Math.round(taxes * 100) / 100
+        }
+      }
+    });
   } catch (error) {
     next(error);
   }

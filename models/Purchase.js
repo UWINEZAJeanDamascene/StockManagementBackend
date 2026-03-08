@@ -157,6 +157,19 @@ const purchaseSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Backwards-compatible field names expected by some consumers
+  taxAmount: {
+    type: Number,
+    default: 0
+  },
+  discount: {
+    type: Number,
+    default: 0
+  },
+  total: {
+    type: Number,
+    default: 0
+  },
   
   // Payment tracking
   amountPaid: {
@@ -269,6 +282,11 @@ purchaseSchema.pre('save', function(next) {
   } else if (this.amountPaid > 0 && this.amountPaid < this.roundedAmount) {
     this.status = 'partial';
   }
+
+  // Backwards-compatible aliases
+  this.taxAmount = this.totalTax;
+  this.discount = this.totalDiscount;
+  this.total = this.roundedAmount || this.grandTotal;
   
   next();
 });

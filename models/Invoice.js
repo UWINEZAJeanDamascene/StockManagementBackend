@@ -158,6 +158,19 @@ const invoiceSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Backwards-compatible field names expected by some consumers
+  taxAmount: {
+    type: Number,
+    default: 0
+  },
+  discount: {
+    type: Number,
+    default: 0
+  },
+  total: {
+    type: Number,
+    default: 0
+  },
   
   // Payment tracking
   amountPaid: {
@@ -276,6 +289,11 @@ invoiceSchema.pre('save', function(next) {
     
     // Rounded amount
     this.roundedAmount = Math.round(this.grandTotal * 100) / 100;
+    // Backwards-compatible aliases expected by other parts of the system
+    this.taxAmount = this.totalTax;
+    this.discount = this.totalDiscount;
+    // `total` should represent the invoice total amount. Prefer roundedAmount when available.
+    this.total = this.roundedAmount || this.grandTotal;
     
     // Always calculate balance - ensure it's never undefined
     this.balance = (this.roundedAmount || 0) - (this.amountPaid || 0);

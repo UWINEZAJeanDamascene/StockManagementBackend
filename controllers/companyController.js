@@ -140,7 +140,7 @@ exports.getCompany = async (req, res, next) => {
 // @access  Private (Admin only)
 exports.updateCompany = async (req, res, next) => {
   try {
-    const { name, tin, email, phone, address, settings } = req.body;
+    const { name, tin, email, phone, address, settings, equity } = req.body;
 
     const company = await Company.findById(req.user.company);
 
@@ -158,6 +158,7 @@ exports.updateCompany = async (req, res, next) => {
     if (phone) company.phone = phone;
     if (address) company.address = address;
     if (settings) company.settings = { ...company.settings, ...settings };
+    if (equity) company.equity = { ...company.equity, ...equity };
 
     await company.save();
 

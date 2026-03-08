@@ -51,6 +51,27 @@ const companySchema = new mongoose.Schema({
       default: 'YYYY-MM-DD'
     }
   },
+  // Equity settings for Balance Sheet
+  equity: {
+    shareCapital: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    retainedEarnings: {
+      type: Number,
+      default: 0
+    },
+    // Track accumulated profit/loss from previous periods
+    accumulatedProfit: {
+      type: Number,
+      default: 0
+    },
+    // Last year closing date for retained earnings calculation
+    lastClosingDate: {
+      type: Date
+    }
+  },
   // Subscription status
   subscription: {
     plan: {

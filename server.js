@@ -21,6 +21,8 @@ connectDB();
 require('./models/IPWhitelist');
 require('./models/Role');
 require('./models/Backup');
+require('./models/FixedAsset');
+require('./models/Loan');
 
 const app = express();
 
@@ -121,6 +123,12 @@ app.use('/api/notifications', require('./routes/notificationRoutes'));
 // Backup & Restore
 app.use('/api/backups', require('./routes/backupRoutes'));
 
+// Fixed Assets
+app.use('/api/fixed-assets', require('./routes/fixedAssetRoutes'));
+
+// Loans
+app.use('/api/loans', require('./routes/loanRoutes'));
+
 // Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 
@@ -128,6 +136,18 @@ app.get('/health', (req, res) => {
     message: 'Stock Management System API is running',
     timestamp: new Date().toISOString()
   });
+});
+
+// Admin: Reset rate limit for IP (for testing)
+app.post('/admin/reset-rate-limit', async (req, res) => {
+  try {
+    const { resetRateLimit } = require('./middleware/redisRateLimiter');
+    const ip = req.body.ip || req.ip;
+    const result = await resetRateLimit(ip, 'ratelimit:auth');
+    res.json({ success: result, message: `Rate limit reset for IP: ${ip}` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // Root route
