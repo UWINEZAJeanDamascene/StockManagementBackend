@@ -25,7 +25,7 @@ const purchaseReturnItemSchema = new mongoose.Schema({
   },
   reason: {
     type: String,
-    enum: ['wrong_goods', 'damaged', 'overdelivery', 'wrong_specifications', 'other'],
+    enum: ['wrong_goods', 'damaged', 'overdelivery', 'wrong_specifications', 'quality_issues', 'expired', 'other'],
     default: 'other'
   },
   notes: String
