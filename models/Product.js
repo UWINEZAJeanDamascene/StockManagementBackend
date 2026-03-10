@@ -85,6 +85,11 @@ const productSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
+  sellingPrice: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
   lastSupplyDate: {
     type: Date
   },
@@ -123,6 +128,18 @@ const productSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Supplier'
   },
+  // Tax settings: product-level default tax code and rate
+  taxCode: {
+    type: String,
+    enum: ['A', 'B', 'None'],
+    default: 'A'
+  },
+  taxRate: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
   history: [productHistorySchema],
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -138,6 +155,12 @@ productSchema.index({ company: 1, sku: 1 }, { unique: true });
 productSchema.index({ name: 'text', sku: 'text', description: 'text' });
 // Index for company filtering
 productSchema.index({ company: 1 });
+
+// Performance indexes for reports and queries
+productSchema.index({ company: 1, category: 1 });
+productSchema.index({ company: 1, isArchived: 1 });
+productSchema.index({ company: 1, currentStock: 1 });
+productSchema.index({ supplier: 1 });
 
 // Virtual for low stock alert
 productSchema.virtual('isLowStock').get(function() {

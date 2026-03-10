@@ -66,6 +66,9 @@ exports.getCategory = async (req, res, next) => {
 exports.createCategory = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { name } = req.body;
+    
+    // Allow duplicate category names per request — uniqueness enforced at DB only if needed
     
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
@@ -77,6 +80,13 @@ exports.createCategory = async (req, res, next) => {
       data: category
     });
   } catch (error) {
+    // Handle duplicate key error
+    if (error.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category with this name already exists'
+      });
+    }
     next(error);
   }
 };
@@ -87,6 +97,9 @@ exports.createCategory = async (req, res, next) => {
 exports.updateCategory = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { name } = req.body;
+    
+    // Allow updating name even if duplicates exist
     
     const category = await Category.findOneAndUpdate(
       { _id: req.params.id, company: companyId },
@@ -109,6 +122,13 @@ exports.updateCategory = async (req, res, next) => {
       data: category
     });
   } catch (error) {
+    // Handle duplicate key error
+    if (error.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category with this name already exists'
+      });
+    }
     next(error);
   }
 };

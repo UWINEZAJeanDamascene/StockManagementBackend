@@ -90,4 +90,10 @@ stockMovementSchema.index({ product: 1, movementDate: -1 });
 stockMovementSchema.index({ supplier: 1, movementDate: -1 });
 stockMovementSchema.index({ type: 1, movementDate: -1 });
 
+// Performance indexes for reports
+stockMovementSchema.index({ company: 1, type: 1 });
+stockMovementSchema.index({ company: 1, reason: 1 });
+stockMovementSchema.index({ company: 1, movementDate: 1 });
+stockMovementSchema.index({ product: 1, type: 1 });
+
 module.exports = mongoose.model('StockMovement', stockMovementSchema);

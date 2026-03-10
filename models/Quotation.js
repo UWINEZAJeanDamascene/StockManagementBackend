@@ -84,6 +84,9 @@ const quotationSchema = new mongoose.Schema({
   },
   terms: String,
   notes: String,
+  // Store company and client TINs for PDF/printing convenience
+  companyTin: String,
+  clientTin: String,
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

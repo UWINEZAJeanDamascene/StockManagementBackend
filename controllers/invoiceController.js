@@ -4,15 +4,12 @@ const Client = require('../models/Client');
 const StockMovement = require('../models/StockMovement');
 const InvoiceReceiptMetadata = require('../models/InvoiceReceiptMetadata');
 const PDFDocument = require('pdfkit');
-const notificationService = require('../services/notificationService');
-const {
-  notifyInvoiceCreated,
-  notifyPaymentReceived,
-  notifyPaymentOverdue,
-  notifyInvoiceSent
-} = require('../services/notificationHelper');
+const notificationService = require('../services/notificationHelper');
 const emailService = require('../services/emailService');
 const Company = require('../models/Company');
+const cacheService = require('../services/cacheService');
+
+const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notifyInvoiceSent } = require('../services/notificationHelper');
 
 // @desc    Get all invoices
 // @route   GET /api/invoices
@@ -112,7 +109,7 @@ exports.createInvoice = async (req, res, next) => {
       });
     }
 
-    // Validate stock availability for all items BEFORE creating
+    const productMap = {};
     for (const item of items) {
       const product = await Product.findOne({ _id: item.product, company: companyId });
       if (!product) {
@@ -121,6 +118,7 @@ exports.createInvoice = async (req, res, next) => {
           message: `Product not found: ${item.product}`
         });
       }
+      productMap[item.product.toString()] = product;
       if (product.currentStock < item.quantity) {
         return res.status(400).json({
           success: false,
@@ -134,13 +132,17 @@ exports.createInvoice = async (req, res, next) => {
       const subtotal = item.quantity * item.unitPrice;
       const discount = item.discount || 0;
       const netAmount = subtotal - discount;
-      const taxRate = item.taxRate || 0;
+      const product = productMap[item.product.toString()];
+      const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
+      const taxCode = item.taxCode || product?.taxCode || 'A';
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
-      
+
       return {
         ...item,
         itemCode: item.itemCode || `ITEM-${index + 1}`,
+        taxCode,
+        taxRate,
         subtotal,
         taxAmount,
         totalWithTax
@@ -160,14 +162,12 @@ exports.createInvoice = async (req, res, next) => {
     await invoice.populate('client items.product createdBy');
 
     // Attempt to send invoice email to client if email exists
-    // Only send if explicitly requested or if client email exists
     const sendEmailOnCreate = req.body.sendEmail || false;
     if (sendEmailOnCreate) {
       try {
         const company = await Company.findById(companyId);
         const clientData = await Client.findById(clientId);
         await emailService.sendInvoiceEmail(invoice, company, clientData);
-        // Notify that invoice was sent
         try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
       } catch (emailErr) {
         console.error('Invoice email error:', emailErr);
@@ -215,6 +215,8 @@ exports.updateInvoice = async (req, res, next) => {
 
     // If items are updated, validate stock
     if (req.body.items) {
+      // build product map for provided items
+      const updateProductMap = {};
       for (const item of req.body.items) {
         const product = await Product.findOne({ _id: item.product, company: companyId });
         if (!product) {
@@ -223,6 +225,7 @@ exports.updateInvoice = async (req, res, next) => {
             message: `Product not found: ${item.product}`
           });
         }
+        updateProductMap[item.product.toString()] = product;
         if (product.currentStock < item.quantity) {
           return res.status(400).json({
             success: false,
@@ -230,18 +233,22 @@ exports.updateInvoice = async (req, res, next) => {
           });
         }
       }
-      
-      // Recalculate item totals
+
+      // Recalculate item totals using product defaults when missing
       req.body.items = req.body.items.map((item, index) => {
         const subtotal = item.quantity * item.unitPrice;
         const discount = item.discount || 0;
         const netAmount = subtotal - discount;
-        const taxRate = item.taxRate || 0;
+        const product = updateProductMap[item.product.toString()];
+        const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
+        const taxCode = item.taxCode || product?.taxCode || 'A';
         const taxAmount = netAmount * (taxRate / 100);
         const totalWithTax = netAmount + taxAmount;
         return {
           ...item,
           itemCode: item.itemCode || `ITEM-${index + 1}`,
+          taxCode,
+          taxRate,
           subtotal,
           taxAmount,
           totalWithTax
@@ -373,12 +380,14 @@ exports.confirmInvoice = async (req, res, next) => {
     invoice.confirmedDate = new Date();
     invoice.confirmedBy = req.user.id;
     await invoice.save();
+
     // Notify payment received
     try {
-      await notifyPaymentReceived(companyId, invoice, amount);
+      await notifyPaymentReceived(companyId, invoice, 0);
     } catch (e) {
       console.error('notifyPaymentReceived failed', e);
     }
+
     // Update linked quotation if exists
     if (invoice.quotation) {
       const Quotation = require('../models/Quotation');
@@ -394,6 +403,13 @@ exports.confirmInvoice = async (req, res, next) => {
     if (client) {
       client.outstandingBalance += invoice.roundedAmount;
       await client.save();
+    }
+
+    // Invalidate report cache
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
     }
 
     res.json({
@@ -449,13 +465,12 @@ exports.recordPayment = async (req, res, next) => {
 
     invoice.amountPaid += amount;
 
-    // Explicitly recalculate balance to ensure it's correct
+    // Explicitly recalculate balance
     invoice.balance = invoice.roundedAmount - invoice.amountPaid;
     if (invoice.balance < 0) invoice.balance = 0;
 
     // Auto-confirm if stock not yet deducted and payment is made
     if (!invoice.stockDeducted && invoice.status === 'draft') {
-      // Deduct stock on first payment
       for (const item of invoice.items) {
         const product = await Product.findOne({ _id: item.product._id, company: companyId });
         
@@ -493,7 +508,7 @@ exports.recordPayment = async (req, res, next) => {
       invoice.confirmedBy = req.user.id;
     }
 
-    // Update client stats whenever a payment is recorded
+    // Update client stats
     const client = await Client.findOne({ _id: invoice.client, company: companyId });
     if (client) {
       client.totalPurchases += amount;
@@ -510,6 +525,13 @@ exports.recordPayment = async (req, res, next) => {
       await notifyPaymentReceived(companyId, invoice, amount);
     } catch (e) {
       console.error('notifyPaymentReceived failed', e);
+    }
+
+    // Invalidate report cache
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
     }
 
     res.json({
@@ -555,7 +577,6 @@ exports.cancelInvoice = async (req, res, next) => {
           const previousStock = product.currentStock;
           const newStock = previousStock + item.quantity;
 
-          // Create reversal stock movement
           await StockMovement.create({
             company: companyId,
             product: product._id,
@@ -574,7 +595,6 @@ exports.cancelInvoice = async (req, res, next) => {
             performedBy: req.user.id
           });
 
-          // Update product stock
           product.currentStock = newStock;
           await product.save();
         }
@@ -596,6 +616,13 @@ exports.cancelInvoice = async (req, res, next) => {
     invoice.cancellationReason = reason;
 
     await invoice.save();
+
+    // Invalidate report cache
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
 
     res.json({
       success: true,
@@ -624,18 +651,15 @@ exports.saveReceiptMetadata = async (req, res, next) => {
       });
     }
 
-    // Check if metadata already exists
     let metadata = await InvoiceReceiptMetadata.findOne({ invoice: invoice._id, company: companyId });
 
     if (metadata) {
-      // Update existing
       metadata = await InvoiceReceiptMetadata.findByIdAndUpdate(
         metadata._id,
         { sdcId, receiptNumber, receiptSignature, internalData, mrcCode, deviceId, fiscalDate },
         { new: true }
       );
     } else {
-      // Create new
       metadata = await InvoiceReceiptMetadata.create({
         invoice: invoice._id,
         company: companyId,
@@ -718,8 +742,11 @@ exports.generateInvoicePDF = async (req, res, next) => {
       });
     }
 
-    // Create PDF document
-    const doc = new PDFDocument({ margin: 50 });
+    // Get company info
+    const company = await Company.findById(companyId);
+
+    // Create PDF document with more breathable layout
+    const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true });
 
     // Set response headers
     res.setHeader('Content-Type', 'application/pdf');
@@ -728,99 +755,260 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Pipe PDF to response
     doc.pipe(res);
 
-    // Header
-    doc.fontSize(20).text('INVOICE', { align: 'center' });
-    doc.moveDown();
-    
-    doc.fontSize(12).text(`Invoice Number: ${invoice.invoiceNumber}`);
-    doc.text(`Invoice Date: ${new Date(invoice.invoiceDate).toLocaleDateString()}`);
-    doc.text(`Due Date: ${invoice.dueDate ? new Date(invoice.dueDate).toLocaleDateString() : 'N/A'}`);
-    doc.text(`Status: ${invoice.status.toUpperCase()}`);
-    doc.text(`Currency: ${invoice.currency || 'FRW'}`);
-    doc.moveDown();
+    const currency = invoice.currency || 'FRW';
+    const currencySymbol = currency === 'USD' ? '$' : '';
 
-    // Client info
-    doc.text('Bill To:', { underline: true });
-    doc.text(invoice.customerName || invoice.client?.name || 'N/A');
-    if (invoice.customerTin) doc.text(`TIN: ${invoice.customerTin}`);
-    if (invoice.customerAddress) doc.text(invoice.customerAddress);
-    if (invoice.client?.contact?.phone) doc.text(`Phone: ${invoice.client.contact.phone}`);
-    if (invoice.client?.contact?.email) doc.text(`Email: ${invoice.client.contact.email}`);
-    doc.moveDown(2);
+    // Helper to format money
+    const fmt = (v) => (currencySymbol ? `${currencySymbol} ${Number(v || 0).toFixed(2)}` : Number(v || 0).toLocaleString());
 
-    // Items table header
-    const tableTop = doc.y;
-    doc.fontSize(10);
-    doc.text('Item', 50, tableTop);
-    doc.text('Code', 180, tableTop);
-    doc.text('Qty', 230, tableTop);
-    doc.text('Price', 270, tableTop);
-    doc.text('Tax', 330, tableTop);
-    doc.text('Total', 400, tableTop);
+    // Page counter
+    let pageNumber = 1;
 
-    let yPosition = tableTop + 20;
-    doc.fontSize(9);
-    invoice.items.forEach(item => {
+    // Draw header - reusable for first page and subsequent pages
+    const drawHeader = () => {
+      // Clear top area
+      doc.fillColor('#1f2937').font('Helvetica-Bold').fontSize(20);
+      doc.text(company?.name || 'Company', 50, 48);
+
+      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
+      const contactX = 50;
+      let contactY = 70;
+      if (company?.address) { doc.text(company.address, contactX, contactY, { width: 260 }); contactY += 12; }
+      if (company?.phone) { doc.text(`Phone: ${company.phone}`, contactX, contactY); contactY += 12; }
+      if (company?.email) { doc.text(`Email: ${company.email}`, contactX, contactY); }
+
+      // Invoice title block
+      doc.fontSize(26).fillColor('#111827').font('Helvetica-Bold');
+      doc.text('INVOICE', 0, 50, { align: 'right' });
+      doc.fontSize(10).font('Helvetica').fillColor('#6b7280');
+      doc.text(`# ${invoice.invoiceNumber}`, 0, 80, { align: 'right' });
+
+      // Status badge
+      const statusColors = {
+        'draft': ['#6b7280', 'Draft'],
+        'confirmed': ['#f59e0b', 'Confirmed'],
+        'paid': ['#10b981', 'Paid'],
+        'partial': ['#3b82f6', 'Partial'],
+        'cancelled': ['#ef4444', 'Cancelled']
+      };
+      const statusInfo = statusColors[invoice.status] || ['#6b7280', invoice.status];
+      doc.fillColor(statusInfo[0]).font('Helvetica-Bold').fontSize(10);
+      doc.text(statusInfo[1].toUpperCase(), 0, 98, { align: 'right' });
+
+      // Horizontal rule
+      doc.moveTo(50, 120).lineTo(doc.page.width - 50, 120).lineWidth(0.5).strokeColor('#e5e7eb').stroke();
+    };
+
+    // Footer: page numbers and timestamp
+    const drawFooter = (pn) => {
+      const bottom = doc.page.height - 40;
+      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
+      doc.text(`Generated: ${new Date().toLocaleString()}`, 50, bottom, { align: 'left' });
+      doc.text(`Page ${pn}`, 0, bottom, { align: 'right' });
+    };
+
+    // Draw invoice details and bill-to box
+    const drawInvoiceDetails = (startY) => {
+      // Dates box
+      doc.rect(50, startY, 230, 80).fillAndStroke('#ffffff', '#e5e7eb');
+      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
+      doc.text('INVOICE DETAILS', 60, startY + 8);
+
+      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
+      doc.text('Invoice Date:', 60, startY + 26);
+      doc.fillColor('#111827').text(new Date(invoice.invoiceDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }), 140, startY + 26);
+
+      doc.fillColor('#6b7280').text('Due Date:', 60, startY + 42);
+      doc.fillColor('#111827').text(invoice.dueDate ? new Date(invoice.dueDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'On Delivery', 140, startY + 42);
+
+      doc.fillColor('#6b7280').text('Currency:', 60, startY + 58);
+      doc.fillColor('#111827').text(currency, 140, startY + 58);
+
+      // Bill To
+      doc.rect(300, startY, 250, 80).fillAndStroke('#ffffff', '#e5e7eb');
+      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
+      doc.text('BILL TO', 310, startY + 8);
+      doc.font('Helvetica').fontSize(10).fillColor('#111827');
+      doc.text(invoice.customerName || invoice.client?.name || 'N/A', 310, startY + 28);
+      doc.fontSize(9).fillColor('#6b7280');
+      if (invoice.customerTin) doc.text(`TIN: ${invoice.customerTin}`, 310, startY + 44);
+      if (invoice.customerAddress) doc.text(invoice.customerAddress, 310, startY + 58, { width: 230 });
+    };
+
+    // Table header renderer (callable on new pages)
+    const tableHeader = (y) => {
+      doc.rect(50, y, doc.page.width - 100, 28).fill('#111827');
+      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
+      doc.text('#', 56, y + 8);
+      doc.text('Item / Description', 80, y + 8);
+      doc.text('Qty', 320, y + 8, { width: 30, align: 'right' });
+      doc.text('Unit Price', 370, y + 8, { width: 70, align: 'right' });
+      doc.text('Tax', 450, y + 8, { width: 50, align: 'right' });
+      doc.text('Total', 510, y + 8, { width: 70, align: 'right' });
+    };
+
+    // Start first page
+    drawHeader();
+    drawInvoiceDetails(140);
+
+    // Table
+    let y = 230;
+    tableHeader(y);
+    y += 36;
+    doc.font('Helvetica').fontSize(9).fillColor('#111827');
+
+    // Rows with automatic page breaks and repeated header
+    invoice.items.forEach((item, idx) => {
+      // Page break if low space
+      if (y > doc.page.height - 150) {
+        // footer for the page
+        drawFooter(pageNumber);
+        doc.addPage();
+        pageNumber += 1;
+        drawHeader();
+        y = 140; // position after header
+        tableHeader(y);
+        y += 36;
+        doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      }
+
+      // Alternate background
+      if (idx % 2 === 0) {
+        doc.rect(50, y - 6, doc.page.width - 100, 18).fill('#f9fafb');
+        doc.fillColor('#111827');
+      }
+
       const productName = item.product?.name || item.description || 'N/A';
-      const code = item.itemCode || '-';
-      const qty = `${item.quantity} ${item.unit || ''}`;
-      const price = `$${item.unitPrice.toFixed(2)}`;
-      const tax = `${item.taxCode || 'A'}: ${item.taxRate}%`;
-      const total = `$${item.totalWithTax.toFixed(2)}`;
-      
-      doc.text(productName.substring(0, 25), 50, yPosition);
-      doc.text(code, 180, yPosition);
-      doc.text(qty, 230, yPosition);
-      doc.text(price, 270, yPosition);
-      doc.text(tax, 330, yPosition);
-      doc.text(total, 400, yPosition);
-      yPosition += 18;
+      doc.fillColor('#111827');
+      doc.text(`${idx + 1}`, 56, y);
+      doc.text(productName, 80, y, { width: 230 });
+      doc.text((item.quantity || 0).toString(), 320, y, { width: 40, align: 'right' });
+      doc.text(fmt(item.unitPrice), 370, y, { width: 70, align: 'right' });
+      doc.text(`${item.taxCode || 'A'} (${item.taxRate}%)`, 450, y, { width: 50, align: 'right' });
+      doc.text(fmt(item.totalWithTax), 510, y, { width: 70, align: 'right' });
+      y += 20;
     });
 
-    yPosition += 20;
-    
-    // Tax breakdown
-    doc.fontSize(11);
-    doc.text('Tax Breakdown:', 300, yPosition);
-    yPosition += 18;
-    doc.fontSize(10);
-    doc.text(`Total A-Ex (0%): $${invoice.totalAEx?.toFixed(2) || '0.00'}`, 300, yPosition);
-    yPosition += 15;
-    doc.text(`Total B (18%): $${invoice.totalB18?.toFixed(2) || '0.00'}`, 300, yPosition);
-    yPosition += 15;
-    doc.text(`Tax A: $${invoice.totalTaxA?.toFixed(2) || '0.00'}`, 300, yPosition);
-    yPosition += 15;
-    doc.text(`Tax B: $${invoice.totalTaxB?.toFixed(2) || '0.00'}`, 300, yPosition);
-    yPosition += 25;
-
-    // Totals
-    doc.fontSize(12);
-    doc.text(`Subtotal: $${invoice.subtotal.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.text(`Tax: $${invoice.totalTax.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.fontSize(14).text(`Grand Total: $${invoice.grandTotal.toFixed(2)}`, 350, yPosition, { bold: true });
-    yPosition += 18;
-    doc.fontSize(12).text(`Rounded: $${invoice.roundedAmount?.toFixed(2) || invoice.grandTotal.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.text(`Paid: $${invoice.amountPaid.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.text(`Balance: $${invoice.balance.toFixed(2)}`, 350, yPosition);
-
-    if (invoice.terms || invoice.notes) {
-      doc.moveDown(2);
-      if (invoice.terms) {
-        doc.text('Terms:', { underline: true });
-        doc.fontSize(10).text(invoice.terms);
-        doc.moveDown();
-      }
-      if (invoice.notes) {
-        doc.text('Notes:', { underline: true });
-        doc.fontSize(10).text(invoice.notes);
-      }
+    // Draw totals block (ensure space)
+    if (y > doc.page.height - 200) {
+      drawFooter(pageNumber);
+      doc.addPage();
+      pageNumber += 1;
+      drawHeader();
+      y = 140;
     }
 
-    // Finalize PDF
+    const totalsX = doc.page.width - 260;
+    doc.rect(totalsX - 10, y, 230, 110).fill('#ffffff').stroke('#e5e7eb');
+    let ty = y + 8;
+    doc.fillColor('#6b7280').fontSize(10).font('Helvetica');
+    doc.text('Subtotal', totalsX, ty, { width: 140, align: 'left' });
+    doc.fillColor('#111827').text(fmt(invoice.subtotal), totalsX + 100, ty, { width: 120, align: 'right' });
+    ty += 18;
+
+    if (invoice.totalDiscount > 0) {
+      doc.fillColor('#10b981').text('Discount', totalsX, ty);
+      doc.fillColor('#10b981').text(`- ${fmt(invoice.totalDiscount)}`, totalsX + 100, ty, { width: 120, align: 'right' });
+      ty += 18;
+    }
+
+    doc.fillColor('#6b7280').text('Tax', totalsX, ty);
+    doc.fillColor('#111827').text(fmt(invoice.totalTax), totalsX + 100, ty, { width: 120, align: 'right' });
+    ty += 18;
+
+    if (invoice.roundedAmount && invoice.roundedAmount !== invoice.grandTotal) {
+      doc.fillColor('#6b7280').text('Rounded', totalsX, ty);
+      doc.fillColor('#111827').text(fmt(invoice.roundedAmount), totalsX + 100, ty, { width: 120, align: 'right' });
+      ty += 18;
+    }
+
+    doc.rect(totalsX - 10, ty - 6, 230, 40).fill('#111827');
+    doc.fillColor('#ffffff').fontSize(12).font('Helvetica-Bold');
+    doc.text('GRAND TOTAL', totalsX, ty, { width: 140, align: 'left' });
+    doc.text(fmt(invoice.grandTotal), totalsX + 100, ty + 2, { width: 120, align: 'right' });
+    ty += 52;
+
+    if (invoice.amountPaid > 0) {
+      doc.fillColor('#10b981').fontSize(10).font('Helvetica');
+      doc.text('Paid', totalsX, ty - 8, { width: 140, align: 'left' });
+      doc.text(`- ${fmt(invoice.amountPaid)}`, totalsX + 100, ty - 8, { width: 120, align: 'right' });
+      ty += 18;
+
+      doc.fillColor('#ef4444').fontSize(11).font('Helvetica-Bold');
+      doc.text('BALANCE DUE', totalsX, ty - 8, { width: 140, align: 'left' });
+      doc.text(fmt(invoice.balance), totalsX + 100, ty - 8, { width: 120, align: 'right' });
+    }
+
+    // Payment history
+    y += 130;
+    if (invoice.payments && invoice.payments.length > 0) {
+      if (y > doc.page.height - 120) {
+        drawFooter(pageNumber);
+        doc.addPage();
+        pageNumber += 1;
+        drawHeader();
+        y = 140;
+      }
+
+      doc.rect(50, y, doc.page.width - 100, 20).fill('#f0fdf4');
+      doc.fillColor('#166534').fontSize(10).font('Helvetica-Bold');
+      doc.text('PAYMENT HISTORY', 56, y + 5);
+      y += 28;
+
+      doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      invoice.payments.forEach((payment, idx) => {
+        if (y > doc.page.height - 100) {
+          drawFooter(pageNumber);
+          doc.addPage();
+          pageNumber += 1;
+          drawHeader();
+          y = 140;
+        }
+
+        doc.text(`${idx + 1}. ${payment.paymentMethod?.replace(/_/g, ' ').toUpperCase() || 'Payment'}`, 56, y);
+        doc.text(fmt(payment.amount), 510, y, { width: 70, align: 'right' });
+        doc.text(`Ref: ${payment.reference || 'N/A'}`, 300, y);
+        doc.text(`Date: ${payment.paidDate ? new Date(payment.paidDate).toLocaleDateString() : 'N/A'}`, 380, y);
+        y += 16;
+      });
+    }
+
+    // Terms and notes
+    y += 18;
+    if (invoice.terms) {
+      if (y > doc.page.height - 120) {
+        drawFooter(pageNumber);
+        doc.addPage();
+        pageNumber += 1;
+        drawHeader();
+        y = 140;
+      }
+      doc.rect(50, y, doc.page.width - 100, 30).fill('#fffbeb');
+      doc.fillColor('#92400e').fontSize(10).font('Helvetica-Bold');
+      doc.text('TERMS & CONDITIONS', 56, y + 6);
+      y += 20;
+      doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      doc.text(invoice.terms, 56, y + 6, { width: doc.page.width - 120 });
+      y += 40;
+    }
+
+    if (invoice.notes) {
+      if (y > doc.page.height - 120) {
+        drawFooter(pageNumber);
+        doc.addPage();
+        pageNumber += 1;
+        drawHeader();
+        y = 140;
+      }
+      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
+      doc.text('NOTES', 56, y);
+      y += 14;
+      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
+      doc.text(invoice.notes, 56, y, { width: doc.page.width - 120 });
+    }
+
+    // Finalize: draw footer on last page then end
+    drawFooter(pageNumber);
     doc.end();
   } catch (error) {
     next(error);
@@ -857,8 +1045,10 @@ exports.sendInvoiceEmail = async (req, res, next) => {
 
     // Send the invoice email
     await emailService.sendInvoiceEmail(invoice, company, clientData);
+    
     // Notify invoice sent
     try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
+    
     res.json({
       success: true,
       message: 'Invoice sent to ' + clientEmail

@@ -224,6 +224,12 @@ const purchaseSchema = new mongoose.Schema({
 purchaseSchema.index({ company: 1, purchaseNumber: 1 }, { unique: true });
 purchaseSchema.index({ company: 1 });
 
+// Performance indexes for reports
+purchaseSchema.index({ company: 1, status: 1 });
+purchaseSchema.index({ company: 1, purchaseDate: 1 });
+purchaseSchema.index({ company: 1, supplier: 1 });
+purchaseSchema.index({ 'payments.paidDate': 1 });
+
 // Auto-generate purchase number
 purchaseSchema.pre('save', async function(next) {
   if (this.isNew && !this.purchaseNumber) {

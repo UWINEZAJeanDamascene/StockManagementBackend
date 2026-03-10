@@ -50,14 +50,14 @@ exports.createSale = async (req, res, next) => {
       const quantity = it.quantity || 1;
       const unitPrice = it.unitPrice != null ? it.unitPrice : 0;
       const discount = it.discount || 0;
-      // Normalize tax code and rate
-      let itemTaxCode = it.taxCode || defaultTaxCode; // 'A' or 'B'
-      // Derive rate from code if not provided
-      let derivedRateFromCode = itemTaxCode === 'B' ? (company?.settings?.taxRate ?? 18) : 0;
-      let itemTaxRate = (it.taxRate != null ? it.taxRate : derivedRateFromCode);
-      // Ensure consistency: if rate > 0, code must be 'B'; if rate = 0, code 'A'
+      // Normalize tax code and rate - prefer product defaults
+      let itemTaxCode = it.taxCode || product.taxCode || defaultTaxCode; // prefer item -> product -> company
+      // Derive rate from product or company settings if not provided
+      let derivedRateFromCode = product?.taxRate != null ? product.taxRate : (itemTaxCode === 'B' ? (company?.settings?.taxRate ?? 18) : 0);
+      let itemTaxRate = (it.taxRate != null ? it.taxRate : (product?.taxRate != null ? product.taxRate : derivedRateFromCode));
+      // Ensure consistency: if rate > 0, code must be 'B'; if rate = 0, code 'A' or 'None'
       if (itemTaxRate > 0 && itemTaxCode !== 'B') itemTaxCode = 'B';
-      if ((itemTaxRate === 0 || itemTaxRate == null) && itemTaxCode !== 'A') itemTaxCode = 'A';
+      if ((itemTaxRate === 0 || itemTaxRate == null) && itemTaxCode !== 'A' && itemTaxCode !== 'None') itemTaxCode = 'A';
 
       const itemSubtotal = quantity * unitPrice;
       const netAmount = itemSubtotal - discount;

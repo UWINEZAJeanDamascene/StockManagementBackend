@@ -28,8 +28,8 @@ const categorySchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Compound index for company + unique name
-categorySchema.index({ company: 1, name: 1 }, { unique: true });
+// Compound index for company + name (allow duplicates across names)
+categorySchema.index({ company: 1, name: 1 });
 categorySchema.index({ company: 1 });
 
 module.exports = mongoose.model('Category', categorySchema);

@@ -13,6 +13,7 @@ const {
   // new reports
   getProfitAndLossReport,
   getProfitAndLossDetailed,
+  getProfitAndLossFull,
   getAgingReport,
   getVATSummaryReport,
   getProductPerformanceReport,
@@ -36,6 +37,7 @@ router.get('/export/excel/:reportType', exportReportToExcel);
 router.get('/export/pdf/:reportType', exportReportToPDF);
 router.get('/profit-and-loss', cacheMiddleware({ type: 'report', ttl: 900 }), getProfitAndLossReport);
 router.get('/profit-and-loss-detailed', getProfitAndLossDetailed);
+router.get('/profit-and-loss-full', getProfitAndLossFull);
 router.get('/aging', cacheMiddleware({ type: 'report', ttl: 900 }), getAgingReport);
 router.get('/vat-summary', cacheMiddleware({ type: 'report', ttl: 900 }), getVATSummaryReport);
 router.get('/product-performance', cacheMiddleware({ type: 'report', ttl: 900 }), getProductPerformanceReport);

@@ -72,6 +72,65 @@ const companySchema = new mongoose.Schema({
       type: Date
     }
   },
+  // Additional assets for Balance Sheet (manual entries)
+  assets: {
+    // Current assets - prepaid expenses
+    prepaidExpenses: {
+      type: Number,
+      default: 0,
+      min: 0
+    }
+  },
+  // Additional liabilities for Balance Sheet (dynamic fields)
+  liabilities: {
+    // Current liabilities (due within 12 months)
+    currentLiabilities: [{
+      name: {
+        type: String,
+        required: true
+      },
+      amount: {
+        type: Number,
+        default: 0,
+        min: 0
+      },
+      description: String,
+      createdAt: {
+        type: Date,
+        default: Date.now
+      }
+    }],
+    // Non-current liabilities (due after 12 months)
+    nonCurrentLiabilities: [{
+      name: {
+        type: String,
+        required: true
+      },
+      amount: {
+        type: Number,
+        default: 0,
+        min: 0
+      },
+      description: String,
+      dueDate: Date,
+      createdAt: {
+        type: Date,
+        default: Date.now
+      }
+    }],
+    // Accrued Expenses (current liability) - manual entry
+    accruedExpenses: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    // Other Long-term Liabilities - manual entry
+    otherLongTermLiabilities: {
+      type: Number,
+      default: 0,
+      min: 0
+    }
+  },
   // Subscription status
   subscription: {
     plan: {

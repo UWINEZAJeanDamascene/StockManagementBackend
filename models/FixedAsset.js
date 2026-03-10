@@ -83,69 +83,181 @@ const fixedAssetSchema = new mongoose.Schema({
 fixedAssetSchema.index({ company: 1, assetCode: 1 }, { unique: true });
 fixedAssetSchema.index({ company: 1 });
 
-// Virtual for calculating accumulated depreciation
+// Helper: declining-balance rate
+// Rate = 1 - (Salvage / Cost) ^ (1 / UsefulLife)
+// Falls back to double-declining (2/n) when salvage = 0
+function _dbRate(cost, salvage, years) {
+  if (salvage > 0 && cost > 0) {
+    return 1 - Math.pow(salvage / cost, 1 / years);
+  }
+  return 2 / years;
+}
+
+// Helper: return depreciation start as UTC Date snapped to the 1st of the purchase month.
+// Uses UTC getters to avoid server timezone shifting a "YYYY-MM-01" string into the previous month.
+function _depreciationStartDate(purchaseDate) {
+  const d = new Date(purchaseDate);
+  // Use UTC fields so a date stored as "2025-01-01T00:00:00.000Z" stays January, not December
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+}
+
+// Helper: depreciation end date (exclusive) — startDate + usefulLifeYears months, UTC
+function _depreciationEndDate(startDate, usefulLifeYears) {
+  return new Date(Date.UTC(
+    startDate.getUTCFullYear(),
+    startDate.getUTCMonth() + usefulLifeYears * 12,
+    1
+  ));
+}
+
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+// Helper: total days in an asset's useful life (start → end, both UTC 1st-of-month)
+function _totalDays(startDate, endDate) {
+  return Math.round((endDate - startDate) / MS_PER_DAY);
+}
+
+// Helper: days elapsed from startDate to refDate, clamped to [0, totalDays]
+function _daysUsed(startDate, endDate, refDate) {
+  const elapsed = Math.floor((refDate - startDate) / MS_PER_DAY);
+  return Math.max(0, Math.min(elapsed, _totalDays(startDate, endDate)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACCUMULATED DEPRECIATION (Balance Sheet)
+//
+// Accrues DAILY from the 1st of the purchase month up to today (or end of
+// useful life if the asset is already fully depreciated).
+// This means the Balance Sheet value changes every single day.
+// ─────────────────────────────────────────────────────────────────────────────
 fixedAssetSchema.virtual('accumulatedDepreciation').get(function() {
   if (!this.purchaseDate || !this.purchaseCost) return 0;
-  
-  const now = new Date();
-  const yearsOwned = (now - this.purchaseDate) / (365.25 * 24 * 60 * 60 * 1000);
-  const yearsUsed = Math.min(yearsOwned, this.usefulLifeYears);
-  
+
+  const now        = new Date();
+  const startDate  = _depreciationStartDate(this.purchaseDate);
+  const endDate    = _depreciationEndDate(startDate, this.usefulLifeYears);
+  const totalDays  = _totalDays(startDate, endDate);
+
+  if (totalDays <= 0) return 0;
+
+  const daysUsed   = _daysUsed(startDate, endDate, now);
+  if (daysUsed <= 0) return 0;
+
+  const depreciable = this.purchaseCost - (this.salvageValue || 0);
+  if (depreciable <= 0) return 0;
+
+  const daysPerYear = totalDays / this.usefulLifeYears;
+
   switch (this.depreciationMethod) {
-    case 'straight-line':
-      const annualDepreciation = (this.purchaseCost - this.salvageValue) / this.usefulLifeYears;
-      return Math.min(annualDepreciation * yearsUsed, this.purchaseCost - this.salvageValue);
-    
-    case 'declining-balance':
-      const rate = 2 / this.usefulLifeYears; // Double declining balance
-      let accumulated = 0;
-      let bookValue = this.purchaseCost;
-      for (let i = 0; i < Math.floor(yearsUsed); i++) {
-        const depreciation = bookValue * rate;
-        accumulated += depreciation;
-        bookValue -= depreciation;
+    case 'straight-line': {
+      // Constant daily rate → linear accumulation
+      return Math.min((depreciable / totalDays) * daysUsed, depreciable);
+    }
+
+    case 'sum-of-years': {
+      const syd = (this.usefulLifeYears * (this.usefulLifeYears + 1)) / 2;
+      const fullYears    = Math.floor(daysUsed / daysPerYear);
+      const remainDays   = daysUsed - fullYears * daysPerYear;
+      let accumulated    = 0;
+      for (let i = 0; i < fullYears && i < this.usefulLifeYears; i++) {
+        accumulated += (depreciable * (this.usefulLifeYears - i)) / syd;
       }
-      // Partial year for declining balance
-      const decliningPartial = yearsUsed % 1;
-      if (decliningPartial > 0) {
-        accumulated += bookValue * rate * decliningPartial;
+      if (remainDays > 0 && fullYears < this.usefulLifeYears) {
+        const yearlyDep = (depreciable * (this.usefulLifeYears - fullYears)) / syd;
+        accumulated += (yearlyDep / daysPerYear) * remainDays;
       }
-      return Math.min(accumulated, this.purchaseCost - this.salvageValue);
-    
-    case 'sum-of-years':
-      const sumOfYears = (this.usefulLifeYears * (this.usefulLifeYears + 1)) / 2;
-      let sumAccumulated = 0;
-      const fullYears = Math.floor(yearsUsed);
-      for (let i = 0; i < fullYears; i++) {
-        const remainingLife = this.usefulLifeYears - i;
-        const yearlyDepreciation = ((this.purchaseCost - this.salvageValue) * remainingLife) / sumOfYears;
-        sumAccumulated += yearlyDepreciation;
+      return Math.min(accumulated, depreciable);
+    }
+
+    case 'declining-balance': {
+      const rate      = _dbRate(this.purchaseCost, this.salvageValue || 0, this.usefulLifeYears);
+      const fullYears = Math.floor(daysUsed / daysPerYear);
+      const remainDays = daysUsed - fullYears * daysPerYear;
+      let accumulated  = 0;
+      let bookValue    = this.purchaseCost;
+      for (let i = 0; i < fullYears && bookValue > (this.salvageValue || 0); i++) {
+        const dep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
+        accumulated += dep;
+        bookValue   -= dep;
       }
-      // Partial year for sum-of-years
-      const sumOfYearsPartial = yearsUsed % 1;
-      if (sumOfYearsPartial > 0) {
-        const remainingLife = this.usefulLifeYears - fullYears;
-        sumAccumulated += ((this.purchaseCost - this.salvageValue) * remainingLife) / sumOfYears * sumOfYearsPartial;
+      if (remainDays > 0 && bookValue > (this.salvageValue || 0)) {
+        const yearlyDep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
+        accumulated += (yearlyDep / daysPerYear) * remainDays;
       }
-      return Math.min(sumAccumulated, this.purchaseCost - this.salvageValue);
-    
+      return Math.min(accumulated, depreciable);
+    }
+
     default:
-      return 0;
+      return Math.min((depreciable / totalDays) * daysUsed, depreciable);
   }
 });
 
-// Virtual for net book value
+// Virtual: Net Book Value = Cost − Accumulated Depreciation (Balance Sheet)
 fixedAssetSchema.virtual('netBookValue').get(function() {
-  return this.purchaseCost - (this.accumulatedDepreciation || 0);
+  return Math.max(0, this.purchaseCost - (this.accumulatedDepreciation || 0));
 });
 
-// Virtual for annual depreciation expense
+// Virtual: depreciation start date exposed to the API (always 1st of purchase month, UTC)
+fixedAssetSchema.virtual('depreciationStartDate').get(function() {
+  if (!this.purchaseDate) return null;
+  return _depreciationStartDate(this.purchaseDate);
+});
+
+// Virtual: depreciation end date exposed to the API
+fixedAssetSchema.virtual('depreciationEndDate').get(function() {
+  if (!this.purchaseDate) return null;
+  const start = _depreciationStartDate(this.purchaseDate);
+  return _depreciationEndDate(start, this.usefulLifeYears);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANNUAL DEPRECIATION (P&L)
+//
+// Returns the FULL annual depreciation amount for the CURRENT depreciation year.
+// P&L uses: (annualDepreciation / 12) × periodMonths = period expense.
+// For straight-line this is the same every year.
+// Kicks in on the 1st of each calendar month (monthly boundary = accounting rule).
+// ─────────────────────────────────────────────────────────────────────────────
 fixedAssetSchema.virtual('annualDepreciation').get(function() {
+  if (!this.purchaseDate || !this.purchaseCost || !this.usefulLifeYears) return 0;
+
+  const now         = new Date();
+  const startDate   = _depreciationStartDate(this.purchaseDate);
+  const totalMonths = this.usefulLifeYears * 12;
+
+  // Count complete months elapsed (UTC) so month boundary is consistent
+  const monthsElapsed =
+    (now.getUTCFullYear() - startDate.getUTCFullYear()) * 12 +
+    (now.getUTCMonth()   - startDate.getUTCMonth());
+
+  if (monthsElapsed <= 0) return 0;           // hasn't started yet
+  if (monthsElapsed >= totalMonths) return 0; // fully depreciated
+
+  const currentYearIdx  = Math.floor(monthsElapsed / 12); // 0-indexed year in asset life
+  const depreciable     = this.purchaseCost - (this.salvageValue || 0);
+
   switch (this.depreciationMethod) {
     case 'straight-line':
-      return (this.purchaseCost - this.salvageValue) / this.usefulLifeYears;
+      return depreciable / this.usefulLifeYears;
+
+    case 'sum-of-years': {
+      const syd = (this.usefulLifeYears * (this.usefulLifeYears + 1)) / 2;
+      const remainingLife = this.usefulLifeYears - currentYearIdx;
+      return (depreciable * remainingLife) / syd;
+    }
+
+    case 'declining-balance': {
+      const rate = _dbRate(this.purchaseCost, this.salvageValue || 0, this.usefulLifeYears);
+      let bookValue = this.purchaseCost;
+      for (let i = 0; i < currentYearIdx; i++) {
+        const dep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
+        bookValue -= dep;
+      }
+      return Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
+    }
+
     default:
-      return (this.purchaseCost - this.salvageValue) / this.usefulLifeYears;
+      return depreciable / this.usefulLifeYears;
   }
 });
 

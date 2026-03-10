@@ -4,6 +4,7 @@ const Supplier = require('../models/Supplier');
 const StockMovement = require('../models/StockMovement');
 const PDFDocument = require('pdfkit');
 const { notifyStockReceived, notifyLowStock, notifyOutOfStock } = require('../services/notificationHelper');
+const cacheService = require('../services/cacheService');
 
 // @desc    Get all purchases
 // @route   GET /api/purchases
@@ -95,23 +96,29 @@ exports.createPurchase = async (req, res, next) => {
       });
     }
 
-    // Process items with tax codes
-    const processedItems = items.map((item, index) => {
+    // Process items with tax codes - prefer product defaults when present
+    const processedItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const product = await Product.findOne({ _id: item.product, company: companyId });
       const subtotal = item.quantity * item.unitCost;
       const discount = item.discount || 0;
       const netAmount = subtotal - discount;
-      const taxRate = item.taxRate || 0;
+      const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
+      const taxCode = item.taxCode || product?.taxCode || 'A';
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
-      
-      return {
+
+      processedItems.push({
         ...item,
-        itemCode: item.itemCode || `ITEM-${index + 1}`,
+        itemCode: item.itemCode || `ITEM-${i + 1}`,
+        taxCode,
+        taxRate,
         subtotal,
         taxAmount,
         totalWithTax
-      };
-    });
+      });
+    }
 
     const purchase = await Purchase.create({
       ...req.body,
@@ -329,6 +336,13 @@ exports.receivePurchase = async (req, res, next) => {
       await supplier.save();
     }
 
+    // Invalidate report cache - receiving purchase affects Balance Sheet (inventory, payables, VAT) and P&L
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.json({
       success: true,
       message: 'Purchase received and stock added',
@@ -462,6 +476,13 @@ exports.recordPayment = async (req, res, next) => {
 
     await purchase.save();
 
+    // Invalidate report cache - payment affects Balance Sheet (cash, payables) and P&L
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.json({
       success: true,
       message: 'Payment recorded successfully',
@@ -546,6 +567,13 @@ exports.cancelPurchase = async (req, res, next) => {
 
     await purchase.save();
 
+    // Invalidate report cache - cancellation affects Balance Sheet and P&L
+    try {
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.json({
       success: true,
       message: 'Purchase cancelled and stock reversed',
@@ -595,68 +623,145 @@ exports.generatePurchasePDF = async (req, res, next) => {
       });
     }
 
-    // Create PDF document
-    const doc = new PDFDocument({ margin: 50 });
+    // Create PDF document with pagination support
+    const doc = new PDFDocument({ margin: 50, bufferPages: true });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename=purchase-${purchase.purchaseNumber}.pdf`);
 
     doc.pipe(res);
 
-    // Header
-    doc.fontSize(20).text('PURCHASE ORDER', { align: 'center' });
-    doc.moveDown();
-    
-    doc.fontSize(12).text(`Purchase Number: ${purchase.purchaseNumber}`);
-    doc.text(`Purchase Date: ${new Date(purchase.purchaseDate).toLocaleDateString()}`);
-    doc.text(`Status: ${purchase.status.toUpperCase()}`);
-    doc.text(`Currency: ${purchase.currency || 'FRW'}`);
-    doc.moveDown();
+    const currency = purchase.currency || 'FRW';
+    const currencySymbol = currency === 'USD' ? '$' : '';
+    const fmt = (v) => (currencySymbol ? `${currencySymbol} ${Number(v || 0).toFixed(2)}` : Number(v || 0).toLocaleString());
 
-    // Supplier info
-    doc.text('Supplier:', { underline: true });
-    doc.text(purchase.supplierName || purchase.supplier?.name || 'N/A');
-    if (purchase.supplierTin) doc.text(`TIN: ${purchase.supplierTin}`);
-    if (purchase.supplierAddress) doc.text(purchase.supplierAddress);
-    doc.moveDown(2);
+    let page = 1;
 
-    // Items table
-    const tableTop = doc.y;
-    doc.fontSize(10);
-    doc.text('Item', 50, tableTop);
-    doc.text('Qty', 250, tableTop);
-    doc.text('Cost', 300, tableTop);
-    doc.text('Tax', 360, tableTop);
-    doc.text('Total', 420, tableTop);
+    const drawHeader = () => {
+      doc.font('Helvetica-Bold').fontSize(20).fillColor('#111827').text('PURCHASE ORDER', 50, 48);
+      doc.fontSize(9).font('Helvetica').fillColor('#6b7280');
+      doc.text(`Purchase Number: ${purchase.purchaseNumber}`, 50, 74);
+      doc.text(`Purchase Date: ${new Date(purchase.purchaseDate).toLocaleDateString()}`, 50, 88);
+      doc.text(`Status: ${purchase.status.toUpperCase()}`, 50, 102);
+      doc.text(`Currency: ${currency}`, 50, 116);
 
-    let yPosition = tableTop + 20;
-    purchase.items.forEach(item => {
-      doc.text(item.product?.name || item.description || 'N/A', 50, yPosition);
-      doc.text(item.quantity.toString(), 250, yPosition);
-      doc.text(`$${item.unitCost.toFixed(2)}`, 300, yPosition);
-      doc.text(`${item.taxCode}: ${item.taxRate}%`, 360, yPosition);
-      doc.text(`$${item.totalWithTax.toFixed(2)}`, 420, yPosition);
-      yPosition += 20;
+      // Supplier box
+      doc.rect(330, 74, 220, 70).fillAndStroke('#ffffff', '#e5e7eb');
+      doc.fillColor('#374151').font('Helvetica-Bold').fontSize(10).text('SUPPLIER', 340, 78);
+      doc.font('Helvetica').fontSize(10).fillColor('#111827');
+      doc.text(purchase.supplierName || purchase.supplier?.name || 'N/A', 340, 96);
+      if (purchase.supplierTin) doc.text(`TIN: ${purchase.supplierTin}`, 340, 110);
+      if (purchase.supplierAddress) doc.text(purchase.supplierAddress, 340, 124, { width: 200 });
+
+      // horizontal rule
+      doc.moveTo(50, 150).lineTo(doc.page.width - 50, 150).lineWidth(0.5).strokeColor('#e5e7eb').stroke();
+    };
+
+    const drawFooter = (p) => {
+      const bottom = doc.page.height - 40;
+      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
+      doc.text(`Generated: ${new Date().toLocaleString()}`, 50, bottom, { align: 'left' });
+      doc.text(`Page ${p}`, 0, bottom, { align: 'right' });
+    };
+
+    const tableHeader = (y) => {
+      doc.rect(50, y, doc.page.width - 100, 28).fill('#111827');
+      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
+      doc.text('#', 56, y + 8);
+      doc.text('Item / Description', 80, y + 8);
+      doc.text('Qty', 320, y + 8, { width: 30, align: 'right' });
+      doc.text('Unit Cost', 370, y + 8, { width: 70, align: 'right' });
+      doc.text('Tax', 450, y + 8, { width: 50, align: 'right' });
+      doc.text('Total', 510, y + 8, { width: 70, align: 'right' });
+    };
+
+    // Begin page
+    drawHeader();
+    let y = 170;
+    tableHeader(y);
+    y += 36;
+    doc.font('Helvetica').fontSize(9).fillColor('#111827');
+
+    purchase.items.forEach((item, idx) => {
+      if (y > doc.page.height - 150) {
+        drawFooter(page);
+        doc.addPage();
+        page += 1;
+        drawHeader();
+        y = 170;
+        tableHeader(y);
+        y += 36;
+        doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      }
+
+      if (idx % 2 === 0) {
+        doc.rect(50, y - 6, doc.page.width - 100, 18).fill('#f9fafb');
+      }
+
+      doc.fillColor('#111827');
+      doc.text(`${idx + 1}`, 56, y);
+      doc.text(item.product?.name || item.description || 'N/A', 80, y, { width: 230 });
+      doc.text((item.quantity || 0).toString(), 320, y, { width: 40, align: 'right' });
+      doc.text(fmt(item.unitCost), 370, y, { width: 70, align: 'right' });
+      doc.text(`${item.taxCode || 'A'} (${item.taxRate}%)`, 450, y, { width: 50, align: 'right' });
+      doc.text(fmt(item.totalWithTax), 510, y, { width: 70, align: 'right' });
+      y += 20;
     });
 
-    yPosition += 20;
-    doc.fontSize(12);
-    doc.text(`Subtotal: $${purchase.subtotal.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.text(`Tax: $${purchase.totalTax.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.fontSize(14).text(`Total: $${purchase.grandTotal.toFixed(2)}`, 350, yPosition, { bold: true });
-    yPosition += 18;
-    doc.text(`Paid: $${purchase.amountPaid.toFixed(2)}`, 350, yPosition);
-    yPosition += 18;
-    doc.text(`Balance: $${purchase.balance.toFixed(2)}`, 350, yPosition);
-
-    if (purchase.notes) {
-      doc.moveDown(2);
-      doc.text('Notes:', { underline: true });
-      doc.fontSize(10).text(purchase.notes);
+    // Totals block
+    if (y > doc.page.height - 200) {
+      drawFooter(page);
+      doc.addPage();
+      page += 1;
+      drawHeader();
+      y = 170;
     }
 
+    const totalsX = doc.page.width - 260;
+    doc.rect(totalsX - 10, y, 230, 110).fill('#ffffff').stroke('#e5e7eb');
+    let ty = y + 8;
+    doc.fillColor('#6b7280').fontSize(10).font('Helvetica');
+    doc.text('Subtotal', totalsX, ty, { width: 140, align: 'left' });
+    doc.fillColor('#111827').text(fmt(purchase.subtotal), totalsX + 100, ty, { width: 120, align: 'right' });
+    ty += 18;
+
+    doc.fillColor('#6b7280').text('Tax', totalsX, ty);
+    doc.fillColor('#111827').text(fmt(purchase.totalTax), totalsX + 100, ty, { width: 120, align: 'right' });
+    ty += 18;
+
+    doc.rect(totalsX - 10, ty - 6, 230, 40).fill('#111827');
+    doc.fillColor('#ffffff').fontSize(12).font('Helvetica-Bold');
+    doc.text('TOTAL', totalsX, ty, { width: 140, align: 'left' });
+    doc.text(fmt(purchase.grandTotal), totalsX + 100, ty + 2, { width: 120, align: 'right' });
+    ty += 52;
+
+    doc.fillColor('#10b981').fontSize(10).font('Helvetica');
+    doc.text('Paid', totalsX, ty - 8, { width: 140, align: 'left' });
+    doc.text(fmt(purchase.amountPaid), totalsX + 100, ty - 8, { width: 120, align: 'right' });
+    ty += 18;
+
+    doc.fillColor('#ef4444').fontSize(11).font('Helvetica-Bold');
+    doc.text('BALANCE', totalsX, ty - 8, { width: 140, align: 'left' });
+    doc.text(fmt(purchase.balance), totalsX + 100, ty - 8, { width: 120, align: 'right' });
+
+    // Notes
+    y += 140;
+    if (purchase.notes) {
+      if (y > doc.page.height - 120) {
+        drawFooter(page);
+        doc.addPage();
+        page += 1;
+        drawHeader();
+        y = 170;
+      }
+      doc.moveDown(1);
+      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold').text('NOTES', 56, y);
+      y += 14;
+      doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(purchase.notes, 56, y, { width: doc.page.width - 120 });
+    }
+
+    // Finalize
+    drawFooter(page);
     doc.end();
   } catch (error) {
     next(error);

@@ -61,6 +61,17 @@ const loanSchema = new mongoose.Schema({
     min: 0,
     max: 100
   },
+  // Interest calculation method
+  interestMethod: {
+    type: String,
+    enum: ['simple', 'compound'],
+    default: 'simple'
+  },
+  // Duration in months (drives schedule calculation)
+  durationMonths: {
+    type: Number,
+    min: 1
+  },
   
   // Dates
   startDate: {

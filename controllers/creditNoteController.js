@@ -65,6 +65,32 @@ exports.approveCreditNote = async (req, res, next) => {
           amount: note.grandTotal,
           appliedDate: new Date()
         });
+        
+        // Reduce the invoice balance by the credit note amount
+        const creditAmount = note.grandTotal;
+        invoice.balance = Math.max(0, (invoice.balance || 0) - creditAmount);
+        
+        // Update invoice status based on new balance - but keep 'paid' status if it was paid
+        // A credit note is a reduction of the invoice, not a partial payment
+        if (invoice.balance <= 0) {
+          invoice.status = 'paid';
+          if (!invoice.paidDate) {
+            invoice.paidDate = new Date();
+          }
+        } else if (invoice.amountPaid > 0 && invoice.amountPaid < invoice.grandTotal) {
+          // Only change to partial if there's actual partial payment, not just credit note
+          invoice.status = 'partial';
+        }
+        // Don't reduce amountPaid - the invoice was paid, credit note is a separate adjustment
+        if (invoice.balance <= 0) {
+          invoice.status = 'paid';
+          if (!invoice.paidDate) {
+            invoice.paidDate = new Date();
+          }
+        } else if (invoice.amountPaid > 0 && invoice.amountPaid < invoice.grandTotal) {
+          invoice.status = 'partial';
+        }
+        
         await invoice.save();
       }
     }
@@ -174,6 +200,28 @@ exports.applyCreditNote = async (req, res, next) => {
       amount: note.grandTotal,
       appliedDate: new Date()
     });
+    
+    // Reduce the invoice balance by the credit note amount
+    const creditAmount = note.grandTotal;
+    targetInvoice.balance = Math.max(0, (targetInvoice.balance || 0) - creditAmount);
+    
+    // Update invoice status - keep 'paid' if it was paid
+    if (targetInvoice.balance <= 0) {
+      targetInvoice.status = 'paid';
+      if (!targetInvoice.paidDate) {
+        targetInvoice.paidDate = new Date();
+      }
+    }
+    // Don't reduce amountPaid - credit note is a separate adjustment
+    if (targetInvoice.balance <= 0) {
+      targetInvoice.status = 'paid';
+      if (!targetInvoice.paidDate) {
+        targetInvoice.paidDate = new Date();
+      }
+    } else if (targetInvoice.amountPaid > 0 && targetInvoice.amountPaid < targetInvoice.grandTotal) {
+      targetInvoice.status = 'partial';
+    }
+    
     await targetInvoice.save();
 
     // Update credit note status

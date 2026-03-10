@@ -6,6 +6,7 @@ const Supplier = require('../models/Supplier');
 const bwipjs = require('bwip-js');
 const QRCode = require('qrcode');
 const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
+const cacheService = require('../services/cacheService');
 
 // @desc    Get all products
 // @route   GET /api/products
@@ -138,6 +139,14 @@ exports.createProduct = async (req, res, next) => {
       }
     }
 
+    // Invalidate cache - product changes affect stock reports
+    try {
+      await cacheService.invalidateByCompany(companyId, 'product');
+      await cacheService.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.status(201).json({
       success: true,
       data: product
@@ -217,6 +226,14 @@ exports.updateProduct = async (req, res, next) => {
       }
     }
 
+    // Invalidate cache - product changes affect stock reports
+    try {
+      await cacheService.invalidateByCompany(companyId, 'product');
+      await cacheService.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.json({
       success: true,
       data: product
@@ -243,6 +260,14 @@ exports.deleteProduct = async (req, res, next) => {
     }
 
     await Product.findByIdAndDelete(req.params.id);
+
+    // Invalidate cache - product deletion affects stock reports
+    try {
+      await cacheService.invalidateByCompany(companyId, 'product');
+      await cacheService.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
 
     res.json({
       success: true,
@@ -278,6 +303,14 @@ exports.archiveProduct = async (req, res, next) => {
 
     await product.save();
 
+    // Invalidate cache - archiving affects stock reports
+    try {
+      await cacheService.invalidateByCompany(companyId, 'product');
+      await cacheService.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
     res.json({
       success: true,
       message: 'Product archived successfully',
@@ -312,6 +345,14 @@ exports.restoreProduct = async (req, res, next) => {
     });
 
     await product.save();
+
+    // Invalidate cache - restoring affects stock reports
+    try {
+      await cacheService.invalidateByCompany(companyId, 'product');
+      await cacheService.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
 
     res.json({
       success: true,

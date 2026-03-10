@@ -237,6 +237,14 @@ const invoiceSchema = new mongoose.Schema({
 invoiceSchema.index({ company: 1, invoiceNumber: 1 }, { unique: true });
 invoiceSchema.index({ company: 1 });
 
+// Performance indexes for reports
+invoiceSchema.index({ company: 1, status: 1 });
+invoiceSchema.index({ company: 1, paidDate: 1 });
+invoiceSchema.index({ company: 1, invoiceDate: 1 });
+invoiceSchema.index({ 'payments.paidDate': 1 });
+invoiceSchema.index({ client: 1 });
+invoiceSchema.index({ createdBy: 1 });
+
 // Auto-generate invoice number
 invoiceSchema.pre('save', async function(next) {
   if (this.isNew && !this.invoiceNumber) {

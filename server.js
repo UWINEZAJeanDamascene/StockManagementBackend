@@ -23,6 +23,9 @@ require('./models/Role');
 require('./models/Backup');
 require('./models/FixedAsset');
 require('./models/Loan');
+require('./models/PrecomputedAggregation');
+require('./models/Expense');
+require('./models/PurchaseReturn');
 
 const app = express();
 
@@ -129,6 +132,15 @@ app.use('/api/fixed-assets', require('./routes/fixedAssetRoutes'));
 // Loans
 app.use('/api/loans', require('./routes/loanRoutes'));
 
+// Budget Management
+app.use('/api/budgets', require('./routes/budgetRoutes'));
+
+// Expenses
+app.use('/api/expenses', require('./routes/expenseRoutes'));
+
+// Purchase Returns
+app.use('/api/purchase-returns', require('./routes/purchaseReturnRoutes'));
+
 // Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 
@@ -210,6 +222,23 @@ try {
   backupScheduler.startVerificationScheduler();
 } catch (err) {
   console.warn('Could not start backup scheduler', err);
+}
+
+// Initialize Background Job Queue (BullMQ)
+// Runs nightly aggregations, report generation, email notifications
+try {
+  const { initializeWorkers } = require('./services/jobWorkers');
+  const { setupScheduledJobs } = require('./services/jobQueue');
+  
+  // Initialize workers to process background jobs
+  initializeWorkers();
+  
+  // Setup scheduled jobs (nightly aggregations)
+  setupScheduledJobs();
+  
+  console.log('Background job system initialized');
+} catch (err) {
+  console.warn('Could not initialize job queue:', err.message || err);
 }
 
 const server = app.listen(PORT, () => {
