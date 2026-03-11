@@ -92,6 +92,8 @@ exports.createPurchaseReturn = async (req, res, next) => {
     let originalPurchasePaid = false;
     let originalPurchasePaymentDate = null;
     
+    let computedTotalTax = req.body.totalTax || 0;
+
     if (req.body.purchase) {
       const purchase = await Purchase.findOne({
         _id: req.body.purchase,
@@ -101,17 +103,24 @@ exports.createPurchaseReturn = async (req, res, next) => {
       if (purchase) {
         originalPurchasePaid = purchase.status === 'paid';
         if (purchase.payments && purchase.payments.length > 0) {
-          // Get the last payment date
           const paidPayments = purchase.payments.filter(p => p.status === 'completed');
           if (paidPayments.length > 0) {
             originalPurchasePaymentDate = paidPayments[paidPayments.length - 1].paidDate;
           }
+        }
+
+        // Auto-compute totalTax if frontend didn't supply it (or sent 0)
+        // Use proportional calculation: (returnSubtotal / purchaseSubtotal) * purchaseTotalTax
+        if (computedTotalTax === 0 && purchase.subtotal > 0 && purchase.totalTax > 0) {
+          const returnSubtotal = req.body.subtotal || 0;
+          computedTotalTax = (returnSubtotal / purchase.subtotal) * purchase.totalTax;
         }
       }
     }
     
     const purchaseReturn = new PurchaseReturn({
       ...req.body,
+      totalTax: computedTotalTax,
       company: companyId,
       createdBy: req.user._id,
       originalPurchasePaid,

@@ -141,6 +141,9 @@ app.use('/api/expenses', require('./routes/expenseRoutes'));
 // Purchase Returns
 app.use('/api/purchase-returns', require('./routes/purchaseReturnRoutes'));
 
+// AI Chatbot (Gemini)
+app.use('/api/chat', require('./routes/chatRoutes'));
+
 // Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 

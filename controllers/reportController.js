@@ -665,14 +665,27 @@ exports.getProfitAndLossDetailed = async (req, res, next) => {
     const purchasesExVAT = purchases.reduce((sum, p) => {
       return sum + (p.subtotal || 0) - (p.totalDiscount || 0);
     }, 0);
+
+    // Purchase Returns (ex. VAT) - approved/refunded purchase returns in period
+    const purchaseReturnMatchDetailed = {
+      company: companyId,
+      status: { $in: ['approved', 'refunded', 'partially_refunded'] },
+      returnDate: { $gte: periodStart, $lte: periodEnd }
+    };
+    const purchaseReturnsAggDetailed = await PurchaseReturn.aggregate([
+      { $match: purchaseReturnMatchDetailed },
+      { $group: { _id: null, subtotal: { $sum: '$subtotal' }, count: { $sum: 1 } } }
+    ]);
+    const purchaseReturnsDetailed = purchaseReturnsAggDetailed[0]?.subtotal || 0;
+    const purchaseReturnsCountDetailed = purchaseReturnsAggDetailed[0]?.count || 0;
     
     // Closing Stock Value (current inventory)
     const closingStockValue = products.reduce((sum, product) => {
       return sum + (product.currentStock * product.averageCost);
     }, 0);
     
-    // COGS: Formula-based approach - Opening Stock + Purchases - Closing Stock
-    const totalCOGS = openingStockValue + purchasesExVAT - closingStockValue;
+    // COGS: Opening Stock + Purchases - Purchase Returns - Closing Stock
+    const totalCOGS = openingStockValue + purchasesExVAT - purchaseReturnsDetailed - closingStockValue;
     
     // =============================================
     // GROSS PROFIT
@@ -811,6 +824,7 @@ exports.getProfitAndLossDetailed = async (req, res, next) => {
         cogs: {
           openingStockValue: Math.round(openingStockValue * 100) / 100,
           purchasesExVAT: Math.round(purchasesExVAT * 100) / 100,
+          purchaseReturns: Math.round(purchaseReturnsDetailed * 100) / 100,
           closingStockValue: Math.round(closingStockValue * 100) / 100,
           totalCOGS: Math.round(totalCOGS * 100) / 100
         },
@@ -880,6 +894,7 @@ exports.getProfitAndLossDetailed = async (req, res, next) => {
           paidInvoicesCount: paidInvoices.length,
           creditNotesCount: creditNotes.length,
           purchasesCount: purchases.length,
+          purchaseReturnsCount: purchaseReturnsCountDetailed,
           fixedAssetsCount: fixedAssets.length,
           activeLoansCount: activeLoans.length,
           productsCount: products.length
@@ -2305,10 +2320,46 @@ exports.getProfitAndLossFull = async (req, res, next) => {
     // TAX
     // =============================================
     
-    // VAT Info (Output VAT - Input VAT) - For information only, not an expense
+    // VAT Info (Output VAT - Net Input VAT) - For information only, not an expense
     const outputVAT = paidInvoices.reduce((sum, inv) => sum + (inv.totalTax || 0), 0);
     const inputVAT = purchases.reduce((sum, p) => sum + (p.totalTax || 0), 0);
-    const netVAT = outputVAT - inputVAT; // Positive = VAT payable, Negative = VAT receivable
+    // Purchase Return VAT reduces the claimable Input VAT (VAT on returned goods is no longer claimable)
+    // Uses a $lookup fallback: if totalTax=0 (old records), compute proportionally from linked purchase
+    const purchaseReturnVATFull = await PurchaseReturn.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: { $in: ['approved', 'refunded', 'partially_refunded'] },
+          returnDate: { $gte: periodStart, $lte: periodEnd }
+        }
+      },
+      { $lookup: { from: 'purchases', localField: 'purchase', foreignField: '_id', as: 'linkedPurchase' } },
+      { $addFields: { linkedPurchase: { $arrayElemAt: ['$linkedPurchase', 0] } } },
+      {
+        $addFields: {
+          effectiveTax: {
+            $cond: {
+              if: { $gt: ['$totalTax', 0] },
+              then: '$totalTax',
+              else: {
+                $cond: {
+                  if: { $and: [
+                    { $gt: [{ $ifNull: ['$linkedPurchase.subtotal', 0] }, 0] },
+                    { $gt: [{ $ifNull: ['$linkedPurchase.totalTax', 0] }, 0] }
+                  ]},
+                  then: { $multiply: [{ $divide: ['$subtotal', '$linkedPurchase.subtotal'] }, '$linkedPurchase.totalTax'] },
+                  else: 0
+                }
+              }
+            }
+          }
+        }
+      },
+      { $group: { _id: null, totalTax: { $sum: '$effectiveTax' } } }
+    ]);
+    const inputVATReturn = purchaseReturnVATFull[0]?.totalTax || 0;
+    const netInputVAT = inputVAT - inputVATReturn;
+    const netVAT = outputVAT - netInputVAT; // Positive = VAT payable, Negative = VAT receivable
     
     // Corporate Income Tax (30% of Profit Before Tax)
     const corporateTaxRate = 0.30;
@@ -2399,6 +2450,8 @@ exports.getProfitAndLossFull = async (req, res, next) => {
           vatInfo: {
             outputVAT: Math.round(outputVAT * 100) / 100,
             inputVAT: Math.round(inputVAT * 100) / 100,
+            inputVATReturn: Math.round(inputVATReturn * 100) / 100,
+            netInputVAT: Math.round(netInputVAT * 100) / 100,
             netVAT: Math.round(netVAT * 100) / 100
           },
           corporateIncomeTax: Math.round(corporateIncomeTax * 100) / 100,
@@ -2561,6 +2614,42 @@ exports.getBalanceSheet = async (req, res, next) => {
     const accountsPayable = purchaseResult.payables?.[0]?.total || 0;
     const inputVAT = purchaseResult.inputVAT?.[0]?.total || 0;
 
+    // Purchase Return VAT - reduces the claimable Input VAT on the Balance Sheet
+    // Uses a $lookup fallback: if totalTax=0 (old records), compute proportionally from linked purchase
+    const purchaseReturnVATAggBS = await PurchaseReturn.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: { $in: ['approved', 'refunded', 'partially_refunded'] }
+        }
+      },
+      { $lookup: { from: 'purchases', localField: 'purchase', foreignField: '_id', as: 'linkedPurchase' } },
+      { $addFields: { linkedPurchase: { $arrayElemAt: ['$linkedPurchase', 0] } } },
+      {
+        $addFields: {
+          effectiveTax: {
+            $cond: {
+              if: { $gt: ['$totalTax', 0] },
+              then: '$totalTax',
+              else: {
+                $cond: {
+                  if: { $and: [
+                    { $gt: [{ $ifNull: ['$linkedPurchase.subtotal', 0] }, 0] },
+                    { $gt: [{ $ifNull: ['$linkedPurchase.totalTax', 0] }, 0] }
+                  ]},
+                  then: { $multiply: [{ $divide: ['$subtotal', '$linkedPurchase.subtotal'] }, '$linkedPurchase.totalTax'] },
+                  else: 0
+                }
+              }
+            }
+          }
+        }
+      },
+      { $group: { _id: null, totalTax: { $sum: '$effectiveTax' } } }
+    ]);
+    const inputVATReturn = purchaseReturnVATAggBS[0]?.totalTax || 0;
+    const netInputVAT = inputVAT - inputVATReturn;
+
     // Extract inventory value
     const inventoryValue = inventoryData[0]?.totalValue || 0;
 
@@ -2627,9 +2716,10 @@ exports.getBalanceSheet = async (req, res, next) => {
     const cashAndBank = netCashInflows || 0;
     // Get Prepaid Expenses from Company settings (manual entry)
     const prepaidExpenses = company?.assets?.prepaidExpenses || 0;
-    // VAT Receivable = Input VAT - Output VAT + Credit Note VAT (we get back the VAT from credit note)
-    const vatReceivable = Math.max(0, inputVAT - outputVAT + totalCreditNoteTax);
-    const vatPayable = Math.max(0, outputVAT - inputVAT - totalCreditNoteTax);
+    // VAT Receivable = Net Input VAT - Output VAT + Credit Note VAT
+    // Net Input VAT = Input VAT - VAT on purchase returns (VAT on returned goods is no longer claimable)
+    const vatReceivable = Math.max(0, netInputVAT - outputVAT + totalCreditNoteTax);
+    const vatPayable = Math.max(0, outputVAT - netInputVAT - totalCreditNoteTax);
 
     const totalCurrentAssets = cashAndBank + accountsReceivable + inventoryValue + prepaidExpenses + vatReceivable;
     const totalFixedAssets = equipmentValue + furnitureValue + vehiclesValue + buildingsValue + computersValue + machineryValue + otherAssetsValue;
@@ -2777,7 +2867,7 @@ exports.getBalanceSheet = async (req, res, next) => {
           endDate: periodEnd.toISOString(),
           formatted: `${periodStart.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} – ${periodEnd.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}`
         },
-        details: { totalInflows, totalOutflows, outputVAT, inputVAT, incomeTaxPayable, totalCreditNoteAmount, pl: pl_debug }
+        details: { totalInflows, totalOutflows, outputVAT, inputVAT, inputVATReturn, netInputVAT, incomeTaxPayable, totalCreditNoteAmount, pl: pl_debug }
       }
     });
   } catch (error) {
