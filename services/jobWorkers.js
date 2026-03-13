@@ -1,26 +1,38 @@
 /**
  * Job Workers - Process background jobs
+ * 
+ * NOTE: If Redis is not configured, workers will not be initialized
+ * and jobs will be processed synchronously where needed
  */
 
 const { Worker } = require('bullmq');
-const redisConnection = require('../config/redis');
+const { redisClient, isRedisConfigured } = require('../config/redis');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const Company = require('../models/Company');
 const RecurringInvoice = require('../models/RecurringInvoice');
 const emailService = require('./emailService');
 const reportController = require('../controllers/reportController');
-const { JOB_TYPES } = require('./jobQueue');
+const { JOB_TYPES, isQueueAvailable } = require('./jobQueue');
 
 // Store worker references
 const workers = {};
+
+// Check if Redis is available
+const isRedisAvailable = () => {
+  if (!isRedisConfigured()) {
+    return false;
+  }
+  // Check if client has connected successfully
+  return redisClient && redisClient.status === 'ready';
+};
 
 /**
  * Create a worker for a specific queue
  */
 function createWorker(queueName, processorFn) {
   const worker = new Worker(queueName, processorFn, {
-    connection: redisConnection,
+    connection: redisClient,
     concurrency: 5, // Process 5 jobs concurrently
     limiter: {
       max: 10,
@@ -351,26 +363,37 @@ const emailProcessor = async (job) => {
 };
 
 /**
- * Initialize all workers
+ * Initialize all workers - only if Redis is available
  */
 function initializeWorkers() {
-  workers.highPriority = createWorker('highPriority', emailProcessor);
-  workers.default = createWorker('default', recurringInvoiceProcessor);
-  workers.background = createWorker('background', async (job) => {
-    switch (job.name) {
-      case JOB_TYPES.NIGHTLY_AGGREGATION:
-        return await nightlyAggregationProcessor(job);
-      case JOB_TYPES.DAILY_SUMMARY:
-        return await dailySummaryProcessor(job);
-      case JOB_TYPES.MONTHLY_SUMMARY:
-        return await monthlySummaryProcessor(job);
-      default:
-        console.log(`Unknown background job: ${job.name}`);
-    }
-  });
-  workers.reports = createWorker('reports', reportGenerationProcessor);
+  // Check if Redis is available before initializing workers
+  if (!isRedisAvailable() || !isQueueAvailable()) {
+    console.log('⚠️  Redis not available - job workers will not be initialized');
+    console.log('   Background jobs are disabled. Set REDIS_URL to enable.');
+    return;
+  }
   
-  console.log('All workers initialized');
+  try {
+    workers.highPriority = createWorker('highPriority', emailProcessor);
+    workers.default = createWorker('default', recurringInvoiceProcessor);
+    workers.background = createWorker('background', async (job) => {
+      switch (job.name) {
+        case JOB_TYPES.NIGHTLY_AGGREGATION:
+          return await nightlyAggregationProcessor(job);
+        case JOB_TYPES.DAILY_SUMMARY:
+          return await dailySummaryProcessor(job);
+        case JOB_TYPES.MONTHLY_SUMMARY:
+          return await monthlySummaryProcessor(job);
+        default:
+          console.log(`Unknown background job: ${job.name}`);
+      }
+    });
+    workers.reports = createWorker('reports', reportGenerationProcessor);
+    
+    console.log('✅ All job workers initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize job workers:', error.message);
+  }
 }
 
 /**
@@ -385,9 +408,17 @@ async function closeWorkers() {
   console.log('All workers closed');
 }
 
+/**
+ * Check if workers are initialized
+ */
+function areWorkersInitialized() {
+  return Object.keys(workers).length > 0;
+}
+
 module.exports = {
   initializeWorkers,
   closeWorkers,
+  areWorkersInitialized,
   nightlyAggregationProcessor,
   dailySummaryProcessor,
   monthlySummaryProcessor,

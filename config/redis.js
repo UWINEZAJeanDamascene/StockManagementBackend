@@ -12,6 +12,55 @@ const { UpstashRedis } = (() => {
 // Supports: Local Redis, Redis Cloud, Render Redis, Upstash, AWS ElastiCache, etc.
 // Uses REDIS_URL if available, or UPSTASH_REDIS_REST_URL for Upstash serverless Redis
 
+// Check if Redis is configured at all
+const isRedisConfigured = () => {
+  return !!(
+    process.env.UPSTASH_REDIS_REST_URL ||
+    process.env.REDIS_URL ||
+    process.env.REDIS_HOST ||
+    process.env.REDIS_CLUSTER_NODES
+  );
+};
+
+// Create a no-op client for when Redis is not available
+const createNoOpClient = () => {
+  const noOpClient = {
+    // Methods that return promises
+    get: async () => null,
+    set: async () => 'OK',
+    setex: async () => 'OK',
+    del: async () => 0,
+    keys: async () => [],
+    scan: async () => ['0', []],
+    exists: async () => 0,
+    incr: async () => 1,
+    decr: async () => 0,
+    expire: async () => 0,
+    ttl: async () => -1,
+    incrby: async () => 1,
+    getdel: async () => null,
+    info: async () => '',
+    
+    // Event emitter methods (no-ops)
+    on: () => {},
+    off: () => {},
+    emit: () => {},
+    
+    // Connection methods (no-ops)
+    connect: async () => {},
+    disconnect: async () => {},
+    quit: async () => {},
+    close: async () => {},
+    
+    // Properties
+    status: 'disconnected',
+    isReady: false,
+    isConnecting: false,
+  };
+  
+  return noOpClient;
+};
+
 const createRedisClient = () => {
   const redisConfig = {
     // Connection settings optimized for high throughput
@@ -31,6 +80,13 @@ const createRedisClient = () => {
     connectTimeout: 10000,
     commandTimeout: 5000,
   };
+
+  // Check if Redis is configured
+  if (!isRedisConfigured()) {
+    console.log('⚠️  Redis is not configured. Running in non-cached mode.');
+    console.log('   To enable Redis, set one of: REDIS_URL, UPSTASH_REDIS_REST_URL, or REDIS_HOST');
+    return createNoOpClient();
+  }
 
   // Check for Upstash Redis (serverless Redis with REST API)
   if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
@@ -96,14 +152,17 @@ if (redisClient && typeof redisClient.on === 'function') {
   });
 
   redisClient.on('error', (err) => {
-    console.error('Redis error:', err && err.message ? err.message : err);
+    // Don't log error if Redis is not configured (we're using no-op client)
+    if (isRedisConfigured()) {
+      console.error('Redis error:', err && err.message ? err.message : err);
+    }
   });
 
   redisClient.on('close', () => {
     console.log('Redis connection closed');
   });
 } else {
-  console.log('Redis client does not support event handlers (likely Upstash REST client).');
+  console.log('Redis client does not support event handlers (likely Upstash REST client or no-op).');
 }
 
 // Graceful shutdown
@@ -136,8 +195,13 @@ process.on('SIGTERM', gracefulShutdown);
 module.exports = {
   redisClient,
   createRedisClient,
+  isRedisConfigured,
   // Helper to get a client for specific operations (e.g., different DB)
   getClient: (db = 0) => {
+    if (!isRedisConfigured()) {
+      return createNoOpClient();
+    }
+    
     if (process.env.REDIS_URL) {
       return new Redis(process.env.REDIS_URL, { db });
     }

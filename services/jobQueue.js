@@ -5,10 +5,22 @@
  * - Recurring invoice generation
  * - Report generation
  * - Email notifications
+ * 
+ * NOTE: If Redis is not configured, this service will run in mock mode
+ * and jobs will not be queued (they'll be executed synchronously where needed)
  */
 
 const { Queue, Worker, Scheduler } = require('bullmq');
-const redisConnection = require('../config/redis');
+const { redisClient, isRedisConfigured } = require('../config/redis');
+
+// Check if Redis is available
+const isRedisAvailable = () => {
+  if (!isRedisConfigured()) {
+    return false;
+  }
+  // Check if client has connected successfully
+  return redisClient && redisClient.status === 'ready';
+};
 
 // Job types
 const JOB_TYPES = {
@@ -29,20 +41,34 @@ const JOB_TYPES = {
   LOW_STOCK_NOTIFICATION: 'low-stock-notification'
 };
 
-// Create queues
-const queues = {
-  // High priority queue for urgent jobs
-  highPriority: new Queue('high-priority', { connection: redisConnection }),
-  
-  // Default queue for regular jobs
-  default: new Queue('default', { connection: redisConnection }),
-  
-  // Low priority queue for background jobs (nightly jobs)
-  background: new Queue('background', { connection: redisConnection }),
-  
-  // Reports queue
-  reports: new Queue('reports', { connection: redisConnection })
-};
+// Create queues only if Redis is configured
+let queues = null;
+
+// Initialize queues if Redis is available
+if (isRedisAvailable()) {
+  try {
+    queues = {
+      // High priority queue for urgent jobs
+      highPriority: new Queue('high-priority', { connection: redisClient }),
+      
+      // Default queue for regular jobs
+      default: new Queue('default', { connection: redisClient }),
+      
+      // Low priority queue for background jobs (nightly jobs)
+      background: new Queue('background', { connection: redisClient }),
+      
+      // Reports queue
+      reports: new Queue('reports', { connection: redisClient })
+    };
+    console.log('✅ BullMQ job queues initialized');
+  } catch (error) {
+    console.error('❌ Failed to initialize BullMQ queues:', error.message);
+    queues = null;
+  }
+} else {
+  console.log('⚠️  Redis not configured - job queue is disabled');
+  console.log('   Jobs will not be queued. Set REDIS_URL to enable background jobs.');
+}
 
 /**
  * Add a job to the queue
@@ -52,6 +78,11 @@ const queues = {
  * @param {Object} options - Job options (priority, delay, repeat, etc.)
  */
 async function addJob(queueName, jobName, data, options = {}) {
+  if (!queues) {
+    console.warn(`⚠️  Job queue not available - job "${jobName}" will not be queued`);
+    return null;
+  }
+
   const queue = queues[queueName];
   if (!queue) {
     throw new Error(`Queue ${queueName} not found`);
@@ -87,6 +118,11 @@ async function addJob(queueName, jobName, data, options = {}) {
  * @param {Object} repeatOptions - Repeat options (cron expression)
  */
 async function scheduleRecurringJob(queueName, jobName, data, repeatOptions) {
+  if (!queues) {
+    console.warn(`⚠️  Job queue not available - recurring job "${jobName}" will not be scheduled`);
+    return null;
+  }
+
   const queue = queues[queueName];
   
   const job = await queue.add(jobName, data, {
@@ -107,6 +143,10 @@ async function scheduleRecurringJob(queueName, jobName, data, repeatOptions) {
  * Setup nightly aggregation job (runs at 2 AM daily)
  */
 async function setupNightlyAggregation() {
+  if (!queues) {
+    console.warn('⚠️  Job queue not available - nightly aggregation disabled');
+    return;
+  }
   await scheduleRecurringJob('background', JOB_TYPES.NIGHTLY_AGGREGATION, {}, {
     pattern: '0 2 * * *' // 2 AM daily
   });
@@ -117,6 +157,10 @@ async function setupNightlyAggregation() {
  * Setup daily summary job (runs at 6 AM daily)
  */
 async function setupDailySummary() {
+  if (!queues) {
+    console.warn('⚠️  Job queue not available - daily summary disabled');
+    return;
+  }
   await scheduleRecurringJob('background', JOB_TYPES.DAILY_SUMMARY, {}, {
     pattern: '0 6 * * *' // 6 AM daily
   });
@@ -127,6 +171,10 @@ async function setupDailySummary() {
  * Setup monthly summary job (runs at 1st of month at 3 AM)
  */
 async function setupMonthlySummary() {
+  if (!queues) {
+    console.warn('⚠️  Job queue not available - monthly summary disabled');
+    return;
+  }
   await scheduleRecurringJob('background', JOB_TYPES.MONTHLY_SUMMARY, {}, {
     pattern: '0 3 1 * *' // 1st of month at 3 AM
   });
@@ -185,6 +233,10 @@ async function scheduleEmail(to, subject, template, data) {
  * Get queue statistics
  */
 async function getQueueStats() {
+  if (!queues) {
+    return { status: 'unavailable', message: 'Redis not configured' };
+  }
+  
   const stats = {};
   
   for (const [name, queue] of Object.entries(queues)) {
@@ -213,10 +265,20 @@ async function getQueueStats() {
  * Clean up old jobs
  */
 async function cleanupOldJobs() {
+  if (!queues) {
+    return;
+  }
   for (const queue of Object.values(queues)) {
     await queue.clean(24 * 3600 * 1000, 100, 'completed'); // Clean completed older than 24h
     await queue.clean(7 * 24 * 3600 * 1000, 100, 'failed'); // Clean failed older than 7 days
   }
+}
+
+/**
+ * Check if job queue is available
+ */
+function isQueueAvailable() {
+  return queues !== null;
 }
 
 module.exports = {
@@ -229,5 +291,6 @@ module.exports = {
   scheduleReportGeneration,
   scheduleEmail,
   getQueueStats,
-  cleanupOldJobs
+  cleanupOldJobs,
+  isQueueAvailable
 };
