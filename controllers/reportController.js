@@ -16,6 +16,7 @@ const PurchaseReturn = require('../models/PurchaseReturn');
 const cacheService = require('../services/cacheService');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
 const reportGeneratorService = require('../services/reportGeneratorService');
+const pdfRenderer = require('../utils/pdfRenderer');
 
 // Shared helper: declining-balance rate (mirrors FixedAsset model logic)
 function _dbRateReport(cost, salvage, years) {
@@ -3489,6 +3490,121 @@ exports.exportReportToExcel = async (req, res, next) => {
         }
         break;
 
+      // ============================================
+      // BANK & CASH REPORTS
+      // ============================================
+      case 'bank-reconciliation':
+        const bankReconData = await reportGeneratorService.generateBankReconciliationReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Account', key: 'accountName', width: 25 },
+          { header: 'Type', key: 'accountType', width: 15 },
+          { header: 'Bank', key: 'bankName', width: 20 },
+          { header: 'Opening Balance', key: 'openingBalance', width: 15 },
+          { header: 'Deposits', key: 'totalDeposits', width: 15 },
+          { header: 'Withdrawals', key: 'totalWithdrawals', width: 15 },
+          { header: 'Closing Balance', key: 'closingBalance', width: 15 },
+          { header: 'Reconciled', key: 'reconciledAmount', width: 15 },
+          { header: 'Unreconciled', key: 'unreconciledAmount', width: 15 }
+        ];
+        if (bankReconData && bankReconData.data) {
+          bankReconData.data.forEach(item => {
+            worksheet.addRow({
+              accountName: item.accountName || 'N/A',
+              accountType: item.accountType || 'N/A',
+              bankName: item.bankName || 'N/A',
+              openingBalance: item.openingBalance || 0,
+              totalDeposits: item.totalDeposits || 0,
+              totalWithdrawals: item.totalWithdrawals || 0,
+              closingBalance: item.closingBalance || 0,
+              reconciledAmount: item.reconciledAmount || 0,
+              unreconciledAmount: item.unreconciledAmount || 0
+            });
+          });
+        }
+        break;
+
+      case 'cash-position':
+        const cashPosData = await reportGeneratorService.generateCashPositionReport(companyId);
+        worksheet.columns = [
+          { header: 'Account Name', key: 'name', width: 25 },
+          { header: 'Type', key: 'accountType', width: 15 },
+          { header: 'Bank', key: 'bankName', width: 20 },
+          { header: 'Account Number', key: 'accountNumber', width: 20 },
+          { header: 'Current Balance', key: 'currentBalance', width: 15 },
+          { header: 'Target Balance', key: 'targetBalance', width: 15 },
+          { header: 'Currency', key: 'currency', width: 10 },
+          { header: 'Primary', key: 'isPrimary', width: 10 }
+        ];
+        if (cashPosData && cashPosData.data) {
+          cashPosData.data.forEach(item => {
+            worksheet.addRow({
+              name: item.name || 'N/A',
+              accountType: item.accountType || 'N/A',
+              bankName: item.bankName || 'N/A',
+              accountNumber: item.accountNumber || 'N/A',
+              currentBalance: item.currentBalance || 0,
+              targetBalance: item.targetBalance || 0,
+              currency: item.currency || 'FRW',
+              isPrimary: item.isPrimary ? 'Yes' : 'No'
+            });
+          });
+        }
+        break;
+
+      case 'bank-transaction':
+        const bankTxnData = await reportGeneratorService.generateBankTransactionReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Date', key: 'date', width: 12 },
+          { header: 'Account', key: 'accountName', width: 20 },
+          { header: 'Type', key: 'type', width: 12 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Balance After', key: 'balanceAfter', width: 15 },
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Reference', key: 'referenceNumber', width: 20 },
+          { header: 'Status', key: 'status', width: 12 }
+        ];
+        if (bankTxnData && bankTxnData.data) {
+          bankTxnData.data.forEach(item => {
+            worksheet.addRow({
+              date: item.date ? new Date(item.date).toLocaleDateString() : 'N/A',
+              accountName: item.accountName || 'N/A',
+              type: item.type || 'N/A',
+              amount: item.amount || 0,
+              balanceAfter: item.balanceAfter || 0,
+              description: item.description || '',
+              referenceNumber: item.referenceNumber || '',
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'unreconciled-transactions':
+        const unreconciledData = await reportGeneratorService.generateUnreconciledTransactionsReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Date', key: 'date', width: 12 },
+          { header: 'Account', key: 'accountName', width: 20 },
+          { header: 'Type', key: 'type', width: 12 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Reference Number', key: 'referenceNumber', width: 20 },
+          { header: 'Status', key: 'status', width: 12 }
+        ];
+        if (unreconciledData && unreconciledData.data) {
+          unreconciledData.data.forEach(item => {
+            worksheet.addRow({
+              date: item.date ? new Date(item.date).toLocaleDateString() : 'N/A',
+              accountName: item.accountName || 'N/A',
+              type: item.type || 'N/A',
+              amount: item.amount || 0,
+              description: item.description || '',
+              referenceNumber: item.referenceNumber || '',
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
       default:
         return res.status(400).json({
           success: false,
@@ -3608,13 +3724,13 @@ exports.exportReportToPDF = async (req, res, next) => {
         const suppliersPdf = await Supplier.find({ company: companyId }).sort({ name: 1 });
         const companySupPdf = await Company.findById(companyId);
 
-        // Header block
-        doc.fontSize(16).text(companySupPdf?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companySupPdf?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SUPPLIERS LIST', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(1.5);
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companySupPdf?.name || 'Company',
+          companyTin: companySupPdf?.tin || 'N/A',
+          reportTitle: 'SUPPLIERS LIST',
+          reportDate: new Date().toLocaleDateString()
+        });
 
         let totalSupplierPurchases = 0;
         let totalSupplierBalance = 0;
@@ -3778,12 +3894,13 @@ exports.exportReportToPDF = async (req, res, next) => {
 
         const companyInvPdf = await Company.findById(companyId);
         
-        doc.fontSize(16).text(companyInvPdf?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyInvPdf?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SALES INVOICES REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyInvPdf?.name || 'Company',
+          companyTin: companyInvPdf?.tin || 'N/A',
+          reportTitle: 'SALES INVOICES REPORT',
+          reportDate: new Date().toLocaleDateString()
+        });
 
         // Summary
         const totalInvoices = invoicesPdf.length;
@@ -3904,29 +4021,20 @@ exports.exportReportToPDF = async (req, res, next) => {
         const pdfPlNetProfit = pdfPlProfitBeforeTax - pdfPlTotalTax;
         const pdfPlNetMarginPercent = pdfPlNetRevenue > 0 ? (pdfPlNetProfit / pdfPlNetRevenue) * 100 : 0;
 
-        // PDF Header
+        // PDF Header - Use pdfRenderer for consistent formatting
         const plLeft = 40;
         const plRight = 48;
         const plAmountX = doc.page.width - plRight - 110; // position for amounts
         const plItemWidth = plAmountX - plLeft - 10;
 
-        const fmt = (v) => {
-          const n = Number(v || 0);
-          return n < 0 ? `(${Math.abs(n).toFixed(2)})` : n.toFixed(2);
-        };
-
-        const printLine = (label, amount, y, indent = 0) => {
-          const labelX = plLeft + indent * 12;
-          doc.font('Helvetica').fontSize(10).text(label, labelX, y, { width: plItemWidth - indent * 12 });
-          doc.font('Helvetica').fontSize(10).text(fmt(amount), plAmountX, y, { width: 100, align: 'right' });
-        };
-
-        doc.fontSize(16).text(pdfPlCompany?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${pdfPlCompany?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('PROFIT & LOSS STATEMENT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${pdfPeriodStart.toLocaleDateString()} - ${pdfPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: pdfPlCompany?.name || 'Company',
+          companyTin: pdfPlCompany?.tin || 'N/A',
+          reportTitle: 'PROFIT & LOSS STATEMENT',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${pdfPeriodStart.toLocaleDateString()} - ${pdfPeriodEnd.toLocaleDateString()}`
+        });
         doc.moveDown(1.2);
 
         // Compact summary block
@@ -4002,13 +4110,15 @@ exports.exportReportToPDF = async (req, res, next) => {
         await Client.populate(topClientsPdfData, { path: '_id', select: 'name code' });
 
         const companyTopClients = await Company.findById(companyId);
-        doc.fontSize(16).text(companyTopClients?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyTopClients?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('TOP CLIENTS BY REVENUE', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyTopClients?.name || 'Company',
+          companyTin: companyTopClients?.tin || 'N/A',
+          reportTitle: 'TOP CLIENTS BY REVENUE',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
 
         const tcHeaders = ['Code', 'Client Name', 'Invoices', 'Total Revenue'];
         const tcColWidths = [60, 150, 60, 80];
@@ -4054,13 +4164,15 @@ exports.exportReportToPDF = async (req, res, next) => {
         await Supplier.populate(topSuppliersPdfData, { path: '_id', select: 'name code' });
 
         const companyTopSup = await Company.findById(companyId);
-        doc.fontSize(16).text(companyTopSup?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyTopSup?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('TOP SUPPLIERS BY PURCHASE', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyTopSup?.name || 'Company',
+          companyTin: companyTopSup?.tin || 'N/A',
+          reportTitle: 'TOP SUPPLIERS BY PURCHASE',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
 
         const tsHeaders = ['Code', 'Supplier Name', 'Purchases', 'Total Purchases'];
         const tsColWidths = [60, 150, 60, 80];
@@ -4101,12 +4213,14 @@ exports.exportReportToPDF = async (req, res, next) => {
           .lean();
 
         const companyCreditLimit = await Company.findById(companyId);
-        doc.fontSize(16).text(companyCreditLimit?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyCreditLimit?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('CLIENT CREDIT LIMIT REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyCreditLimit?.name || 'Company',
+          companyTin: companyCreditLimit?.tin || 'N/A',
+          reportTitle: 'CLIENT CREDIT LIMIT REPORT',
+          reportDate: new Date().toLocaleDateString()
+        });
 
         const clHeaders = ['Code', 'Client Name', 'Credit Limit', 'Outstanding', 'Utilization %'];
         const clColWidths = [50, 120, 70, 70, 60];
@@ -4157,13 +4271,15 @@ exports.exportReportToPDF = async (req, res, next) => {
         .sort({ createdAt: -1 });
 
         const companyNewClients = await Company.findById(companyId);
-        doc.fontSize(16).text(companyNewClients?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyNewClients?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('NEW CLIENTS REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyNewClients?.name || 'Company',
+          companyTin: companyNewClients?.tin || 'N/A',
+          reportTitle: 'NEW CLIENTS REPORT',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
 
         const ncHeaders = ['Code', 'Client Name', 'Registration Date'];
         const ncColWidths = [60, 180, 100];
@@ -4208,13 +4324,15 @@ exports.exportReportToPDF = async (req, res, next) => {
         });
 
         const companyInactive = await Company.findById(companyId);
-        doc.fontSize(16).text(companyInactive?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyInactive?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('INACTIVE CLIENTS REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Clients with no purchase in 90+ days`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyInactive?.name || 'Company',
+          companyTin: companyInactive?.tin || 'N/A',
+          reportTitle: 'INACTIVE CLIENTS REPORT',
+          reportDate: new Date().toLocaleDateString(),
+          period: 'Clients with no purchase in 90+ days'
+        });
 
         const icHeaders = ['Code', 'Client Name', 'Last Purchase', 'Days Inactive', 'Outstanding'];
         const icColWidths = [50, 120, 70, 60, 70];
@@ -4381,13 +4499,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'purchase-by-product':
         const companyPurchaseProduct = await Company.findById(companyId);
-        doc.fontSize(16).text(companyPurchaseProduct?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyPurchaseProduct?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('PURCHASE BY PRODUCT REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyPurchaseProduct?.name || 'Company',
+          companyTin: companyPurchaseProduct?.tin || 'N/A',
+          reportTitle: 'PURCHASE BY PRODUCT REPORT',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const purchaseByProductData = await reportGeneratorService.generatePurchaseByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
         
@@ -4479,12 +4599,14 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'accounts-payable':
         const companyAP = await Company.findById(companyId);
-        doc.fontSize(16).text(companyAP?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyAP?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('ACCOUNTS PAYABLE REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyAP?.name || 'Company',
+          companyTin: companyAP?.tin || 'N/A',
+          reportTitle: 'ACCOUNTS PAYABLE REPORT',
+          reportDate: new Date().toLocaleDateString()
+        });
         
         const accountsPayableData = await reportGeneratorService.generateAccountsPayableReport(companyId);
         
@@ -4529,12 +4651,14 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'supplier-aging':
         const companySA = await Company.findById(companyId);
-        doc.fontSize(16).text(companySA?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companySA?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SUPPLIER AGING REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companySA?.name || 'Company',
+          companyTin: companySA?.tin || 'N/A',
+          reportTitle: 'SUPPLIER AGING REPORT',
+          reportDate: new Date().toLocaleDateString()
+        });
         
         const supplierAgingData = await reportGeneratorService.generateSupplierAgingReport(companyId);
         
@@ -4577,13 +4701,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'purchase-returns':
         const companyPR = await Company.findById(companyId);
-        doc.fontSize(16).text(companyPR?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyPR?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('PURCHASE RETURNS REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyPR?.name || 'Company',
+          companyTin: companyPR?.tin || 'N/A',
+          reportTitle: 'PURCHASE RETURNS REPORT',
+          reportDate: new Date().toLocaleDateString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const purchaseReturnsData = await reportGeneratorService.generatePurchaseReturnsReport(companyId, reportPeriodStart, reportPeriodEnd);
         
@@ -4711,13 +4837,15 @@ exports.exportReportToPDF = async (req, res, next) => {
       // ============================================
       case 'sales-by-product': {
         const companySBP = await Company.findById(companyId);
-        doc.fontSize(16).text(companySBP?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companySBP?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SALES BY PRODUCT REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companySBP?.name || 'Company',
+          companyTin: companySBP?.tin || 'N/A',
+          reportTitle: 'SALES BY PRODUCT REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const salesByProductPdf = await reportGeneratorService.generateSalesByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (salesByProductPdf && salesByProductPdf.data && salesByProductPdf.data.length > 0) {
@@ -4760,13 +4888,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'sales-by-category': {
         const companySBC = await Company.findById(companyId);
-        doc.fontSize(16).text(companySBC?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companySBC?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SALES BY CATEGORY REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companySBC?.name || 'Company',
+          companyTin: companySBC?.tin || 'N/A',
+          reportTitle: 'SALES BY CATEGORY REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const salesByCategoryPdf = await reportGeneratorService.generateSalesByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (salesByCategoryPdf && salesByCategoryPdf.data && salesByCategoryPdf.data.length > 0) {
@@ -4809,13 +4939,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'sales-by-client': {
         const companySBCt = await Company.findById(companyId);
-        doc.fontSize(16).text(companySBCt?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companySBCt?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('SALES BY CLIENT REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companySBCt?.name || 'Company',
+          companyTin: companySBCt?.tin || 'N/A',
+          reportTitle: 'SALES BY CLIENT REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const salesByClientPdf = await reportGeneratorService.generateSalesByClientReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (salesByClientPdf && salesByClientPdf.data && salesByClientPdf.data.length > 0) {
@@ -4906,12 +5038,14 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'invoice-aging': {
         const companyIA = await Company.findById(companyId);
-        doc.fontSize(16).text(companyIA?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyIA?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('INVOICE AGING REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyIA?.name || 'Company',
+          companyTin: companyIA?.tin || 'N/A',
+          reportTitle: 'INVOICE AGING REPORT',
+          reportDate: new Date().toLocaleString()
+        });
         
         const invoiceAgingPdf = await reportGeneratorService.generateInvoiceAgingReport(companyId);
         if (invoiceAgingPdf && invoiceAgingPdf.buckets) {
@@ -4961,12 +5095,14 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'accounts-receivable': {
         const companyAR = await Company.findById(companyId);
-        doc.fontSize(16).text(companyAR?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyAR?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('ACCOUNTS RECEIVABLE REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyAR?.name || 'Company',
+          companyTin: companyAR?.tin || 'N/A',
+          reportTitle: 'ACCOUNTS RECEIVABLE REPORT',
+          reportDate: new Date().toLocaleString()
+        });
         
         const arPdf = await reportGeneratorService.generateAccountsReceivableReport(companyId);
         if (arPdf && arPdf.data && arPdf.data.length > 0) {
@@ -5012,13 +5148,15 @@ exports.exportReportToPDF = async (req, res, next) => {
       case 'credit-notes':
       case 'credit-notes-report': {
         const companyCNR = await Company.findById(companyId);
-        doc.fontSize(16).text(companyCNR?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyCNR?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('CREDIT NOTES REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyCNR?.name || 'Company',
+          companyTin: companyCNR?.tin || 'N/A',
+          reportTitle: 'CREDIT NOTES REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const cnPdf = await reportGeneratorService.generateCreditNotesReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (cnPdf && cnPdf.data && cnPdf.data.length > 0) {
@@ -5062,13 +5200,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'quotation-conversion': {
         const companyQCR = await Company.findById(companyId);
-        doc.fontSize(16).text(companyQCR?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyQCR?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('QUOTATION CONVERSION REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyQCR?.name || 'Company',
+          companyTin: companyQCR?.tin || 'N/A',
+          reportTitle: 'QUOTATION CONVERSION REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const qcPdf = await reportGeneratorService.generateQuotationConversionReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (qcPdf && qcPdf.data && qcPdf.data.length > 0) {
@@ -5109,13 +5249,15 @@ exports.exportReportToPDF = async (req, res, next) => {
 
       case 'recurring-invoice': {
         const companyRIR = await Company.findById(companyId);
-        doc.fontSize(16).text(companyRIR?.name || 'Company', { align: 'center' });
-        doc.fontSize(10).text(`TIN: ${companyRIR?.tin || 'N/A'}`, { align: 'center' });
-        doc.moveDown(0.5);
-        doc.fontSize(14).text('RECURRING INVOICE REPORT', { align: 'center', underline: true });
-        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
-        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        
+        // Use pdfRenderer for consistent header
+        pdfRenderer.renderReportHeader(doc, {
+          companyName: companyRIR?.name || 'Company',
+          companyTin: companyRIR?.tin || 'N/A',
+          reportTitle: 'RECURRING INVOICE REPORT',
+          reportDate: new Date().toLocaleString(),
+          period: `${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`
+        });
         
         const riPdf = await reportGeneratorService.generateRecurringInvoiceReport(companyId, reportPeriodStart, reportPeriodEnd);
         if (riPdf && riPdf.data && riPdf.data.length > 0) {
@@ -6371,6 +6513,572 @@ exports.exportReportToPDF = async (req, res, next) => {
           });
         } else {
           doc.fontSize(10).text('No warehouse stock data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      // ============================================
+      // BANK & CASH REPORTS
+      // ============================================
+      case 'bank-reconciliation': {
+        const companyBank1 = await Company.findById(companyId);
+        doc.fontSize(16).text(companyBank1?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyBank1?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('BANK RECONCILIATION REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const bankReconPdf = await reportGeneratorService.generateBankReconciliationReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (bankReconPdf && bankReconPdf.data && bankReconPdf.data.length > 0) {
+          const brHeaders = ['Account', 'Bank', 'Deposits', 'Withdrawals', 'Reconciled', 'Unreconciled'];
+          const brColWidths = [60, 60, 60, 60, 60, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let brX = 30;
+          brHeaders.forEach((header, i) => {
+            doc.text(header, brX, doc.y, { width: brColWidths[i] });
+            brX += brColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          bankReconPdf.data.forEach(item => {
+            brX = 30;
+            const rowData = [
+              item.accountName || '-',
+              item.bankName || '-',
+              (item.totalDeposits || 0).toFixed(2),
+              (item.totalWithdrawals || 0).toFixed(2),
+              (item.reconciledAmount || 0).toFixed(2),
+              (item.unreconciledAmount || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), brX, doc.y, { width: brColWidths[i] });
+              brX += brColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No bank reconciliation data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'cash-position': {
+        const companyBank2 = await Company.findById(companyId);
+        doc.fontSize(16).text(companyBank2?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyBank2?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CASH POSITION REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`As of: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const cashPosPdf = await reportGeneratorService.generateCashPositionReport(companyId);
+        if (cashPosPdf && cashPosPdf.data && cashPosPdf.data.length > 0) {
+          const cpHeaders = ['Account', 'Type', 'Bank', 'Balance'];
+          const cpColWidths = [80, 60, 80, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let cpX = 30;
+          cpHeaders.forEach((header, i) => {
+            doc.text(header, cpX, doc.y, { width: cpColWidths[i] });
+            cpX += cpColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          cashPosPdf.data.forEach(item => {
+            cpX = 30;
+            const rowData = [
+              item.name || '-',
+              item.accountType || '-',
+              item.bankName || '-',
+              (item.currentBalance || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), cpX, doc.y, { width: cpColWidths[i] });
+              cpX += cpColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No cash position data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'bank-transaction': {
+        const companyBank3 = await Company.findById(companyId);
+        doc.fontSize(16).text(companyBank3?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyBank3?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('BANK TRANSACTION REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const bankTxnPdf = await reportGeneratorService.generateBankTransactionReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (bankTxnPdf && bankTxnPdf.data && bankTxnPdf.data.length > 0) {
+          const btHeaders = ['Date', 'Account', 'Type', 'Amount', 'Description'];
+          const btColWidths = [40, 60, 40, 50, 100];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let btX = 30;
+          btHeaders.forEach((header, i) => {
+            doc.text(header, btX, doc.y, { width: btColWidths[i] });
+            btX += btColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          bankTxnPdf.data.slice(0, 50).forEach(item => {
+            btX = 30;
+            const rowData = [
+              item.date ? new Date(item.date).toLocaleDateString() : '-',
+              item.accountName || '-',
+              item.type || '-',
+              (item.amount || 0).toFixed(2),
+              (item.description || '-').substring(0, 30)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), btX, doc.y, { width: btColWidths[i] });
+              btX += btColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No bank transaction data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'unreconciled-transactions': {
+        const companyBank4 = await Company.findById(companyId);
+        doc.fontSize(16).text(companyBank4?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyBank4?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('UNRECONCILED TRANSACTIONS REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const unreconciledPdf = await reportGeneratorService.generateUnreconciledTransactionsReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (unreconciledPdf && unreconciledPdf.data && unreconciledPdf.data.length > 0) {
+          const urHeaders = ['Date', 'Account', 'Type', 'Amount', 'Description'];
+          const urColWidths = [40, 60, 40, 50, 100];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let urX = 30;
+          urHeaders.forEach((header, i) => {
+            doc.text(header, urX, doc.y, { width: urColWidths[i] });
+            urX += urColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          unreconciledPdf.data.slice(0, 50).forEach(item => {
+            urX = 30;
+            const rowData = [
+              item.date ? new Date(item.date).toLocaleDateString() : '-',
+              item.accountName || '-',
+              item.type || '-',
+              (item.amount || 0).toFixed(2),
+              (item.description || '-').substring(0, 30)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), urX, doc.y, { width: urColWidths[i] });
+              urX += urColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No unreconciled transactions found.', { align: 'center' });
+        }
+        break;
+      }
+
+      // ============================================
+      // MISSING PERIOD/FINANCIAL REPORTS
+      // ============================================
+      case 'balance-sheet': {
+        const bsCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(bsCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${bsCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('BALANCE SHEET', { align: 'center', underline: true });
+        doc.fontSize(9).text(`As of: ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Get balance sheet data - only takes (companyId, asOfDate)
+        const bsData = await reportGeneratorService.generateBalanceSheetReport(companyId, reportPeriodEnd);
+        if (bsData) {
+          doc.fontSize(11).font('Helvetica-Bold').text('ASSETS', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Current Assets: ${(bsData.currentAssets || 0).toFixed(2)}`, 70);
+          doc.text(`Non-Current Assets: ${(bsData.nonCurrentAssets || 0).toFixed(2)}`, 70);
+          doc.font('Helvetica-Bold').text(`Total Assets: ${(bsData.totalAssets || 0).toFixed(2)}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('LIABILITIES', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Current Liabilities: ${(bsData.currentLiabilities || 0).toFixed(2)}`, 70);
+          doc.text(`Non-Current Liabilities: ${(bsData.nonCurrentLiabilities || 0).toFixed(2)}`, 70);
+          doc.font('Helvetica-Bold').text(`Total Liabilities: ${(bsData.totalLiabilities || 0).toFixed(2)}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('EQUITY', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Share Capital: ${(bsData.shareCapital || 0).toFixed(2)}`, 70);
+          doc.text(`Retained Earnings: ${(bsData.retainedEarnings || 0).toFixed(2)}`, 70);
+          doc.text(`Current Period Profit: ${(bsData.currentPeriodProfit || 0).toFixed(2)}`, 70);
+          doc.font('Helvetica-Bold').text(`Total Equity: ${(bsData.totalEquity || 0).toFixed(2)}`, 70);
+        } else {
+          doc.fontSize(10).text('Balance Sheet data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'financial-ratios': {
+        const frCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(frCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${frCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('FINANCIAL RATIOS', { align: 'center', underline: true });
+        doc.fontSize(9).text(`As of: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Get financial ratios from service
+        const ratiosData = await reportGeneratorService.generateFinancialRatiosReport(companyId);
+        if (ratiosData) {
+          doc.fontSize(11).font('Helvetica-Bold').text('LIQUIDITY RATIOS', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Current Ratio: ${ratiosData.currentRatio?.toFixed(2) || 'N/A'}`, 70);
+          doc.text(`Quick Ratio: ${ratiosData.quickRatio?.toFixed(2) || 'N/A'}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('PROFITABILITY RATIOS', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Gross Margin: ${ratiosData.grossMargin?.toFixed(2) || 'N/A'}%`, 70);
+          doc.text(`Net Profit Margin: ${ratiosData.netMargin?.toFixed(2) || 'N/A'}%`, 70);
+          doc.text(`Return on Assets: ${ratiosData.returnOnAssets?.toFixed(2) || 'N/A'}%`, 70);
+          doc.text(`Return on Equity: ${ratiosData.returnOnEquity?.toFixed(2) || 'N/A'}%`, 70);
+        } else {
+          doc.fontSize(10).text('Financial Ratios data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'cash-flow': {
+        const cfCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(cfCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${cfCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CASH FLOW STATEMENT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const cfData = await reportGeneratorService.generateCashFlowReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (cfData && cfData.summary) {
+          doc.fontSize(11).font('Helvetica-Bold').text('OPERATING ACTIVITIES', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Net Cash from Operations: ${(cfData.summary.operating?.netCashFlow || 0).toFixed(2)}`, 70);
+          doc.moveDown(0.5);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('INVESTING ACTIVITIES', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Net Cash from Investing: ${(cfData.summary.investing?.netCashFlow || 0).toFixed(2)}`, 70);
+          doc.moveDown(0.5);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('FINANCING ACTIVITIES', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Net Cash from Financing: ${(cfData.summary.financing?.netCashFlow || 0).toFixed(2)}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(11).font('Helvetica-Bold');
+          doc.text(`NET CHANGE IN CASH: ${(cfData.summary.netChangeInCash || 0).toFixed(2)}`, 50);
+        } else {
+          doc.fontSize(10).text('Cash Flow data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'top-products': {
+        const tpCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(tpCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${tpCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('TOP PRODUCTS BY SALES', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const tpData = await reportGeneratorService.generateSalesByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (tpData && tpData.data) {
+          const tpHeaders = ['SKU', 'Product Name', 'Quantity Sold', 'Revenue'];
+          const tpColWidths = [60, 150, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let tpX = 30;
+          tpHeaders.forEach((header, i) => {
+            doc.text(header, tpX, doc.y, { width: tpColWidths[i] });
+            tpX += tpColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          tpData.data.slice(0, 50).forEach(item => {
+            const rowData = [
+              item.product?.sku || 'N/A',
+              (item.product?.name || 'Unknown').substring(0, 30),
+              (item.quantitySold || 0).toString(),
+              (item.revenue || 0).toFixed(2)
+            ];
+            tpX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, tpX, doc.y, { width: tpColWidths[i] });
+              tpX += tpColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No product sales data available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'vat-summary': {
+        const vsCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(vsCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${vsCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('VAT SUMMARY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const vsData = await reportGeneratorService.generateVATReturnReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (vsData && vsData.data) {
+          doc.fontSize(11).font('Helvetica-Bold').text('OUTPUT VAT (Sales)', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Total Output VAT: ${(vsData.data.outputVAT?.totalVAT || 0).toFixed(2)}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(11).font('Helvetica-Bold').text('INPUT VAT (Purchases)', 50);
+          doc.font('Helvetica').fontSize(10);
+          doc.text(`Total Input VAT: ${(vsData.data.inputVAT?.totalVAT || 0).toFixed(2)}`, 70);
+          doc.moveDown(1);
+          
+          doc.fontSize(12).font('Helvetica-Bold');
+          doc.text(`NET VAT: ${(vsData.data.netVAT || 0).toFixed(2)}`, 50);
+        } else {
+          doc.fontSize(10).text('VAT Summary data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'product-performance': {
+        const ppCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(ppCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${ppCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PRODUCT PERFORMANCE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const ppData = await reportGeneratorService.generateProductPerformanceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (ppData && ppData.data) {
+          const ppHeaders = ['SKU', 'Product Name', 'Qty Sold', 'Revenue', 'COGS', 'Margin'];
+          const ppColWidths = [50, 120, 50, 60, 50, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let ppX = 30;
+          ppHeaders.forEach((header, i) => {
+            doc.text(header, ppX, doc.y, { width: ppColWidths[i] });
+            ppX += ppColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          ppData.data.slice(0, 50).forEach(item => {
+            const rowData = [
+              item.product?.sku || 'N/A',
+              (item.product?.name || 'Unknown').substring(0, 25),
+              (item.quantitySold || 0).toString(),
+              (item.revenue || 0).toFixed(2),
+              (item.cogs || 0).toFixed(2),
+              (item.margin || 0).toFixed(2)
+            ];
+            ppX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, ppX, doc.y, { width: ppColWidths[i] });
+              ppX += ppColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('Product Performance data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'customer-summary': {
+        const csCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(csCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${csCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CUSTOMER SUMMARY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Use generateTopCustomersReport for customer summary
+        const csData = await reportGeneratorService.generateTopCustomersReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (csData && csData.data) {
+          const csHeaders = ['Code', 'Client Name', 'Invoices', 'Total Sales', 'Balance'];
+          const csColWidths = [50, 140, 50, 70, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let csX = 30;
+          csHeaders.forEach((header, i) => {
+            doc.text(header, csX, doc.y, { width: csColWidths[i] });
+            csX += csColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          csData.data.slice(0, 50).forEach(item => {
+            const rowData = [
+              item.client?.code || 'N/A',
+              (item.client?.name || 'Unknown').substring(0, 30),
+              (item.invoiceCount || 0).toString(),
+              (item.totalSales || 0).toFixed(2),
+              (item.balance || 0).toFixed(2)
+            ];
+            csX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, csX, doc.y, { width: csColWidths[i] });
+              csX += csColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('Customer Summary data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'supplier-summary': {
+        const ssCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(ssCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${ssCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SUPPLIER SUMMARY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Use generateTopSuppliersByPurchaseReport for supplier summary
+        const ssData = await reportGeneratorService.generateTopSuppliersByPurchaseReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (ssData && ssData.data) {
+          const ssHeaders = ['Code', 'Supplier Name', 'Purchases', 'Quantity', 'Total Cost'];
+          const ssColWidths = [50, 140, 50, 60, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let ssX = 30;
+          ssHeaders.forEach((header, i) => {
+            doc.text(header, ssX, doc.y, { width: ssColWidths[i] });
+            ssX += ssColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          ssData.data.slice(0, 50).forEach(item => {
+            const rowData = [
+              item._id?.code || 'N/A',
+              (item._id?.name || 'Unknown').substring(0, 30),
+              (item.totalPurchases || 0).toString(),
+              (item.totalQuantity || 0).toString(),
+              (item.totalCost || 0).toFixed(2)
+            ];
+            ssX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, ssX, doc.y, { width: ssColWidths[i] });
+              ssX += ssColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('Supplier Summary data not available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'purchases': {
+        const purchCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(purchCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${purchCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PURCHASES REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const purchData = await Purchase.find({
+          company: companyId,
+          purchaseDate: { $gte: reportPeriodStart, $lte: reportPeriodEnd }
+        }).populate('supplier', 'name code').sort({ purchaseDate: -1 }).limit(100);
+        
+        if (purchData && purchData.length > 0) {
+          const purchHeaders = ['PO #', 'Date', 'Supplier', 'Total', 'Paid', 'Balance', 'Status'];
+          const purchColWidths = [50, 40, 100, 60, 50, 50, 50];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let purchX = 30;
+          purchHeaders.forEach((header, i) => {
+            doc.text(header, purchX, doc.y, { width: purchColWidths[i] });
+            purchX += purchColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalPurch = 0;
+          purchData.forEach(p => {
+            totalPurch += p.grandTotal || 0;
+            const rowData = [
+              p.purchaseNumber || 'N/A',
+              p.purchaseDate ? new Date(p.purchaseDate).toLocaleDateString() : 'N/A',
+              (p.supplier?.name || '-').substring(0, 20),
+              (p.grandTotal || 0).toFixed(2),
+              (p.amountPaid || 0).toFixed(2),
+              (p.balance || 0).toFixed(2),
+              p.status || '-'
+            ];
+            purchX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, purchX, doc.y, { width: purchColWidths[i] });
+              purchX += purchColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Purchases: ${totalPurch.toFixed(2)}`, 30);
+        } else {
+          doc.fontSize(10).text('No purchase data available.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'aging': {
+        const agingCompany = await Company.findById(companyId);
+        doc.fontSize(16).text(agingCompany?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${agingCompany?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('AGING REPORT', { align: 'center', underline: true });
+        doc.moveDown(2);
+        
+        const agingData = await reportGeneratorService.generateInvoiceAgingReport(companyId);
+        if (agingData && agingData.buckets) {
+          doc.fontSize(11).font('Helvetica-Bold').text('RECEIVABLES AGING', 50);
+          doc.font('Helvetica').fontSize(10);
+          
+          const buckets = agingData.buckets;
+          const bucketLabels = ['Current', '1-30 Days', '31-60 Days', '61-90 Days', '90+ Days'];
+          const bucketKeys = ['current', '1-30', '31-60', '61-90', '90+'];
+          
+          bucketKeys.forEach((key, idx) => {
+            const items = buckets[key] || [];
+            const total = items.reduce((sum, i) => sum + (i.balance || 0), 0);
+            doc.text(`${bucketLabels[idx]}: ${items.length} invoices, Total: ${total.toFixed(2)}`, 70);
+          });
+        } else {
+          doc.fontSize(10).text('Aging data not available.', { align: 'center' });
         }
         break;
       }

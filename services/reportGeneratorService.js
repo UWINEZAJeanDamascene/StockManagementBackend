@@ -1755,6 +1755,48 @@ const getReportData = async (companyId, reportType, periodType, year, periodNumb
     case 'warehouse-stock':
       data = await generateWarehouseStockReport(companyId);
       break;
+    // ============================================
+    // BANK & CASH REPORTS
+    // ============================================
+    case 'bank-reconciliation':
+      data = await generateBankReconciliationReport(companyId, startDate, endDate);
+      break;
+    case 'cash-position':
+      data = await generateCashPositionReport(companyId);
+      break;
+    case 'bank-transaction':
+      data = await generateBankTransactionReport(companyId, startDate, endDate);
+      break;
+    case 'unreconciled-transactions':
+      data = await generateUnreconciledTransactionsReport(companyId, startDate, endDate);
+      break;
+    // ============================================
+    // ADDITIONAL REPORT TYPES NEEDED BY FRONTEND
+    // ============================================
+    case 'sales-summary':
+      data = await generateSalesSummaryReport(companyId, startDate, endDate);
+      break;
+    case 'purchases':
+      data = await generatePurchaseByProductReport(companyId, startDate, endDate);
+      break;
+    case 'suppliers':
+      data = await generateTopSuppliersByPurchaseReport(companyId, startDate, endDate);
+      break;
+    case 'aging':
+      data = await generateInvoiceAgingReport(companyId);
+      break;
+    case 'cash-flow':
+      data = await generateCashFlowReport(companyId, startDate, endDate);
+      break;
+    case 'financial-ratios':
+      data = await generateFinancialRatiosReport(companyId, startDate, endDate);
+      break;
+    case 'top-products':
+      data = await generateProductPerformanceReport(companyId, startDate, endDate);
+      break;
+    case 'top-customers':
+      data = await generateTopClientsByRevenueReport(companyId, startDate, endDate);
+      break;
     default:
       throw new Error(`Unknown report type: ${reportType}`);
   }
@@ -3984,6 +4026,588 @@ const generateWarehouseStockReport = async (companyId, warehouseId = null) => {
   return { data: report, summary };
 };
 
+// ============================================
+// BANK & CASH REPORTS
+// ============================================
+
+// Generate Bank Reconciliation Report
+const generateBankReconciliationReport = async (companyId, startDate, endDate) => {
+  const { BankAccount, BankTransaction } = require('../models/BankAccount');
+  
+  // Get all active bank accounts
+  const accounts = await BankAccount.find({ company: companyId, isActive: true }).lean();
+  
+  const report = [];
+  let totalReconciled = 0;
+  let totalUnreconciled = 0;
+  
+  for (const account of accounts) {
+    // Get all transactions in period
+    const transactions = await BankTransaction.find({
+      company: companyId,
+      account: account._id,
+      date: { $gte: new Date(startDate), $lte: new Date(endDate) }
+    }).sort({ date: 1 }).lean();
+    
+    // Calculate totals
+    const totalDeposits = transactions
+      .filter(t => t.type === 'deposit' || t.type === 'transfer_in')
+      .reduce((sum, t) => sum + t.amount, 0);
+    
+    const totalWithdrawals = transactions
+      .filter(t => t.type === 'withdrawal' || t.type === 'transfer_out')
+      .reduce((sum, t) => sum + t.amount, 0);
+    
+    // Get reconciled vs unreconciled
+    const reconciledTxns = transactions.filter(t => 
+      t.reference !== null && t.referenceType !== null
+    );
+    const unreconciledTxns = transactions.filter(t => 
+      t.reference === null || t.referenceType === null
+    );
+    
+    const reconciledAmount = reconciledTxns.reduce((sum, t) => sum + t.amount, 0);
+    const unreconciledAmount = unreconciledTxns.reduce((sum, t) => sum + t.amount, 0);
+    
+    totalReconciled += reconciledAmount;
+    totalUnreconciled += unreconciledAmount;
+    
+    report.push({
+      accountId: account._id,
+      accountName: account.name,
+      accountType: account.accountType,
+      bankName: account.bankName,
+      accountNumber: account.accountNumber,
+      openingBalance: account.openingBalance,
+      closingBalance: account.currentBalance,
+      totalDeposits,
+      totalWithdrawals,
+      netChange: totalDeposits - totalWithdrawals,
+      reconciledCount: reconciledTxns.length,
+      unreconciledCount: unreconciledTxns.length,
+      reconciledAmount,
+      unreconciledAmount,
+      lastReconciledAt: account.lastReconciledAt,
+      lastReconciledBalance: account.lastReconciledBalance
+    });
+  }
+  
+  const summary = {
+    totalAccounts: report.length,
+    totalReconciled,
+    totalUnreconciled,
+    reconciledPercentage: (totalReconciled / (totalReconciled + totalUnreconciled)) * 100 || 0
+  };
+  
+  return { data: report, summary };
+};
+
+// Generate Cash Position Report (balance per bank account)
+const generateCashPositionReport = async (companyId) => {
+  const { BankAccount } = require('../models/BankAccount');
+  
+  // Get all active bank accounts
+  const accounts = await BankAccount.find({ company: companyId, isActive: true })
+    .sort({ accountType: 1, name: 1 })
+    .lean();
+  
+  const report = accounts.map(account => ({
+    _id: account._id,
+    name: account.name,
+    accountType: account.accountType,
+    accountNumber: account.accountNumber,
+    bankName: account.bankName,
+    currentBalance: account.currentBalance,
+    targetBalance: account.targetBalance,
+    currency: account.currency,
+    isPrimary: account.isPrimary,
+    lastReconciledAt: account.lastReconciledAt
+  }));
+  
+  // Calculate totals by account type
+  const byType = {};
+  report.forEach(account => {
+    if (!byType[account.accountType]) {
+      byType[account.accountType] = 0;
+    }
+    byType[account.accountType] += account.currentBalance;
+  });
+  
+  const total = report.reduce((sum, acc) => sum + acc.currentBalance, 0);
+  
+  const summary = {
+    totalAccounts: report.length,
+    total,
+    byType,
+    primaryAccount: report.find(a => a.isPrimary) || null
+  };
+  
+  return { data: report, summary };
+};
+
+// Generate Sales Summary Report
+const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
+  const matchStage = {
+    company: companyId,
+    status: { $in: ['paid', 'partial', 'confirmed'] }
+  };
+
+  if (startDate || endDate) {
+    matchStage.invoiceDate = {};
+    if (startDate) matchStage.invoiceDate.$gte = new Date(startDate);
+    if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
+  }
+
+  const salesSummary = await Invoice.aggregate([
+    { $match: matchStage },
+    {
+      $group: {
+        _id: null,
+        totalInvoices: { $sum: 1 },
+        totalRevenue: { $sum: '$grandTotal' },
+        totalSubtotal: { $sum: '$subtotal' },
+        totalTax: { $sum: '$totalTax' },
+        totalDiscount: { $sum: '$totalDiscount' },
+        totalPaid: { $sum: '$amountPaid' },
+        totalBalance: { $sum: '$balance' },
+        uniqueClients: { $addToSet: '$client' }
+      }
+    }
+  ]);
+
+  const result = salesSummary[0] || {
+    totalInvoices: 0,
+    totalRevenue: 0,
+    totalSubtotal: 0,
+    totalTax: 0,
+    totalDiscount: 0,
+    totalPaid: 0,
+    totalBalance: 0,
+    uniqueClients: []
+  };
+
+  // Get average invoice value
+  const avgInvoiceValue = result.totalInvoices > 0 
+    ? result.totalRevenue / result.totalInvoices 
+    : 0;
+
+  // Get sales by status
+  const salesByStatus = await Invoice.aggregate([
+    { $match: { company: companyId, invoiceDate: { $gte: startDate, $lte: endDate } } },
+    {
+      $group: {
+        _id: '$status',
+        count: { $sum: 1 },
+        total: { $sum: '$grandTotal' }
+      }
+    }
+  ]);
+
+  return {
+    data: {
+      overview: {
+        totalInvoices: result.totalInvoices,
+        totalRevenue: result.totalRevenue,
+        totalSubtotal: result.totalSubtotal,
+        totalTax: result.totalTax,
+        totalDiscount: result.totalDiscount,
+        totalPaid: result.totalPaid,
+        totalBalance: result.totalBalance,
+        uniqueClients: result.uniqueClients.length,
+        avgInvoiceValue: avgInvoiceValue
+      },
+      byStatus: salesByStatus
+    },
+    summary: {
+      totalInvoices: result.totalInvoices,
+      totalRevenue: result.totalRevenue,
+      avgInvoiceValue: avgInvoiceValue
+    }
+  };
+};
+
+// Generate Cash Flow Report
+const generateCashFlowReport = async (companyId, startDate, endDate) => {
+  // Cash inflows from paid invoices
+  const cashInflows = await Invoice.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'paid',
+        paidDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$amountPaid' }
+      }
+    }
+  ]);
+
+  // Cash outflows from purchases
+  const cashOutflowsPurchases = await Purchase.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'completed',
+        purchaseDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$amountPaid' }
+      }
+    }
+  ]);
+
+  // Cash outflows from expenses
+  const cashOutflowsExpenses = await Expense.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'approved',
+        expenseDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$amount' }
+      }
+    }
+  ]);
+
+  // Credit notes issued (cash outflows)
+  const creditNotesIssued = await CreditNote.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'approved',
+        issueDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$grandTotal' }
+      }
+    }
+  ]);
+
+  // Purchase returns (cash inflows)
+  const purchaseReturns = await PurchaseReturn.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'refunded',
+        returnDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: '$refundAmount' }
+      }
+    }
+  ]);
+
+  const totalInflows = (cashInflows[0]?.total || 0) + (purchaseReturns[0]?.total || 0);
+  const totalOutflows = (cashOutflowsPurchases[0]?.total || 0) + (cashOutflowsExpenses[0]?.total || 0) + (creditNotesIssued[0]?.total || 0);
+  const netCashFlow = totalInflows - totalOutflows;
+
+  return {
+    data: {
+      inflows: {
+        customerPayments: cashInflows[0]?.total || 0,
+        purchaseReturns: purchaseReturns[0]?.total || 0,
+        total: totalInflows
+      },
+      outflows: {
+        supplierPayments: cashOutflowsPurchases[0]?.total || 0,
+        expenses: cashOutflowsExpenses[0]?.total || 0,
+        creditNotes: creditNotesIssued[0]?.total || 0,
+        total: totalOutflows
+      },
+      netCashFlow
+    },
+    summary: {
+      totalInflows,
+      totalOutflows,
+      netCashFlow
+    }
+  };
+};
+
+// Generate Financial Ratios Report
+const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
+  // Get basic financial data
+  const invoices = await Invoice.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'paid',
+        paidDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalRevenue: { $sum: '$grandTotal' },
+        totalPaid: { $sum: '$amountPaid' }
+      }
+    }
+  ]);
+
+  const purchases = await Purchase.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'completed',
+        purchaseDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalPurchases: { $sum: '$grandTotal' }
+      }
+    }
+  ]);
+
+  const expenses = await Expense.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: 'approved',
+        expenseDate: { $gte: startDate, $lte: endDate }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalExpenses: { $sum: '$amount' }
+      }
+    }
+  ]);
+
+  // Get current assets and liabilities for ratio calculations
+  const currentAssets = await Invoice.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: { $in: ['sent', 'partial', 'overdue'] },
+        balance: { $gt: 0 }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        accountsReceivable: { $sum: '$balance' }
+      }
+    }
+  ]);
+
+  const currentLiabilities = await Purchase.aggregate([
+    {
+      $match: {
+        company: companyId,
+        status: { $in: ['pending', 'partial'] },
+        balance: { $gt: 0 }
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        accountsPayable: { $sum: '$balance' }
+      }
+    }
+  ]);
+
+  // Get inventory value
+  const inventory = await Product.aggregate([
+    {
+      $match: {
+        company: companyId,
+        isActive: true
+      }
+    },
+    {
+      $group: {
+        _id: null,
+        totalValue: { $sum: { $multiply: ['$quantity', '$costPrice'] } }
+      }
+    }
+  ]);
+
+  // Get bank balances
+  const { BankAccount } = require('../models/BankAccount');
+  const bankAccounts = await BankAccount.find({ company: companyId, isActive: true });
+  const cashBalance = bankAccounts.reduce((sum, ba) => sum + (ba.balance || 0), 0);
+
+  const revenue = invoices[0]?.totalRevenue || 0;
+  const totalExpenses = (purchases[0]?.totalPurchases || 0) + (expenses[0]?.totalExpenses || 0);
+  const netIncome = revenue - totalExpenses;
+  const grossProfit = revenue - (purchases[0]?.totalPurchases || 0);
+
+  // Calculate ratios
+  const grossProfitMargin = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
+  const netProfitMargin = revenue > 0 ? (netIncome / revenue) * 100 : 0;
+  
+  const currentRatio = currentLiabilities[0]?.accountsPayable > 0 
+    ? ((currentAssets[0]?.accountsReceivable || 0) + (inventory[0]?.totalValue || 0) + cashBalance) / currentLiabilities[0].accountsPayable
+    : 0;
+
+  const quickRatio = currentLiabilities[0]?.accountsPayable > 0
+    ? ((currentAssets[0]?.accountsReceivable || 0) + cashBalance) / currentLiabilities[0].accountsPayable
+    : 0;
+
+  const debtToEquity = (currentLiabilities[0]?.accountsPayable || 0) > 0 
+    ? currentLiabilities[0].accountsPayable / (revenue - currentLiabilities[0].accountsPayable || 1)
+    : 0;
+
+  return {
+    data: {
+      profitability: {
+        grossProfitMargin: Math.round(grossProfitMargin * 100) / 100,
+        netProfitMargin: Math.round(netProfitMargin * 100) / 100,
+        revenue,
+        grossProfit,
+        netIncome
+      },
+      liquidity: {
+        currentRatio: Math.round(currentRatio * 100) / 100,
+        quickRatio: Math.round(quickRatio * 100) / 100,
+        cashBalance,
+        accountsReceivable: currentAssets[0]?.accountsReceivable || 0,
+        accountsPayable: currentLiabilities[0]?.accountsPayable || 0
+      },
+      leverage: {
+        debtToEquity: Math.round(debtToEquity * 100) / 100,
+        totalLiabilities: currentLiabilities[0]?.accountsPayable || 0
+      }
+    },
+    summary: {
+      grossProfitMargin: Math.round(grossProfitMargin * 100) / 100,
+      netProfitMargin: Math.round(netProfitMargin * 100) / 100,
+      currentRatio: Math.round(currentRatio * 100) / 100,
+      quickRatio: Math.round(quickRatio * 100) / 100
+    }
+  };
+};
+
+// Generate Bank Transaction Report
+const generateBankTransactionReport = async (companyId, startDate, endDate) => {
+  const { BankAccount, BankTransaction } = require('../models/BankAccount');
+  
+  // Get all transactions in period
+  const transactions = await BankTransaction.find({
+    company: companyId,
+    date: { $gte: new Date(startDate), $lte: new Date(endDate) }
+  })
+  .populate('account', 'name accountType bankName')
+  .sort({ date: -1 })
+  .lean();
+  
+  const report = transactions.map(txn => ({
+    _id: txn._id,
+    date: txn.date,
+    type: txn.type,
+    amount: txn.amount,
+    balanceAfter: txn.balanceAfter,
+    description: txn.description,
+    reference: txn.reference,
+    referenceType: txn.referenceType,
+    paymentMethod: txn.paymentMethod,
+    referenceNumber: txn.referenceNumber,
+    status: txn.status,
+    accountName: txn.account?.name,
+    accountType: txn.account?.accountType,
+    bankName: txn.account?.bankName
+  }));
+  
+  // Calculate summary by type
+  const byType = {};
+  report.forEach(txn => {
+    if (!byType[txn.type]) {
+      byType[txn.type] = { count: 0, total: 0 };
+    }
+    byType[txn.type].count++;
+    byType[txn.type].total += txn.amount;
+  });
+  
+  const totalIn = report
+    .filter(t => t.type === 'deposit' || t.type === 'transfer_in')
+    .reduce((sum, t) => sum + t.amount, 0);
+  
+  const totalOut = report
+    .filter(t => t.type === 'withdrawal' || t.type === 'transfer_out')
+    .reduce((sum, t) => sum + t.amount, 0);
+  
+  const summary = {
+    totalTransactions: report.length,
+    totalIn,
+    totalOut,
+    netChange: totalIn - totalOut,
+    byType
+  };
+  
+  return { data: report, summary };
+};
+
+// Generate Unreconciled Transactions Report
+const generateUnreconciledTransactionsReport = async (companyId, startDate, endDate) => {
+  const { BankAccount, BankTransaction } = require('../models/BankAccount');
+  
+  // Get all unreconciled transactions in period
+  const transactions = await BankTransaction.find({
+    company: companyId,
+    $or: [
+      { reference: null },
+      { referenceType: null }
+    ],
+    date: { $gte: new Date(startDate), $lte: new Date(endDate) }
+  })
+  .populate('account', 'name accountType bankName')
+  .sort({ date: -1 })
+  .lean();
+  
+  const report = transactions.map(txn => ({
+    _id: txn._id,
+    date: txn.date,
+    type: txn.type,
+    amount: txn.amount,
+    balanceAfter: txn.balanceAfter,
+    description: txn.description,
+    reference: txn.reference,
+    referenceType: txn.referenceType,
+    paymentMethod: txn.paymentMethod,
+    referenceNumber: txn.referenceNumber,
+    status: txn.status,
+    accountName: txn.account?.name,
+    accountType: txn.account?.accountType,
+    bankName: txn.account?.bankName,
+    notes: txn.notes
+  }));
+  
+  const totalUnreconciled = report.reduce((sum, t) => sum + t.amount, 0);
+  
+  const summary = {
+    totalTransactions: report.length,
+    totalAmount: totalUnreconciled,
+    byType: {
+      deposit: report.filter(t => t.type === 'deposit').length,
+      withdrawal: report.filter(t => t.type === 'withdrawal').length,
+      transfer_in: report.filter(t => t.type === 'transfer_in').length,
+      transfer_out: report.filter(t => t.type === 'transfer_out').length,
+      adjustment: report.filter(t => t.type === 'adjustment').length
+    }
+  };
+  
+  return { data: report, summary };
+};
+
 module.exports = {
   generateAllReports,
   getReportData,
@@ -4092,5 +4716,14 @@ module.exports = {
   generateInventoryTurnoverReport,
   generateBatchExpiryReport,
   generateSerialNumberTrackingReport,
-  generateWarehouseStockReport
+  generateWarehouseStockReport,
+  // Bank & Cash Reports
+  generateBankReconciliationReport,
+  generateCashPositionReport,
+  generateBankTransactionReport,
+  generateUnreconciledTransactionsReport,
+  // Additional Reports
+  generateSalesSummaryReport,
+  generateCashFlowReport,
+  generateFinancialRatiosReport
 };

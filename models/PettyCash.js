@@ -2,6 +2,18 @@ const mongoose = require('mongoose');
 
 // Petty Cash Expense Schema (individual expense entries)
 const pettyCashExpenseSchema = new mongoose.Schema({
+  // Company reference
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true
+  },
+  // Float reference
+  float: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'PettyCashFloat',
+    required: true
+  },
   description: {
     type: String,
     required: true,

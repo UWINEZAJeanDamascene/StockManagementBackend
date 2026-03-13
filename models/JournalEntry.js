@@ -61,7 +61,7 @@ const journalEntrySchema = new mongoose.Schema({
   // Reference to source document (optional)
   sourceType: {
     type: String,
-    enum: ['manual', 'invoice', 'purchase', 'credit_note', 'expense', 'asset', 'depreciation', 'loan', 'payment', 'adjustment', null],
+    enum: ['manual', 'invoice', 'purchase', 'credit_note', 'expense', 'asset', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_expense', 'petty_cash_replenishment', 'purchase_return', 'stock_adjustment', 'payroll', 'tax_payment', 'bank_transfer', 'opening_balance', null],
     default: 'manual'
   },
   sourceId: {
@@ -133,20 +133,29 @@ journalEntrySchema.statics.generateEntryNumber = async function(companyId) {
   const today = new Date();
   const year = today.getFullYear();
   const month = String(today.getMonth() + 1).padStart(2, '0');
+  const day = String(today.getDate()).padStart(2, '0');
   
-  // Find the last entry for this company this month
+  // Create a unique prefix using company ID and current date
+  // This ensures uniqueness across all companies
+  const companyPrefix = String(companyId).slice(-4).toUpperCase();
+  
+  // Find the last entry for this company (any date) to get the max sequence
   const lastEntry = await this.findOne({
-    company: companyId,
-    entryNumber: new RegExp(`^JE-${year}${month}`)
+    company: companyId
   }).sort({ entryNumber: -1 });
   
   let sequence = 1;
   if (lastEntry) {
-    const lastSequence = parseInt(lastEntry.entryNumber.split('-').pop());
-    sequence = lastSequence + 1;
+    // Extract sequence from last entry and increment
+    const parts = lastEntry.entryNumber.split('-');
+    const lastSeq = parseInt(parts[parts.length - 1]);
+    if (!isNaN(lastSeq)) {
+      sequence = lastSeq + 1;
+    }
   }
   
-  return `JE-${year}${month}-${String(sequence).padStart(4, '0')}`;
+  // Use format: JE-{companyPrefix}-{yearMonthDay}-{sequence}
+  return `JE-${companyPrefix}-${year}${month}${day}-${String(sequence).padStart(4, '0')}`;
 };
 
 // Method to validate debits equal credits

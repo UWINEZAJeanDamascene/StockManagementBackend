@@ -9,7 +9,8 @@ const {
   postJournalEntry,
   getAccounts,
   getTrialBalance,
-  getGeneralLedger
+  getGeneralLedger,
+  runDepreciation
 } = require('../controllers/journalController');
 const { protect } = require('../middleware/auth');
 
@@ -24,6 +25,7 @@ router.route('/')
 router.get('/accounts', getAccounts);
 router.get('/trial-balance', getTrialBalance);
 router.get('/general-ledger', getGeneralLedger);
+router.post('/run-depreciation', runDepreciation);
 
 router.route('/:id')
   .get(getJournalEntry)
