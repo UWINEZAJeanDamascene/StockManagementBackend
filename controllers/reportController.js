@@ -14,6 +14,8 @@ const CreditNote = require('../models/CreditNote');
 const Expense = require('../models/Expense');
 const PurchaseReturn = require('../models/PurchaseReturn');
 const cacheService = require('../services/cacheService');
+const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const reportGeneratorService = require('../services/reportGeneratorService');
 
 // Shared helper: declining-balance rate (mirrors FixedAsset model logic)
 function _dbRateReport(cost, salvage, years) {
@@ -1187,7 +1189,264 @@ exports.getCLVReport = async (req, res, next) => {
   }
 };
 
-// @desc    Cash flow statement (inflows from invoice payments, outflows from purchase payments)
+// @desc    Financial Ratios & KPIs
+// @route   GET /api/reports/financial-ratios
+// @access  Private
+exports.getFinancialRatios = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { asOfDate, startDate, endDate } = req.query;
+
+    const asOf = asOfDate ? new Date(asOfDate) : new Date();
+    const periodStart = startDate ? new Date(startDate) : new Date(asOf.getFullYear(), 0, 1);
+    const periodEnd = endDate ? new Date(endDate) : asOf;
+
+    // Get basic P&L figures using existing helper to ensure consistency
+    const pl = await computeCurrentPeriodProfit(companyId, periodStart, periodEnd);
+    const netProfit = pl.netProfit || 0;
+    const profitBeforeTax = pl.profitBeforeTax || 0;
+    const netRevenue = pl.netRevenue || 0;
+    const grossProfit = pl.grossProfit || 0;
+
+    // Get Balance Sheet aggregates (minimal set) to compute ratios
+    // Use same logic as Balance Sheet for consistency
+    const [invoiceAgg, purchaseAgg, productAgg, fixedAssets, loansAgg, company] = await Promise.all([
+      Invoice.aggregate([
+        { $match: { company: companyId } },
+        { $facet: {
+          payments: [ { $unwind: '$payments' }, { $group: { _id: null, total: { $sum: '$payments.amount' } } } ],
+          receivables: [ { $match: { status: { $in: ['draft','confirmed','partial'] } } }, { $group: { _id: null, total: { $sum: '$balance' } } } ],
+          outputVAT: [ { $match: { status: { $in: ['paid','partial','confirmed'] } } }, { $group: { _id: null, total: { $sum: '$totalTax' } } } ]
+        } }
+      ]),
+      Purchase.aggregate([
+        { $match: { company: companyId } },
+        { $facet: {
+          payments: [ { $unwind: '$payments' }, { $group: { _id: null, total: { $sum: '$payments.amount' } } } ],
+          payables: [ { $match: { status: { $in: ['draft','ordered','received','partial'] } } }, { $group: { _id: null, totalBalance: { $sum: '$balance' } } } ],
+          inputVAT: [ { $match: { status: { $in: ['received','partial','paid'] } } }, { $group: { _id: null, total: { $sum: '$totalTax' } } } ],
+          // Get all purchases (not just payables) for Payables Days calculation
+          allPurchases: [ { $match: { status: { $in: ['draft','ordered','received','partial','paid'] } } }, { $group: { _id: null, total: { $sum: '$subtotal' } } } ]
+        } }
+      ]),
+      Product.aggregate([
+        { $match: { company: companyId, isArchived: false } },
+        { $project: { stockValue: { $multiply: ['$currentStock', '$averageCost'] } } },
+        { $group: { _id: null, totalValue: { $sum: '$stockValue' } } }
+      ]),
+      FixedAsset.find({ company: companyId, status: 'active' }),
+      Loan.aggregate([{ $match: { company: companyId, status: 'active' } }, { $group: { _id: '$loanType', totalBalance: { $sum: { $subtract: ['$originalAmount', '$amountPaid'] } } } }]),
+      Company.findById(companyId).lean()
+    ]);
+
+    const invoiceRes = (invoiceAgg[0] || {});
+    const totalInflows = invoiceRes.payments?.[0]?.total || 0;
+    const accountsReceivable = invoiceRes.receivables?.[0]?.total || 0;
+    const outputVAT = invoiceRes.outputVAT?.[0]?.total || 0;
+
+    const purchaseRes = (purchaseAgg[0] || {});
+    const totalOutflows = purchaseRes.payments?.[0]?.total || 0;
+
+    // Robust accounts payable: sum outstanding balances on purchases
+    // Include ALL purchase statuses that could have a balance (including 'paid' with remaining balance)
+    const purchasePayableAgg = await Purchase.aggregate([
+      { $match: { company: companyId, balance: { $gt: 0 } } },
+      { $group: { _id: null, totalBalance: { $sum: '$balance' } } }
+    ]);
+    const accountsPayable = purchasePayableAgg[0]?.totalBalance || 0;
+    const inputVAT = purchaseRes.inputVAT?.[0]?.total || 0;
+
+    // Get actual purchases (subtotal, excluding VAT and discounts) for Payables Days calculation
+    // This represents the total value of purchases made
+    const purchasesTotal = purchaseRes.allPurchases?.[0]?.total || 
+      (await Purchase.aggregate([
+        { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] } } },
+        { $group: { _id: null, total: { $sum: '$subtotal' } } }
+      ]))[0]?.total || 0;
+
+    const inventoryValue = productAgg[0]?.totalValue || 0;
+
+    // Fixed assets gross and depreciation
+    let totalFixedGross = 0;
+    let totalAccumDep = 0;
+    (fixedAssets || []).forEach(a => { totalFixedGross += a.purchaseCost || 0; totalAccumDep += a.accumulatedDepreciation || 0; });
+
+    const vatReceivable = Math.max(0, (inputVAT || 0) - (outputVAT || 0));
+    const vatPayable = Math.max(0, (outputVAT || 0) - (inputVAT || 0));
+
+    // Get loans data for liability calculations
+    const loansDataAgg = loansAgg[0] || {};
+    const loanTotal = loansDataAgg.totalBalance || 0;
+    
+    // Separate short-term and long-term loans
+    const shortTermLoans = loansDataAgg._id === 'short-term' ? loanTotal : 0;
+    const longTermLoans = loansDataAgg._id === 'long-term' ? loanTotal : 
+      (await Loan.aggregate([
+        { $match: { company: companyId, status: 'active' } },
+        { $group: { _id: '$loanType', totalBalance: { $sum: { $subtract: ['$originalAmount', '$amountPaid'] } } } }
+      ])).reduce((sum, loan) => {
+        if (loan._id === 'long-term') return sum + (loan.totalBalance || 0);
+        return sum;
+      }, 0);
+
+    // Calculate accrued interest on all active loans
+    const allActiveLoans = await Loan.find({ company: companyId, status: 'active' });
+    const accruedInterest = allActiveLoans.reduce((sum, loan) => {
+      const months = loan.durationMonths || 0;
+      const P = loan.originalAmount || 0;
+      const rate = loan.interestRate || 0;
+      if (!months || !P || !rate) return sum;
+
+      if (loan.interestMethod === 'compound') {
+        const r = rate / 100 / 12;
+        const emi = r > 0 ? (P * r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1) : P / months;
+        const totalInterest = emi * months - P;
+        return sum + Math.max(0, totalInterest);
+      } else {
+        const totalInterest = (P * rate / 100 / 12) * months;
+        return sum + totalInterest;
+      }
+    }, 0);
+
+    // Get custom liabilities from Company
+    const companyCurrLiab = (company?.liabilities?.currentLiabilities || []).reduce((s, c) => s + (c.amount || 0), 0);
+    const companyNonCurrLiab = (company?.liabilities?.nonCurrentLiabilities || []).reduce((s, c) => s + (c.amount || 0), 0);
+    const accruedExpenses = company?.liabilities?.accruedExpenses || 0;
+
+    // Corporate Income Tax Payable (30% of Profit Before Tax)
+    const incomeTaxPayable = Math.max(0, profitBeforeTax * 0.30);
+
+    // Calculate Current Assets - using same logic as Balance Sheet
+    // Cash & Bank = payments received from customers (net of credit notes)
+    const creditNoteData = await CreditNote.aggregate([
+      { $match: { company: companyId, status: { $in: ['issued', 'applied', 'refunded', 'partially_refunded'] } } },
+      { $group: { _id: null, total: { $sum: '$grandTotal' } } }
+    ]);
+    const totalCreditNoteAmount = creditNoteData[0]?.total || 0;
+    const netCashInflows = Math.max(0, totalInflows - totalCreditNoteAmount);
+    // Get actual bank account balances - use real bank account data if available
+    let cashAndBank = 0;
+    try {
+      const bankData = await BankAccount.getTotalCashPosition(companyId);
+      cashAndBank = bankData.total || netCashInflows;
+    } catch (e) {
+      cashAndBank = netCashInflows || 0;
+    }
+    const prepaidExpenses = company?.assets?.prepaidExpenses || 0;
+
+    const totalCurrentAssets = cashAndBank + accountsReceivable + inventoryValue + prepaidExpenses + vatReceivable;
+    const totalNonCurrentAssets = Math.max(0, totalFixedGross - totalAccumDep);
+    const totalAssets = totalCurrentAssets + totalNonCurrentAssets;
+
+    // Calculate Current Liabilities - using same logic as Balance Sheet
+    // Include: accounts payable, VAT payable, short-term loans, income tax payable, accrued expenses, accrued interest, and custom current liabilities
+    const totalCurrentLiabilities = accountsPayable + vatPayable + shortTermLoans + incomeTaxPayable + companyCurrLiab + accruedExpenses + accruedInterest;
+    const totalNonCurrentLiabilities = longTermLoans + companyNonCurrLiab;
+    const totalLiabilities = totalCurrentLiabilities + totalNonCurrentLiabilities;
+
+    const shareCapital = company?.equity?.shareCapital || 0;
+    const retainedEarnings = company?.equity?.retainedEarnings || 0;
+    const totalEquity = shareCapital + retainedEarnings + netProfit;
+
+    // Compute ratios (guard divide by zero)
+    const safeDiv = (num, den) => (den && den !== 0) ? num / den : null;
+
+    const currentRatio = safeDiv(totalCurrentAssets, totalCurrentLiabilities);
+    const quickRatio = safeDiv(totalCurrentAssets - inventoryValue, totalCurrentLiabilities);
+    const debtToEquity = safeDiv(totalLiabilities, totalEquity);
+    const returnOnAssets = safeDiv(netProfit, totalAssets);
+    const returnOnEquity = safeDiv(netProfit, totalEquity);
+    const grossMarginPercent = netRevenue ? (grossProfit / netRevenue) * 100 : null;
+    const netProfitMarginPercent = netRevenue ? (netProfit / netRevenue) * 100 : null;
+    const cogs = (netRevenue - grossProfit) || 0;
+    const inventoryTurnover = safeDiv(cogs, inventoryValue || 0);
+
+    // Payables Days = (Accounts Payable × 365) / Actual Purchases
+    // Use purchasesTotal (actual purchases from P&L) not payables
+    const payablesDaysValue = safeDiv((accountsPayable || 0) * 365, purchasesTotal || 1);
+
+    const ratios = {
+      currentRatio: { value: currentRatio, formula: 'Current Assets / Current Liabilities' },
+      quickRatio: { value: quickRatio, formula: '(Current Assets - Inventory) / Current Liabilities' },
+      debtToEquity: { value: debtToEquity, formula: 'Total Liabilities / Total Equity' },
+      returnOnAssets: { value: returnOnAssets, formula: 'Net Profit / Total Assets' },
+      returnOnEquity: { value: returnOnEquity, formula: 'Net Profit / Total Equity' },
+      grossMargin: { value: grossMarginPercent, formula: 'Gross Profit / Net Revenue × 100' },
+      netMargin: { value: netProfitMarginPercent, formula: 'Net Profit / Net Revenue × 100' },
+      inventoryTurnover: { value: inventoryTurnover, formula: 'COGS / Average Inventory (approx)' },
+      receivablesDays: { value: safeDiv((accountsReceivable || 0) * 365, netRevenue) || null, formula: 'Receivables / Revenue × 365' },
+      payablesDays: { value: payablesDaysValue, formula: 'Payables / Purchases × 365' }
+    };
+
+    // Simple interpretation heuristics
+    const interpretation = {
+      liquidity: (currentRatio >= 1.5) ? 'healthy' : (currentRatio >= 1 ? 'caution' : 'risky'),
+      profitability: (netProfitMarginPercent >= 10) ? 'healthy' : (netProfitMarginPercent > 0 ? 'caution' : 'risky'),
+      efficiency: (inventoryTurnover >= 4) ? 'healthy' : (inventoryTurnover >= 2 ? 'caution' : 'risky'),
+      liquidityMessage: '',
+      profitabilityMessage: '',
+      efficiencyMessage: '',
+      keyTakeaways: ''
+    };
+
+    interpretation.liquidityMessage = `Current ratio is ${currentRatio?.toFixed?.(2) || 'N/A'}`;
+    interpretation.profitabilityMessage = `Net margin is ${netProfitMarginPercent != null ? (netProfitMarginPercent.toFixed(1) + '%') : 'N/A'}`;
+    interpretation.efficiencyMessage = `Inventory turnover is ${inventoryTurnover != null ? inventoryTurnover.toFixed(2) : 'N/A'}`;
+    interpretation.keyTakeaways = 'Review liquidity and working capital if any ratios are in caution or risky range.';
+
+    const responseData = {
+      asOf: asOf,
+      periodStart,
+      periodEnd,
+      liquidity: {
+        currentRatio: ratios.currentRatio,
+        quickRatio: ratios.quickRatio
+      },
+      profitability: {
+        grossMargin: ratios.grossMargin,
+        netMargin: ratios.netMargin,
+        roa: { value: returnOnAssets, formula: 'Net Profit / Total Assets × 100' }
+      },
+      efficiency: {
+        inventoryTurnover: ratios.inventoryTurnover,
+        receivablesDays: ratios.receivablesDays,
+        payablesDays: ratios.payablesDays
+      },
+      sourceData: {
+        currentAssets: totalCurrentAssets,
+        currentLiabilities: totalCurrentLiabilities,
+        cash: cashAndBank,
+        receivables: accountsReceivable,
+        grossProfit: grossProfit,
+        revenue: netRevenue,
+        netProfit: netProfit,
+        totalAssets: totalAssets,
+        cogs: cogs,
+        averageInventory: inventoryValue,
+        purchases: purchasesTotal,
+        payables: accountsPayable,
+        inventory: inventoryValue,
+        prepaidExpenses: prepaidExpenses,
+        vatReceivable: vatReceivable,
+        vatPayable: vatPayable,
+        shortTermLoans: shortTermLoans,
+        longTermLoans: longTermLoans,
+        accruedInterest: accruedInterest,
+        accruedExpenses: accruedExpenses,
+        incomeTaxPayable: incomeTaxPayable,
+        customCurrentLiabilities: companyCurrLiab,
+        customNonCurrentLiabilities: companyNonCurrLiab
+      },
+      interpretation
+    };
+
+    res.json({ success: true, data: responseData });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Cash flow statement (comprehensive - IAS 7 format)
 // @route   GET /api/reports/cash-flow
 // @access  Private
 exports.getCashFlowStatement = async (req, res, next) => {
@@ -1197,58 +1456,296 @@ exports.getCashFlowStatement = async (req, res, next) => {
     const cacheKey = { companyId, startDate, endDate, period };
     
     const cached = await cacheService.fetchOrExecute(
-      'report',
+      'report_cashflow_v4',
       async () => {
         const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), 0, 1);
         const end = endDate ? new Date(endDate) : new Date();
 
-        // Determine date format based on period
-        let groupByFormat;
-        switch (period) {
-          case 'weekly':
-            groupByFormat = { $dateToString: { format: '%Y-W%V', date: '$payments.paidDate' } };
-            break;
-          case 'yearly':
-            groupByFormat = { $dateToString: { format: '%Y', date: '$payments.paidDate' } };
-            break;
-          case 'monthly':
-          default:
-            groupByFormat = { $dateToString: { format: '%Y-%m', date: '$payments.paidDate' } };
-            break;
-        }
+        // Determine date format based on period (for system records)
 
-        // Invoice payments (inflows)
+        // INVESTING ACTIVITIES - Asset Purchases from FixedAsset model (vehicles, equipment, etc.)
+        // Query all FixedAssets purchased in the date range and group by period
+        // Use a try-catch to handle potential date parsing issues
+        let fixedAssetPurchasesAgg = [];
+        try {
+          fixedAssetPurchasesAgg = await FixedAsset.find({ 
+            company: companyId,
+            purchaseDate: { $gte: start, $lte: end }
+          }).lean();
+        } catch (err) {
+          console.error('Error querying FixedAssets:', err);
+        }
+        
+        // Group fixed asset purchases by period manually (since purchaseDate might be string or date)
+        const fixedAssetByPeriod = {};
+        fixedAssetPurchasesAgg.forEach(asset => {
+          let periodKey;
+          try {
+            // Handle both Date objects and string dates
+            let purchaseDate;
+            if (asset.purchaseDate instanceof Date) {
+              purchaseDate = asset.purchaseDate;
+            } else if (typeof asset.purchaseDate === 'string') {
+              purchaseDate = new Date(asset.purchaseDate);
+            } else {
+              periodKey = 'N/A';
+              return;
+            }
+            
+            if (isNaN(purchaseDate.getTime())) {
+              periodKey = 'N/A';
+              return;
+            }
+            
+            if (period === 'yearly') {
+              periodKey = purchaseDate.getFullYear().toString();
+            } else if (period === 'weekly') {
+              // Get ISO week number
+              const d = new Date(Date.UTC(purchaseDate.getFullYear(), purchaseDate.getMonth(), purchaseDate.getDate()));
+              const dayNum = d.getUTCDay() || 7;
+              d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+              const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+              const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1)/7);
+              periodKey = `${d.getUTCFullYear()}-W${weekNo.toString().padStart(2, '0')}`;
+            } else {
+              // monthly
+              periodKey = `${purchaseDate.getFullYear()}-${(purchaseDate.getMonth() + 1).toString().padStart(2, '0')}`;
+            }
+          } catch (e) {
+            periodKey = 'N/A';
+          }
+          
+          if (!fixedAssetByPeriod[periodKey]) {
+            fixedAssetByPeriod[periodKey] = 0;
+          }
+          fixedAssetByPeriod[periodKey] += asset.purchaseCost || 0;
+        });
+
+        const fixedAssetPurchases = Object.entries(fixedAssetByPeriod).map(([period, amount]) => ({
+          _id: period,
+          amount: amount
+        })).sort((a, b) => a._id.localeCompare(b._id));
+
+        // OPERATING ACTIVITIES - Use ACTUAL Bank Transactions
+        // This includes BOTH: system-generated transactions (invoices/purchases/expenses paid)
+        // AND CSV-imported transactions from bank statements
+        // This gives the REAL cash flow based on actual bank account movements
+        
+        // Get all bank transactions (completed) grouped by period and type
+        const bankTransactionsAgg = await BankTransaction.aggregate([
+          {
+            $match: {
+              company: companyId,
+              date: { $gte: start, $lte: end },
+              status: 'completed'
+            }
+          },
+          {
+            $group: {
+              _id: {
+                period: { $dateToString: { format: period === 'yearly' ? '%Y' : (period === 'weekly' ? '%Y-W%V' : '%Y-%m'), date: '$date' }},
+                type: '$type'
+              },
+              amount: { $sum: '$amount' },
+              count: { $sum: 1 }
+            }
+          },
+          { $sort: { '_id.period': 1 } }
+        ]);
+        
+        // Transform into deposits (cash inflows) and withdrawals (cash outflows)
+        const depositsByPeriod = {};
+        const withdrawalsByPeriod = {};
+        let totalBankDeposits = 0;
+        let totalBankWithdrawals = 0;
+        
+        bankTransactionsAgg.forEach(tx => {
+          const periodKey = tx._id.period;
+          const type = tx._id.type;
+          const amount = tx.amount;
+          
+          // Deposits: deposit, transfer_in, opening (money coming in)
+          // Withdrawals: withdrawal, transfer_out, adjustment, closing (money going out)
+          const isDeposit = ['deposit', 'transfer_in', 'opening'].includes(type);
+          const isWithdrawal = ['withdrawal', 'transfer_out', 'adjustment', 'closing'].includes(type);
+          
+          if (isDeposit) {
+            depositsByPeriod[periodKey] = (depositsByPeriod[periodKey] || 0) + amount;
+            totalBankDeposits += amount;
+          }
+          if (isWithdrawal) {
+            withdrawalsByPeriod[periodKey] = (withdrawalsByPeriod[periodKey] || 0) + amount;
+            totalBankWithdrawals += amount;
+          }
+        });
+        
+        // Get system records for reconciliation comparison (invoices/purchases/expenses paid)
+        // These are the 'expected' vs 'actual' from bank
         const invoicePayments = await Invoice.aggregate([
           { $match: { company: companyId } },
           { $unwind: '$payments' },
           { $match: { 'payments.paidDate': { $gte: start, $lte: end } } },
           { $group: {
-            _id: groupByFormat,
-            inflow: { $sum: '$payments.amount' }
+            _id: { $dateToString: { format: period === 'yearly' ? '%Y' : (period === 'weekly' ? '%Y-W%V' : '%Y-%m'), date: '$payments.paidDate' }},
+            cashFromCustomers: { $sum: '$payments.amount' },
+            count: { $sum: 1 }
           } },
           { $sort: { _id: 1 } }
         ]);
 
-        // Purchase payments (outflows)
         const purchasePayments = await Purchase.aggregate([
           { $match: { company: companyId } },
           { $unwind: '$payments' },
           { $match: { 'payments.paidDate': { $gte: start, $lte: end } } },
           { $group: {
-            _id: groupByFormat,
-            outflow: { $sum: '$payments.amount' }
+            _id: { $dateToString: { format: period === 'yearly' ? '%Y' : (period === 'weekly' ? '%Y-W%V' : '%Y-%m'), date: '$payments.paidDate' }},
+            cashToSuppliers: { $sum: '$payments.amount' },
+            count: { $sum: 1 }
           } },
           { $sort: { _id: 1 } }
         ]);
 
-        // Merge by period
+        // Merge all data by period - use ACTUAL bank transactions
         const map = {};
-        invoicePayments.forEach(r => { map[r._id] = map[r._id] || { period: r._id, inflow: 0, outflow: 0 }; map[r._id].inflow = r.inflow; });
-        purchasePayments.forEach(r => { map[r._id] = map[r._id] || { period: r._id, inflow: 0, outflow: 0 }; map[r._id].outflow = r.outflow; });
+        
+        // Initialize all periods from bank transactions (deposits)
+        Object.keys(depositsByPeriod).forEach(periodKey => {
+          map[periodKey] = map[periodKey] || { 
+            period: periodKey, 
+            cashFromBank: 0, 
+            cashToBank: 0, 
+            cashFromCustomers: 0, 
+            cashToSuppliers: 0, 
+            cashForExpenses: 0, 
+            taxPaid: 0, 
+            assetPurchases: 0, 
+            assetDisposals: 0, 
+            loanDisbursements: 0, 
+            loanRepayments: 0, 
+            capitalInjections: 0, 
+            dividendsPaid: 0 
+          };
+          map[periodKey].cashFromBank = depositsByPeriod[periodKey];
+        });
+        
+        // Initialize all periods from bank transactions (withdrawals)
+        Object.keys(withdrawalsByPeriod).forEach(periodKey => {
+          map[periodKey] = map[periodKey] || { 
+            period: periodKey, 
+            cashFromBank: 0, 
+            cashToBank: 0, 
+            cashFromCustomers: 0, 
+            cashToSuppliers: 0, 
+            cashForExpenses: 0, 
+            taxPaid: 0, 
+            assetPurchases: 0, 
+            assetDisposals: 0, 
+            loanDisbursements: 0, 
+            loanRepayments: 0, 
+            capitalInjections: 0, 
+            dividendsPaid: 0 
+          };
+          map[periodKey].cashToBank = withdrawalsByPeriod[periodKey];
+        });
+        
+        // Add system records for reconciliation comparison
+        invoicePayments.forEach(r => { 
+          map[r._id] = map[r._id] || { 
+            period: r._id, 
+            cashFromBank: 0, 
+            cashToBank: 0, 
+            cashFromCustomers: 0, 
+            cashToSuppliers: 0, 
+            cashForExpenses: 0, 
+            taxPaid: 0, 
+            assetPurchases: 0, 
+            assetDisposals: 0, 
+            loanDisbursements: 0, 
+            loanRepayments: 0, 
+            capitalInjections: 0, 
+            dividendsPaid: 0 
+          }; 
+          map[r._id].cashFromCustomers = r.cashFromCustomers; 
+        });
+        purchasePayments.forEach(r => { 
+          map[r._id] = map[r._id] || { 
+            period: r._id, 
+            cashFromBank: 0, 
+            cashToBank: 0, 
+            cashFromCustomers: 0, 
+            cashToSuppliers: 0, 
+            cashForExpenses: 0, 
+            taxPaid: 0, 
+            assetPurchases: 0, 
+            assetDisposals: 0, 
+            loanDisbursements: 0, 
+            loanRepayments: 0, 
+            capitalInjections: 0, 
+            dividendsPaid: 0 
+          }; 
+          map[r._id].cashToSuppliers = r.cashToSuppliers; 
+        });
+        fixedAssetPurchases.forEach(r => {
+          map[r._id] = map[r._id] || { period: r._id, cashFromCustomers: 0, cashToSuppliers: 0, cashForExpenses: 0, taxPaid: 0, assetPurchases: 0, assetDisposals: 0, loanDisbursements: 0, loanRepayments: 0, capitalInjections: 0, dividendsPaid: 0 };
+          map[r._id].assetPurchases = r.amount;
+        });
 
         const months = Object.values(map).sort((a, b) => a.period.localeCompare(b.period));
 
-        return { period: { start, end }, periodType: period, months };
+        // Calculate summary totals from ACTUAL bank transactions
+        const totalCashFromBank = months.reduce((sum, m) => sum + (m.cashFromBank || 0), 0);
+        const totalCashToBank = months.reduce((sum, m) => sum + (m.cashToBank || 0), 0);
+        const totalCashFromCustomers = months.reduce((sum, m) => sum + (m.cashFromCustomers || 0), 0);
+        const totalCashToSuppliers = months.reduce((sum, m) => sum + (m.cashToSuppliers || 0), 0);
+        const totalAssetPurchases = months.reduce((sum, m) => sum + (m.assetPurchases || 0), 0);
+        const totalAssetDisposals = months.reduce((sum, m) => sum + (m.assetDisposals || 0), 0);
+
+        // Operating = Cash from Bank - Cash to Bank (actual bank transactions)
+        const netOperatingCashFlow = totalCashFromBank - totalCashToBank;
+        // Investing = Disposals - Purchases
+        const netInvestingCashFlow = totalAssetDisposals - totalAssetPurchases;
+        // Financing = 0 (no data currently)
+        const netFinancingCashFlow = 0;
+
+        // Calculate reconciliation: difference between system records and bank records
+        const totalSystemCashIn = totalCashFromCustomers;
+        const totalSystemCashOut = totalCashToSuppliers;
+        const reconciliation = {
+          bankDeposits: totalCashFromBank,
+          bankWithdrawals: totalCashToBank,
+          systemInvoicePayments: totalCashFromCustomers,
+          systemPurchasePayments: totalCashToSuppliers,
+          depositsDifference: totalCashFromBank - totalCashFromCustomers,
+          withdrawalsDifference: totalCashToBank - totalCashToSuppliers
+        };
+
+        const summary = {
+          operating: {
+            cashFromBank: totalCashFromBank,
+            cashToBank: totalCashToBank,
+            cashFromCustomers: totalCashFromCustomers,
+            cashToSuppliers: totalCashToSuppliers,
+            cashForExpenses: 0,
+            taxPaid: 0,
+            netCashFlow: netOperatingCashFlow
+          },
+          investing: {
+            assetPurchases: totalAssetPurchases,
+            assetDisposals: totalAssetDisposals,
+            netCashFlow: netInvestingCashFlow
+          },
+          financing: {
+            loanDisbursements: 0,
+            loanRepayments: 0,
+            capitalInjections: 0,
+            dividendsPaid: 0,
+            netCashFlow: netFinancingCashFlow
+          },
+          netChangeInCash: netOperatingCashFlow + netInvestingCashFlow + netFinancingCashFlow,
+          reconciliation
+        };
+
+        return { period: { start, end }, periodType: period, months, summary };
       },
       cacheKey,
       { ttl: 300, useCompanyPrefix: true } // 5 minute cache
@@ -1346,6 +1843,457 @@ exports.getSupplierPurchaseReport = async (req, res, next) => {
   }
 };
 
+// @desc    Get client credit limit report
+// @route   GET /api/reports/client-credit-limit
+// @access  Private
+exports.getClientCreditLimitReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    const cacheKey = { companyId, startDate, endDate };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        // Get all active clients with credit limit > 0 or with outstanding balance
+        const clientQuery = { 
+          company: companyId,
+          isActive: true,
+          $or: [
+            { creditLimit: { $gt: 0 } },
+            { outstandingBalance: { $gt: 0 } }
+          ]
+        };
+
+        const clients = await Client.find(clientQuery)
+          .select('name code contact creditLimit outstandingBalance totalPurchases lastPurchaseDate')
+          .sort({ outstandingBalance: -1 });
+
+        // Calculate credit utilization for each client
+        const report = clients.map(client => {
+          const creditLimit = client.creditLimit || 0;
+          const outstandingBalance = client.outstandingBalance || 0;
+          const creditUtilization = creditLimit > 0 ? (outstandingBalance / creditLimit) * 100 : 0;
+          const availableCredit = Math.max(0, creditLimit - outstandingBalance);
+          
+          return {
+            _id: client._id,
+            code: client.code,
+            name: client.name,
+            contact: client.contact,
+            creditLimit: creditLimit,
+            outstandingBalance: outstandingBalance,
+            availableCredit: availableCredit,
+            creditUtilization: Math.round(creditUtilization * 100) / 100,
+            totalPurchases: client.totalPurchases || 0,
+            lastPurchaseDate: client.lastPurchaseDate,
+            status: creditUtilization > 100 ? 'over_limit' : (creditUtilization > 80 ? 'warning' : 'ok')
+          };
+        });
+
+        // Calculate summary
+        const summary = {
+          totalClients: report.length,
+          totalCreditLimit: report.reduce((sum, c) => sum + c.creditLimit, 0),
+          totalOutstanding: report.reduce((sum, c) => sum + c.outstandingBalance, 0),
+          totalAvailable: report.reduce((sum, c) => sum + c.availableCredit, 0),
+          overLimitCount: report.filter(c => c.status === 'over_limit').length,
+          warningCount: report.filter(c => c.status === 'warning').length
+        };
+
+        return { data: report, summary };
+      },
+      cacheKey,
+      { ttl: 120, useCompanyPrefix: true } // 2 minute cache
+    );
+
+    res.json({
+      success: true,
+      data: cached.data.data,
+      summary: cached.data.summary,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get new clients report
+// @route   GET /api/reports/new-clients
+// @access  Private
+exports.getNewClientsReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate, limit = 100 } = req.query;
+    const cacheKey = { companyId, startDate, endDate, limit };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        // Default to current month if no dates provided
+        const now = new Date();
+        const start = startDate ? new Date(startDate) : new Date(now.getFullYear(), now.getMonth(), 1);
+        const end = endDate ? new Date(endDate) : now;
+
+        const clients = await Client.find({
+          company: companyId,
+          createdAt: { $gte: start, $lte: end }
+        })
+        .select('name code contact createdAt totalPurchases outstandingBalance lastPurchaseDate')
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit, 10));
+
+        // Get purchase stats for each client in the period
+        const report = await Promise.all(clients.map(async (client) => {
+          const invoiceStats = await Invoice.aggregate([
+            { $match: {
+              client: client._id,
+              company: companyId,
+              invoiceDate: { $gte: start, $lte: end }
+            }},
+            { $group: {
+              _id: null,
+              totalInvoices: { $sum: 1 },
+              totalSales: { $sum: '$grandTotal' }
+            }}
+          ]);
+
+          return {
+            _id: client._id,
+            code: client.code,
+            name: client.name,
+            contact: client.contact,
+            createdAt: client.createdAt,
+            totalInvoices: invoiceStats[0]?.totalInvoices || 0,
+            totalSales: invoiceStats[0]?.totalSales || 0,
+            outstandingBalance: client.outstandingBalance || 0
+          };
+        }));
+
+        const summary = {
+          totalNewClients: report.length,
+          totalNewClientSales: report.reduce((sum, c) => sum + c.totalSales, 0),
+          periodStart: start,
+          periodEnd: end
+        };
+
+        return { data: report, summary };
+      },
+      cacheKey,
+      { ttl: 120, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data.data,
+      summary: cached.data.summary,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get inactive clients report (no purchase in X days)
+// @route   GET /api/reports/inactive-clients
+// @access  Private
+exports.getInactiveClientsReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { days = 90, limit = 100 } = req.query;
+    const cacheKey = { companyId, days, limit };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const inactiveDays = parseInt(days, 10) || 90;
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - inactiveDays);
+
+        // Get all active clients
+        const clients = await Client.find({
+          company: companyId,
+          isActive: true
+        })
+        .select('name code contact createdAt totalPurchases outstandingBalance lastPurchaseDate')
+        .lean();
+
+        // Filter clients with no purchase since cutoff date
+        const inactiveClients = [];
+        
+        for (const client of clients) {
+          const lastPurchase = client.lastPurchaseDate ? new Date(client.lastPurchaseDate) : null;
+          
+          // Client is inactive if:
+          // 1. No lastPurchaseDate OR
+          // 2. Last purchase was before cutoff date
+          const isInactive = !lastPurchase || lastPurchase < cutoffDate;
+          
+          if (isInactive) {
+            const daysSinceLastPurchase = lastPurchase 
+              ? Math.floor((new Date() - lastPurchase) / (1000 * 60 * 60 * 24))
+              : null;
+            
+            inactiveClients.push({
+              _id: client._id,
+              code: client.code,
+              name: client.name,
+              contact: client.contact,
+              createdAt: client.createdAt,
+              lastPurchaseDate: client.lastPurchaseDate,
+              daysSinceLastPurchase: daysSinceLastPurchase,
+              totalPurchases: client.totalPurchases || 0,
+              outstandingBalance: client.outstandingBalance || 0
+            });
+          }
+        }
+
+        // Sort by days since last purchase (most inactive first)
+        inactiveClients.sort((a, b) => {
+          if (a.daysSinceLastPurchase === null) return -1;
+          if (b.daysSinceLastPurchase === null) return 1;
+          return b.daysSinceLastPurchase - a.daysSinceLastPurchase;
+        });
+
+        // Apply limit
+        const report = inactiveClients.slice(0, parseInt(limit, 10));
+
+        const summary = {
+          totalInactiveClients: inactiveClients.length,
+          daysThreshold: inactiveDays,
+          displayedCount: report.length,
+          totalOutstandingBalance: report.reduce((sum, c) => sum + c.outstandingBalance, 0)
+        };
+
+        return { data: report, summary };
+      },
+      cacheKey,
+      { ttl: 120, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data.data,
+      summary: cached.data.summary,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get low stock report (below minimum level)
+// @route   GET /api/reports/low-stock
+// @access  Private
+exports.getLowStockReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { threshold } = req.query;
+    const cacheKey = { companyId, threshold };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateLowStockReport(companyId, threshold);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get dead stock report (no movement in X days)
+// @route   GET /api/reports/dead-stock
+// @access  Private
+exports.getDeadStockReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { days = 90 } = req.query;
+    const cacheKey = { companyId, days };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateDeadStockReport(companyId, days);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get stock aging report (how long items have been sitting)
+// @route   GET /api/reports/stock-aging
+// @access  Private
+exports.getStockAgingReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const cacheKey = { companyId };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateStockAgingReport(companyId);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get inventory turnover report
+// @route   GET /api/reports/inventory-turnover
+// @access  Private
+exports.getInventoryTurnoverReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    const cacheKey = { companyId, startDate, endDate };
+    
+    let reportPeriodStart, reportPeriodEnd;
+    if (startDate && endDate) {
+      reportPeriodStart = new Date(startDate);
+      reportPeriodEnd = new Date(endDate);
+    } else {
+      const now = new Date();
+      reportPeriodStart = new Date(now.getFullYear(), 0, 1);
+      reportPeriodEnd = now;
+    }
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateInventoryTurnoverReport(companyId, reportPeriodStart, reportPeriodEnd);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get batch/expiry report (items expiring soon)
+// @route   GET /api/reports/batch-expiry
+// @access  Private
+exports.getBatchExpiryReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { daysAhead = 90 } = req.query;
+    const cacheKey = { companyId, daysAhead };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateBatchExpiryReport(companyId, daysAhead);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get serial number tracking report
+// @route   GET /api/reports/serial-number-tracking
+// @access  Private
+exports.getSerialNumberTrackingReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { productId, status } = req.query;
+    const cacheKey = { companyId, productId, status };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateSerialNumberTrackingReport(companyId, productId, status);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get warehouse stock report (stock per warehouse)
+// @route   GET /api/reports/warehouse-stock
+// @access  Private
+exports.getWarehouseStockReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { warehouseId } = req.query;
+    const cacheKey = { companyId, warehouseId };
+    
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => {
+        const data = await reportGeneratorService.generateWarehouseStockReport(companyId, warehouseId);
+        return data;
+      },
+      cacheKey,
+      { ttl: 300, useCompanyPrefix: true }
+    );
+
+    res.json({
+      success: true,
+      data: cached.data,
+      fromCache: cached.fromCache
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Export report to Excel
 // @route   GET /api/reports/export/excel/:reportType
 // @access  Private
@@ -1353,10 +2301,29 @@ exports.exportReportToExcel = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { reportType } = req.params;
+    const { periodType, year, periodNumber, startDate, endDate } = req.query;
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Report');
 
     let data;
+    let reportPeriodStart, reportPeriodEnd;
+
+    // If period parameters provided, use them to determine date range
+    if (periodType && year) {
+      const periodYear = parseInt(year);
+      const periodNum = periodNumber ? parseInt(periodNumber) : 1;
+      const periodInfo = reportGeneratorService.getPeriodDates(periodType, periodYear, periodNum);
+      reportPeriodStart = new Date(periodInfo.startDate);
+      reportPeriodEnd = new Date(periodInfo.endDate);
+    } else if (startDate && endDate) {
+      reportPeriodStart = new Date(startDate);
+      reportPeriodEnd = new Date(endDate);
+    } else {
+      // Default to current quarter
+      const now = new Date();
+      reportPeriodStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+      reportPeriodEnd = new Date();
+    }
 
     switch (reportType) {
       case 'products':
@@ -1458,10 +2425,9 @@ exports.exportReportToExcel = async (req, res, next) => {
         break;
 
       case 'profit-loss':
-        // Get P&L detailed data for export
-        const now = new Date();
-        const plPeriodStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
-        const plPeriodEnd = new Date();
+        // Get P&L detailed data for export - use the determined period dates
+        const plPeriodStart = reportPeriodStart;
+        const plPeriodEnd = reportPeriodEnd;
         
         const plCompany = await Company.findById(companyId);
         const plPaidInvoices = await Invoice.find({ 
@@ -1509,6 +2475,9 @@ exports.exportReportToExcel = async (req, res, next) => {
 
         // Interest expense
         let plInterestExpense = 0;
+        // Calculate number of months in the period
+        const plPeriodMonths = Math.ceil((plPeriodEnd - plPeriodStart) / (1000 * 60 * 60 * 24 * 30)) || 1;
+        
         plLoans.forEach(loan => {
           const monthlyInterest = (loan.originalAmount * (loan.interestRate || 0) / 100) / 12;
           plInterestExpense += monthlyInterest * plPeriodMonths;
@@ -1580,6 +2549,946 @@ exports.exportReportToExcel = async (req, res, next) => {
         worksheet.addRow({ item: 'NET PROFIT', amount: plNetProfit, notes: `Margin: ${plNetMarginPercent.toFixed(1)}%` });
         break;
 
+      case 'top-clients':
+      case 'client-sales':
+        const topClientsExcel = await Invoice.aggregate([
+          { $match: { company: companyId, status: { $in: ['paid', 'partial'] }, invoiceDate: { $gte: reportPeriodStart, $lte: reportPeriodEnd } } },
+          { $group: { _id: '$client', revenue: { $sum: '$grandTotal' }, invoiceCount: { $sum: 1 } } },
+          { $sort: { revenue: -1 } },
+          { $limit: 50 }
+        ]);
+        await Client.populate(topClientsExcel, { path: '_id', select: 'name code' });
+
+        worksheet.columns = [
+          { header: 'Client Code', key: 'code', width: 15 },
+          { header: 'Client Name', key: 'name', width: 30 },
+          { header: 'Invoice Count', key: 'count', width: 15 },
+          { header: 'Total Revenue', key: 'revenue', width: 20 }
+        ];
+
+        topClientsExcel.forEach(c => {
+          worksheet.addRow({
+            code: c._id?.code || 'N/A',
+            name: c._id?.name || 'Unknown',
+            count: c.invoiceCount,
+            revenue: c.revenue
+          });
+        });
+        break;
+
+      case 'top-suppliers':
+      case 'supplier-purchase':
+        const topSuppliersExcel = await Purchase.aggregate([
+          { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: reportPeriodStart, $lte: reportPeriodEnd } } },
+          { $group: { _id: '$supplier', total: { $sum: '$grandTotal' }, purchaseCount: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+          { $limit: 50 }
+        ]);
+        await Supplier.populate(topSuppliersExcel, { path: '_id', select: 'name code' });
+
+        worksheet.columns = [
+          { header: 'Supplier Code', key: 'code', width: 15 },
+          { header: 'Supplier Name', key: 'name', width: 30 },
+          { header: 'Purchase Count', key: 'count', width: 15 },
+          { header: 'Total Purchases', key: 'total', width: 20 }
+        ];
+
+        topSuppliersExcel.forEach(s => {
+          worksheet.addRow({
+            code: s._id?.code || 'N/A',
+            name: s._id?.name || 'Unknown',
+            count: s.purchaseCount,
+            total: s.total
+          });
+        });
+        break;
+
+      case 'credit-limit':
+        const creditLimitClients = await Client.find({ company: companyId, isActive: true })
+          .select('name code creditLimit outstandingBalance')
+          .lean();
+
+        worksheet.columns = [
+          { header: 'Client Code', key: 'code', width: 15 },
+          { header: 'Client Name', key: 'name', width: 30 },
+          { header: 'Credit Limit', key: 'limit', width: 15 },
+          { header: 'Outstanding', key: 'outstanding', width: 15 },
+          { header: 'Utilization %', key: 'utilization', width: 15 }
+        ];
+
+        creditLimitClients.forEach(c => {
+          const limit = c.creditLimit || 0;
+          const outstanding = c.outstandingBalance || 0;
+          const utilization = limit > 0 ? (outstanding / limit) * 100 : 0;
+          worksheet.addRow({
+            code: c.code || 'N/A',
+            name: c.name,
+            limit: limit,
+            outstanding: outstanding,
+            utilization: utilization.toFixed(1)
+          });
+        });
+        break;
+
+      case 'new-clients':
+        const newClients = await Client.find({
+          company: companyId,
+          createdAt: { $gte: reportPeriodStart, $lte: reportPeriodEnd }
+        })
+        .select('name code createdAt')
+        .sort({ createdAt: -1 });
+
+        worksheet.columns = [
+          { header: 'Client Code', key: 'code', width: 15 },
+          { header: 'Client Name', key: 'name', width: 30 },
+          { header: 'Registration Date', key: 'date', width: 20 }
+        ];
+
+        newClients.forEach(c => {
+          worksheet.addRow({
+            code: c.code || 'N/A',
+            name: c.name,
+            date: c.createdAt ? new Date(c.createdAt).toLocaleDateString() : 'N/A'
+          });
+        });
+        break;
+
+      case 'inactive-clients':
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - 90);
+        
+        const allClients = await Client.find({ company: companyId, isActive: true })
+          .select('name code lastPurchaseDate')
+          .lean();
+
+        const inactiveClients = allClients.filter(c => {
+          if (!c.lastPurchaseDate) return true;
+          return new Date(c.lastPurchaseDate) < cutoffDate;
+        });
+
+        worksheet.columns = [
+          { header: 'Client Code', key: 'code', width: 15 },
+          { header: 'Client Name', key: 'name', width: 30 },
+          { header: 'Last Purchase', key: 'lastDate', width: 20 },
+          { header: 'Days Inactive', key: 'days', width: 15 }
+        ];
+
+        inactiveClients.forEach(c => {
+          const lastDate = c.lastPurchaseDate ? new Date(c.lastPurchaseDate) : null;
+          const days = lastDate ? Math.floor((new Date() - lastDate) / (1000 * 60 * 60 * 24)) : 'N/A';
+          worksheet.addRow({
+            code: c.code || 'N/A',
+            name: c.name,
+            lastDate: lastDate ? lastDate.toLocaleDateString() : 'No purchases',
+            days: typeof days === 'number' ? days : 'N/A'
+          });
+        });
+        break;
+
+      // ============================================
+      // NEW SALES REPORTS
+      // ============================================
+      case 'sales-by-product':
+        const salesByProductData = await reportGeneratorService.generateSalesByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'SKU', key: 'sku', width: 15 },
+          { header: 'Product Name', key: 'name', width: 30 },
+          { header: 'Quantity Sold', key: 'quantity', width: 15 },
+          { header: 'Revenue', key: 'revenue', width: 20 }
+        ];
+        if (salesByProductData && salesByProductData.data) {
+          salesByProductData.data.forEach(item => {
+            worksheet.addRow({
+              sku: item.product?.sku || 'N/A',
+              name: item.product?.name || 'Unknown',
+              quantity: item.quantitySold || 0,
+              revenue: item.revenue || 0
+            });
+          });
+        }
+        break;
+
+      case 'sales-by-category':
+        const salesByCategoryData = await reportGeneratorService.generateSalesByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Category', key: 'category', width: 30 },
+          { header: 'Products', key: 'products', width: 15 },
+          { header: 'Quantity Sold', key: 'quantity', width: 15 },
+          { header: 'Revenue', key: 'revenue', width: 20 }
+        ];
+        if (salesByCategoryData && salesByCategoryData.data) {
+          salesByCategoryData.data.forEach(item => {
+            worksheet.addRow({
+              category: item.category || 'Uncategorized',
+              products: item.productCount || 0,
+              quantity: item.quantitySold || 0,
+              revenue: item.revenue || 0
+            });
+          });
+        }
+        break;
+
+      case 'sales-by-client':
+        const salesByClientData = await reportGeneratorService.generateSalesByClientReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Client Code', key: 'code', width: 15 },
+          { header: 'Client Name', key: 'name', width: 30 },
+          { header: 'Invoice Count', key: 'count', width: 15 },
+          { header: 'Total Sales', key: 'sales', width: 20 }
+        ];
+        if (salesByClientData && salesByClientData.data) {
+          salesByClientData.data.forEach(item => {
+            worksheet.addRow({
+              code: item.client?.code || 'N/A',
+              name: item.client?.name || 'Unknown',
+              count: item.invoiceCount || 0,
+              sales: item.totalSales || 0
+            });
+          });
+        }
+        break;
+
+      case 'sales-by-salesperson':
+        const salesBySalespersonData = await reportGeneratorService.generateSalesBySalespersonReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Salesperson', key: 'name', width: 30 },
+          { header: 'Invoice Count', key: 'count', width: 15 },
+          { header: 'Total Sales', key: 'sales', width: 20 }
+        ];
+        if (salesBySalespersonData && salesBySalespersonData.data) {
+          salesBySalespersonData.data.forEach(item => {
+            worksheet.addRow({
+              name: item.salesperson?.name || 'Unknown',
+              count: item.invoiceCount || 0,
+              sales: item.totalSales || 0
+            });
+          });
+        }
+        break;
+
+      case 'invoice-aging':
+        const invoiceAgingData = await reportGeneratorService.generateInvoiceAgingReport(companyId);
+        worksheet.columns = [
+          { header: 'Invoice #', key: 'invoice', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Due Date', key: 'dueDate', width: 15 },
+          { header: 'Days Overdue', key: 'days', width: 15 },
+          { header: 'Balance', key: 'balance', width: 15 }
+        ];
+        if (invoiceAgingData && invoiceAgingData.buckets) {
+          const allInvoices = [...(invoiceAgingData.buckets.current || []), ...(invoiceAgingData.buckets['1-30'] || []), ...(invoiceAgingData.buckets['31-60'] || []), ...(invoiceAgingData.buckets['61-90'] || []), ...(invoiceAgingData.buckets['90+'] || [])];
+          allInvoices.forEach(item => {
+            worksheet.addRow({
+              invoice: item.invoice?.invoiceNumber || 'N/A',
+              client: item.invoice?.client?.name || 'N/A',
+              date: item.invoice?.invoiceDate ? new Date(item.invoice.invoiceDate).toLocaleDateString() : 'N/A',
+              dueDate: item.invoice?.dueDate ? new Date(item.invoice.dueDate).toLocaleDateString() : 'N/A',
+              days: item.days || 0,
+              balance: item.balance || 0
+            });
+          });
+        }
+        break;
+
+      case 'accounts-receivable':
+        const accountsReceivableData = await reportGeneratorService.generateAccountsReceivableReport(companyId);
+        worksheet.columns = [
+          { header: 'Invoice #', key: 'invoice', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Total', key: 'total', width: 15 },
+          { header: 'Paid', key: 'paid', width: 15 },
+          { header: 'Balance', key: 'balance', width: 15 }
+        ];
+        if (accountsReceivableData && accountsReceivableData.data) {
+          accountsReceivableData.data.forEach(item => {
+            worksheet.addRow({
+              invoice: item.invoiceNumber || 'N/A',
+              client: item.client?.name || 'N/A',
+              date: item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : 'N/A',
+              total: item.total || 0,
+              paid: item.paid || 0,
+              balance: item.balance || 0
+            });
+          });
+        }
+        break;
+
+      case 'credit-notes':
+      case 'credit-notes-report':
+        const creditNotesData = await reportGeneratorService.generateCreditNotesReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Credit Note #', key: 'number', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (creditNotesData && creditNotesData.data) {
+          creditNotesData.data.forEach(item => {
+            worksheet.addRow({
+              number: item.creditNoteNumber || 'N/A',
+              client: item.client?.name || 'N/A',
+              date: item.issueDate ? new Date(item.issueDate).toLocaleDateString() : 'N/A',
+              amount: item.grandTotal || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'quotation-conversion':
+        const quotationConversionData = await reportGeneratorService.generateQuotationConversionReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Quotation #', key: 'quotation', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (quotationConversionData && quotationConversionData.data) {
+          quotationConversionData.data.forEach(item => {
+            worksheet.addRow({
+              quotation: item.quotationNumber || 'N/A',
+              client: item.client?.name || 'N/A',
+              date: item.quotationDate ? new Date(item.quotationDate).toLocaleDateString() : 'N/A',
+              amount: item.grandTotal || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'recurring-invoice':
+        const recurringInvoiceData = await reportGeneratorService.generateRecurringInvoiceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Invoice #', key: 'invoice', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (recurringInvoiceData && recurringInvoiceData.data) {
+          recurringInvoiceData.data.forEach(item => {
+            worksheet.addRow({
+              invoice: item.invoiceNumber || 'N/A',
+              client: item.client?.name || 'N/A',
+              date: item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : 'N/A',
+              amount: item.grandTotal || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'discount-report':
+        const discountData = await reportGeneratorService.generateDiscountReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Invoice #', key: 'invoice', width: 20 },
+          { header: 'Client', key: 'client', width: 25 },
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Subtotal', key: 'subtotal', width: 15 },
+          { header: 'Discount', key: 'discount', width: 15 },
+          { header: 'Discount %', key: 'discountPercent', width: 15 }
+        ];
+        if (discountData && discountData.data) {
+          discountData.data.forEach(item => {
+            worksheet.addRow({
+              invoice: item.invoiceNumber || 'N/A',
+              client: item.client?.name || 'N/A',
+              date: item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : 'N/A',
+              subtotal: item.subtotal || 0,
+              discount: item.totalDiscount || 0,
+              discountPercent: item.discountPercent || 0
+            });
+          });
+        }
+        break;
+
+      case 'daily-sales-summary':
+        const dailySalesData = await reportGeneratorService.generateDailySalesSummaryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Invoices', key: 'invoices', width: 15 },
+          { header: 'Sales', key: 'sales', width: 20 },
+          { header: 'Tax', key: 'tax', width: 15 },
+          { header: 'Discounts', key: 'discounts', width: 15 },
+          { header: 'Net Sales', key: 'netSales', width: 20 }
+        ];
+        if (dailySalesData && dailySalesData.dailyData) {
+          dailySalesData.dailyData.forEach(item => {
+            worksheet.addRow({
+              date: item.date || 'N/A',
+              invoices: item.invoiceCount || 0,
+              sales: item.totalSales || 0,
+              taxes: item.totalTax || 0,
+              discounts: item.totalDiscounts || 0,
+              netSales: item.netSales || 0
+            });
+          });
+        }
+        break;
+
+      // ============================================
+      // EXPENSE REPORTS
+      // ============================================
+      case 'expense-by-category':
+        const expenseByCategoryData = await reportGeneratorService.generateExpenseByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Category', key: 'category', width: 30 },
+          { header: 'Description', key: 'description', width: 40 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (expenseByCategoryData && expenseByCategoryData.data) {
+          expenseByCategoryData.data.forEach(item => {
+            worksheet.addRow({
+              category: item.category || 'N/A',
+              description: item.description || '',
+              amount: item.total || 0
+            });
+          });
+        }
+        break;
+
+      case 'expense-by-period':
+        const expenseByPeriodData = await reportGeneratorService.generateExpenseByPeriodReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Period', key: 'period', width: 20 },
+          { header: 'Category', key: 'category', width: 25 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (expenseByPeriodData && expenseByPeriodData.data) {
+          expenseByPeriodData.data.forEach(item => {
+            worksheet.addRow({
+              period: item.period || 'N/A',
+              category: item.category || 'N/A',
+              amount: item.total || 0
+            });
+          });
+        }
+        break;
+
+      case 'expense-vs-budget':
+        const expenseVsBudgetData = await reportGeneratorService.generateExpenseVsBudgetReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Category', key: 'category', width: 30 },
+          { header: 'Budget', key: 'budget', width: 20 },
+          { header: 'Actual', key: 'actual', width: 20 },
+          { header: 'Variance', key: 'variance', width: 20 },
+          { header: 'Variance %', key: 'variancePercent', width: 15 }
+        ];
+        if (expenseVsBudgetData && expenseVsBudgetData.data) {
+          expenseVsBudgetData.data.forEach(item => {
+            worksheet.addRow({
+              category: item.category || 'N/A',
+              budget: item.budget || 0,
+              actual: item.actual || 0,
+              variance: item.variance || 0,
+              variancePercent: item.variancePercent || 0
+            });
+          });
+        }
+        break;
+
+      case 'employee-expense':
+        const employeeExpenseData = await reportGeneratorService.generateEmployeeExpenseReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Employee', key: 'employee', width: 30 },
+          { header: 'Category', key: 'category', width: 25 },
+          { header: 'Count', key: 'count', width: 15 },
+          { header: 'Total Amount', key: 'amount', width: 20 }
+        ];
+        if (employeeExpenseData && employeeExpenseData.data) {
+          employeeExpenseData.data.forEach(item => {
+            worksheet.addRow({
+              employee: item.employee || 'N/A',
+              category: item.category || 'N/A',
+              count: item.count || 0,
+              amount: item.total || 0
+            });
+          });
+        }
+        break;
+
+      case 'petty-cash':
+        const pettyCashData = await reportGeneratorService.generatePettyCashReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Description', key: 'description', width: 40 },
+          { header: 'Category', key: 'category', width: 25 },
+          { header: 'Amount', key: 'amount', width: 20 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (pettyCashData && pettyCashData.data) {
+          pettyCashData.data.forEach(item => {
+            worksheet.addRow({
+              date: item.date ? new Date(item.date).toLocaleDateString() : 'N/A',
+              description: item.description || '',
+              category: item.category || 'N/A',
+              amount: item.amount || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      // ============================================
+      // TAX REPORTS
+      // ============================================
+      case 'vat-return':
+        const vatReturnData = await reportGeneratorService.generateVATReturnReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (vatReturnData && vatReturnData.data) {
+          worksheet.addRow({ description: 'Output VAT (Sales)', amount: vatReturnData.data.outputVAT.totalVAT || 0 });
+          worksheet.addRow({ description: 'Input VAT (Purchases)', amount: vatReturnData.data.inputVAT.totalVAT || 0 });
+          worksheet.addRow({ description: 'Net VAT', amount: vatReturnData.data.netVAT || 0 });
+        }
+        break;
+
+      case 'paye-report':
+        const payeData = await reportGeneratorService.generatePAYEReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (payeData && payeData.data) {
+          worksheet.addRow({ description: 'Total Employees', amount: payeData.data.totalEmployees || 0 });
+          worksheet.addRow({ description: 'Total Gross Salary', amount: payeData.data.totalGrossSalary || 0 });
+          worksheet.addRow({ description: 'Total PAYE', amount: payeData.data.totalPAYE || 0 });
+          worksheet.addRow({ description: 'Total RSSB', amount: payeData.data.totalRSSB || 0 });
+        }
+        break;
+
+      case 'withholding-tax':
+        const whtData = await reportGeneratorService.generateWithholdingTaxReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (whtData && whtData.data) {
+          worksheet.addRow({ description: 'Withholding Tax Collected', amount: whtData.data.withholdingTaxCollected.amount || 0 });
+          worksheet.addRow({ description: 'Withholding Tax Paid', amount: whtData.data.withholdingTaxPaid.amount || 0 });
+          worksheet.addRow({ description: 'Net Withholding', amount: whtData.data.netWithholding || 0 });
+        }
+        break;
+
+      case 'corporate-tax':
+        const corpTaxData = await reportGeneratorService.generateCorporateTaxReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Amount', key: 'amount', width: 20 }
+        ];
+        if (corpTaxData && corpTaxData.data) {
+          worksheet.addRow({ description: 'Gross Income', amount: corpTaxData.data.grossIncome || 0 });
+          worksheet.addRow({ description: 'Total Deductions', amount: corpTaxData.data.deductions.total || 0 });
+          worksheet.addRow({ description: 'Taxable Income', amount: corpTaxData.data.taxableIncome || 0 });
+          worksheet.addRow({ description: 'Corporate Tax (30%)', amount: corpTaxData.data.corporateTax || 0 });
+        }
+        break;
+
+      case 'tax-payment-history':
+        const taxPayData = await reportGeneratorService.generateTaxPaymentHistory(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Date', key: 'date', width: 15 },
+          { header: 'Tax Type', key: 'taxType', width: 20 },
+          { header: 'Amount', key: 'amount', width: 15 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (taxPayData && taxPayData.data && taxPayData.data.payments) {
+          taxPayData.data.payments.forEach(item => {
+            worksheet.addRow({
+              date: item.date ? new Date(item.date).toLocaleDateString() : 'N/A',
+              taxType: item.taxType || 'N/A',
+              amount: item.amount || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'tax-calendar':
+        const taxCalData = await reportGeneratorService.generateTaxCalendarReport(companyId, reportPeriodStart ? new Date(reportPeriodStart).getFullYear().toString() : null);
+        worksheet.columns = [
+          { header: 'Tax Type', key: 'taxType', width: 20 },
+          { header: 'Period', key: 'period', width: 20 },
+          { header: 'Due Date', key: 'dueDate', width: 15 },
+          { header: 'Status', key: 'status', width: 15 }
+        ];
+        if (taxCalData && taxCalData.data && taxCalData.data.calendar) {
+          taxCalData.data.calendar.forEach(item => {
+            worksheet.addRow({
+              taxType: item.taxName || 'N/A',
+              period: item.period || 'N/A',
+              dueDate: item.dueDate ? new Date(item.dueDate).toLocaleDateString() : 'N/A',
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      // ============================================
+      // ASSET REPORTS
+      // ============================================
+      case 'asset-register':
+        const assetRegData = await reportGeneratorService.generateAssetRegisterReport(companyId);
+        worksheet.columns = [
+          { header: 'Asset Code', key: 'assetCode', width: 15 },
+          { header: 'Name', key: 'name', width: 25 },
+          { header: 'Category', key: 'category', width: 15 },
+          { header: 'Status', key: 'status', width: 12 },
+          { header: 'Location', key: 'location', width: 15 },
+          { header: 'Purchase Date', key: 'purchaseDate', width: 15 },
+          { header: 'Purchase Cost', key: 'purchaseCost', width: 15 },
+          { header: 'Accum. Depreciation', key: 'accumulatedDepreciation', width: 18 },
+          { header: 'Net Book Value', key: 'netBookValue', width: 15 },
+          { header: 'Useful Life (Years)', key: 'usefulLifeYears', width: 18 }
+        ];
+        if (assetRegData && assetRegData.data) {
+          assetRegData.data.forEach(item => {
+            worksheet.addRow({
+              assetCode: item.assetCode || 'N/A',
+              name: item.name || 'N/A',
+              category: item.category || 'N/A',
+              status: item.status || 'N/A',
+              location: item.location || 'N/A',
+              purchaseDate: item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : 'N/A',
+              purchaseCost: item.purchaseCost || 0,
+              accumulatedDepreciation: item.accumulatedDepreciation || 0,
+              netBookValue: item.netBookValue || 0,
+              usefulLifeYears: item.usefulLifeYears || 0
+            });
+          });
+        }
+        break;
+
+      case 'depreciation-schedule':
+        const depSchedData = await reportGeneratorService.generateDepreciationScheduleReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Asset Code', key: 'assetCode', width: 15 },
+          { header: 'Asset Name', key: 'assetName', width: 25 },
+          { header: 'Category', key: 'category', width: 15 },
+          { header: 'Year', key: 'year', width: 10 },
+          { header: 'Annual Depreciation', key: 'annualDepreciation', width: 18 },
+          { header: 'Accumulated Depreciation', key: 'accumulatedDepreciation', width: 20 },
+          { header: 'Net Book Value', key: 'netBookValue', width: 15 }
+        ];
+        if (depSchedData && depSchedData.data) {
+          depSchedData.data.forEach(asset => {
+            if (asset.schedule) {
+              asset.schedule.forEach(period => {
+                worksheet.addRow({
+                  assetCode: asset.assetCode || 'N/A',
+                  assetName: asset.assetName || 'N/A',
+                  category: asset.category || 'N/A',
+                  year: period.year || 'N/A',
+                  annualDepreciation: period.annualDepreciation || 0,
+                  accumulatedDepreciation: period.accumulatedDepreciation || 0,
+                  netBookValue: period.netBookValue || 0
+                });
+              });
+            }
+          });
+        }
+        break;
+
+      case 'asset-disposal':
+        const assetDispData = await reportGeneratorService.generateAssetDisposalReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Asset Code', key: 'assetCode', width: 15 },
+          { header: 'Name', key: 'name', width: 25 },
+          { header: 'Category', key: 'category', width: 15 },
+          { header: 'Purchase Date', key: 'purchaseDate', width: 15 },
+          { header: 'Purchase Cost', key: 'purchaseCost', width: 15 },
+          { header: 'Accum. Depreciation', key: 'accumulatedDepreciation', width: 18 },
+          { header: 'Net Book Value', key: 'netBookValue', width: 15 },
+          { header: 'Disposal Date', key: 'disposalDate', width: 15 },
+          { header: 'Disposal Amount', key: 'disposalAmount', width: 15 },
+          { header: 'Disposal Method', key: 'disposalMethod', width: 15 },
+          { header: 'Gain/Loss', key: 'gainLoss', width: 12 }
+        ];
+        if (assetDispData && assetDispData.data) {
+          assetDispData.data.forEach(item => {
+            worksheet.addRow({
+              assetCode: item.assetCode || 'N/A',
+              name: item.name || 'N/A',
+              category: item.category || 'N/A',
+              purchaseDate: item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : 'N/A',
+              purchaseCost: item.purchaseCost || 0,
+              accumulatedDepreciation: item.accumulatedDepreciation || 0,
+              netBookValue: item.netBookValue || 0,
+              disposalDate: item.disposalDate ? new Date(item.disposalDate).toLocaleDateString() : 'N/A',
+              disposalAmount: item.disposalAmount || 0,
+              disposalMethod: item.disposalMethod || 'N/A',
+              gainLoss: item.gainLoss || 0
+            });
+          });
+        }
+        break;
+
+      case 'asset-maintenance':
+        const assetMaintData = await reportGeneratorService.generateAssetMaintenanceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'Asset Code', key: 'assetCode', width: 15 },
+          { header: 'Asset Name', key: 'assetName', width: 25 },
+          { header: 'Category', key: 'category', width: 15 },
+          { header: 'Maintenance Date', key: 'date', width: 15 },
+          { header: 'Type', key: 'type', width: 12 },
+          { header: 'Description', key: 'description', width: 30 },
+          { header: 'Cost', key: 'cost', width: 12 },
+          { header: 'Vendor', key: 'vendor', width: 20 }
+        ];
+        if (assetMaintData && assetMaintData.data) {
+          assetMaintData.data.forEach(asset => {
+            if (asset.maintenanceRecords) {
+              asset.maintenanceRecords.forEach(record => {
+                worksheet.addRow({
+                  assetCode: asset.assetCode || 'N/A',
+                  assetName: asset.assetName || 'N/A',
+                  category: asset.category || 'N/A',
+                  date: record.date ? new Date(record.date).toLocaleDateString() : 'N/A',
+                  type: record.type || 'N/A',
+                  description: record.description || 'N/A',
+                  cost: record.cost || 0,
+                  vendor: record.vendor || 'N/A'
+                });
+              });
+            }
+          });
+        }
+        break;
+
+      case 'net-book-value':
+        const nbvData = await reportGeneratorService.generateNetBookValueReport(companyId);
+        worksheet.columns = [
+          { header: 'Asset Code', key: 'assetCode', width: 15 },
+          { header: 'Name', key: 'name', width: 25 },
+          { header: 'Category', key: 'category', width: 15 },
+          { header: 'Status', key: 'status', width: 12 },
+          { header: 'Location', key: 'location', width: 15 },
+          { header: 'Purchase Cost', key: 'purchaseCost', width: 15 },
+          { header: 'Accum. Depreciation', key: 'accumulatedDepreciation', width: 18 },
+          { header: 'Net Book Value', key: 'netBookValue', width: 15 },
+          { header: 'Remaining Life (Years)', key: 'remainingLife', width: 20 }
+        ];
+        if (nbvData && nbvData.data) {
+          nbvData.data.forEach(item => {
+            worksheet.addRow({
+              assetCode: item.assetCode || 'N/A',
+              name: item.name || 'N/A',
+              category: item.category || 'N/A',
+              status: item.status || 'N/A',
+              location: item.location || 'N/A',
+              purchaseCost: item.purchaseCost || 0,
+              accumulatedDepreciation: item.accumulatedDepreciation || 0,
+              netBookValue: item.netBookValue || 0,
+              remainingLife: item.remainingLife ? item.remainingLife.toFixed(1) : '0'
+            });
+          });
+        }
+        break;
+
+      // ============================================
+      // STOCK & INVENTORY REPORTS
+      // ============================================
+      case 'stock-movement':
+        const stockMovData = await reportGeneratorService.generateStockMovementReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'SKU', key: 'sku', width: 15 },
+          { header: 'Product Name', key: 'name', width: 30 },
+          { header: 'Total In', key: 'totalIn', width: 12 },
+          { header: 'Total Out', key: 'totalOut', width: 12 },
+          { header: 'Net Change', key: 'netChange', width: 12 },
+          { header: 'Movements', key: 'movements', width: 12 }
+        ];
+        if (stockMovData && stockMovData.data) {
+          stockMovData.data.forEach(item => {
+            worksheet.addRow({
+              sku: item.product?.sku || 'N/A',
+              name: item.product?.name || 'Unknown',
+              totalIn: item.totalIn || 0,
+              totalOut: item.totalOut || 0,
+              netChange: item.netChange || 0,
+              movements: item.movementCount || 0
+            });
+          });
+        }
+        break;
+
+      case 'low-stock':
+        const lowStockData = await reportGeneratorService.generateLowStockReport(companyId);
+        worksheet.columns = [
+          { header: 'SKU', key: 'sku', width: 15 },
+          { header: 'Product Name', key: 'name', width: 30 },
+          { header: 'Current Stock', key: 'stock', width: 12 },
+          { header: 'Threshold', key: 'threshold', width: 12 },
+          { header: 'Shortage', key: 'shortage', width: 12 },
+          { header: 'Est. Reorder Cost', key: 'reorderCost', width: 15 }
+        ];
+        if (lowStockData && lowStockData.data) {
+          lowStockData.data.forEach(item => {
+            worksheet.addRow({
+              sku: item.sku || 'N/A',
+              name: item.name || 'Unknown',
+              stock: item.currentStock || 0,
+              threshold: item.lowStockThreshold || 0,
+              shortage: item.shortage || 0,
+              reorderCost: item.estimatedReorderCost || 0
+            });
+          });
+        }
+        break;
+
+      case 'dead-stock':
+        const deadStockData = await reportGeneratorService.generateDeadStockReport(companyId);
+        worksheet.columns = [
+          { header: 'SKU', key: 'sku', width: 15 },
+          { header: 'Product Name', key: 'name', width: 30 },
+          { header: 'Current Stock', key: 'stock', width: 12 },
+          { header: 'Stock Value', key: 'value', width: 15 },
+          { header: 'Days Since Movement', key: 'days', width: 15 }
+        ];
+        if (deadStockData && deadStockData.data) {
+          deadStockData.data.forEach(item => {
+            worksheet.addRow({
+              sku: item.sku || 'N/A',
+              name: item.name || 'Unknown',
+              stock: item.currentStock || 0,
+              value: item.stockValue || 0,
+              days: item.daysSinceMovement || 0
+            });
+          });
+        }
+        break;
+
+      case 'stock-aging':
+        const stockAgingData = await reportGeneratorService.generateStockAgingReport(companyId);
+        worksheet.columns = [
+          { header: 'Batch', key: 'batch', width: 15 },
+          { header: 'Product', key: 'product', width: 25 },
+          { header: 'Quantity', key: 'quantity', width: 12 },
+          { header: 'Value', key: 'value', width: 15 },
+          { header: 'Days Old', key: 'days', width: 12 },
+          { header: 'Status', key: 'status', width: 12 }
+        ];
+        if (stockAgingData && stockAgingData.data) {
+          const allBatches = [
+            ...(stockAgingData.data['0-30'] || []),
+            ...(stockAgingData.data['31-60'] || []),
+            ...(stockAgingData.data['61-90'] || []),
+            ...(stockAgingData.data['91-180'] || []),
+            ...(stockAgingData.data['180+'] || [])
+          ];
+          allBatches.forEach(item => {
+            worksheet.addRow({
+              batch: item.batchNumber || 'N/A',
+              product: item.product?.name || 'Unknown',
+              quantity: item.quantity || 0,
+              value: item.totalValue || 0,
+              days: item.daysOld || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'inventory-turnover':
+        const invTurnoverData = await reportGeneratorService.generateInventoryTurnoverReport(companyId, reportPeriodStart, reportPeriodEnd);
+        worksheet.columns = [
+          { header: 'SKU', key: 'sku', width: 15 },
+          { header: 'Product Name', key: 'name', width: 30 },
+          { header: 'Inventory Value', key: 'value', width: 15 },
+          { header: 'COGS', key: 'cogs', width: 15 },
+          { header: 'Turnover', key: 'turnover', width: 12 },
+          { header: 'Turnover Days', key: 'days', width: 12 }
+        ];
+        if (invTurnoverData && invTurnoverData.data) {
+          invTurnoverData.data.forEach(item => {
+            worksheet.addRow({
+              sku: item.sku || 'N/A',
+              name: item.name || 'Unknown',
+              value: item.inventoryValue || 0,
+              cogs: item.cogs || 0,
+              turnover: item.turnover || 0,
+              days: item.turnoverDays || 0
+            });
+          });
+        }
+        break;
+
+      case 'batch-expiry':
+        const batchExpiryData = await reportGeneratorService.generateBatchExpiryReport(companyId);
+        worksheet.columns = [
+          { header: 'Batch', key: 'batch', width: 15 },
+          { header: 'Product', key: 'product', width: 25 },
+          { header: 'Quantity', key: 'quantity', width: 12 },
+          { header: 'Expiry Date', key: 'expiry', width: 15 },
+          { header: 'Days Left', key: 'days', width: 12 },
+          { header: 'Status', key: 'status', width: 12 }
+        ];
+        if (batchExpiryData && batchExpiryData.data) {
+          batchExpiryData.data.forEach(item => {
+            worksheet.addRow({
+              batch: item.batchNumber || 'N/A',
+              product: item.product?.name || 'Unknown',
+              quantity: item.quantity || 0,
+              expiry: item.expiryDate ? new Date(item.expiryDate).toLocaleDateString() : 'N/A',
+              days: item.daysUntilExpiry || 0,
+              status: item.status || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'serial-number-tracking':
+        const serialData = await reportGeneratorService.generateSerialNumberTrackingReport(companyId);
+        worksheet.columns = [
+          { header: 'Serial Number', key: 'serial', width: 20 },
+          { header: 'Product', key: 'product', width: 25 },
+          { header: 'Status', key: 'status', width: 12 },
+          { header: 'Purchase Date', key: 'purchase', width: 15 },
+          { header: 'Sale Date', key: 'sale', width: 15 },
+          { header: 'Client', key: 'client', width: 20 }
+        ];
+        if (serialData && serialData.data) {
+          serialData.data.forEach(item => {
+            worksheet.addRow({
+              serial: item.serialNumber || 'N/A',
+              product: item.product?.name || 'Unknown',
+              status: item.status || 'N/A',
+              purchase: item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : 'N/A',
+              sale: item.saleDate ? new Date(item.saleDate).toLocaleDateString() : 'N/A',
+              client: item.client?.name || 'N/A'
+            });
+          });
+        }
+        break;
+
+      case 'warehouse-stock':
+        const warehouseStockData = await reportGeneratorService.generateWarehouseStockReport(companyId);
+        worksheet.columns = [
+          { header: 'Warehouse', key: 'warehouse', width: 25 },
+          { header: 'Code', key: 'code', width: 10 },
+          { header: 'Products', key: 'products', width: 12 },
+          { header: 'Total Quantity', key: 'quantity', width: 15 },
+          { header: 'Total Value', key: 'value', width: 15 }
+        ];
+        if (warehouseStockData && warehouseStockData.data) {
+          warehouseStockData.data.forEach(item => {
+            worksheet.addRow({
+              warehouse: item.name || 'Unknown',
+              code: item.code || 'N/A',
+              products: item.totalProducts || 0,
+              quantity: item.totalQuantity || 0,
+              value: item.totalValue || 0
+            });
+          });
+        }
+        break;
+
       default:
         return res.status(400).json({
           success: false,
@@ -1604,7 +3513,26 @@ exports.exportReportToPDF = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { reportType } = req.params;
+    const { periodType, year, periodNumber, startDate, endDate, clientId, supplierId } = req.query;
     const doc = new PDFDocument({ margin: 50 });
+
+    // Determine period dates for the report
+    let reportPeriodStart, reportPeriodEnd;
+    if (periodType && year) {
+      const periodYear = parseInt(year);
+      const periodNum = periodNumber ? parseInt(periodNumber) : 1;
+      const periodInfo = reportGeneratorService.getPeriodDates(periodType, periodYear, periodNum);
+      reportPeriodStart = new Date(periodInfo.startDate);
+      reportPeriodEnd = new Date(periodInfo.endDate);
+    } else if (startDate && endDate) {
+      reportPeriodStart = new Date(startDate);
+      reportPeriodEnd = new Date(endDate);
+    } else {
+      // Default to current quarter
+      const now = new Date();
+      reportPeriodStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+      reportPeriodEnd = new Date();
+    }
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename=${reportType}-report.pdf`);
@@ -1905,10 +3833,9 @@ exports.exportReportToPDF = async (req, res, next) => {
         break;
 
       case 'profit-loss':
-        // Get P&L detailed data for PDF export
-        const pdfNow = new Date();
-        const pdfPeriodStart = new Date(pdfNow.getFullYear(), Math.floor(pdfNow.getMonth() / 3) * 3, 1);
-        const pdfPeriodEnd = new Date();
+        // Get P&L detailed data for PDF export - use the determined period dates
+        const pdfPeriodStart = reportPeriodStart;
+        const pdfPeriodEnd = reportPeriodEnd;
         
         const pdfPlCompany = await Company.findById(companyId);
         const pdfPlInvoices = await Invoice.find({ 
@@ -1956,6 +3883,9 @@ exports.exportReportToPDF = async (req, res, next) => {
 
         // Interest expense
         let pdfPlInterestExpense = 0;
+        // Calculate number of months in the period
+        const pdfPlPeriodMonths = Math.ceil((pdfPeriodEnd - pdfPeriodStart) / (1000 * 60 * 60 * 24 * 30)) || 1;
+        
         pdfPlLoans.forEach(loan => {
           const monthlyInterest = (loan.originalAmount * (loan.interestRate || 0) / 100) / 12;
           pdfPlInterestExpense += monthlyInterest * pdfPlPeriodMonths;
@@ -2060,6 +3990,2390 @@ exports.exportReportToPDF = async (req, res, next) => {
         doc.fontSize(12).font('Helvetica-Bold');
         printLine('NET PROFIT', pdfPlNetProfit, doc.y);
         break;
+
+      case 'top-clients':
+      case 'client-sales':
+        const topClientsPdfData = await Invoice.aggregate([
+          { $match: { company: companyId, status: { $in: ['paid', 'partial'] }, invoiceDate: { $gte: reportPeriodStart, $lte: reportPeriodEnd } } },
+          { $group: { _id: '$client', revenue: { $sum: '$grandTotal' }, invoiceCount: { $sum: 1 } } },
+          { $sort: { revenue: -1 } },
+          { $limit: 50 }
+        ]);
+        await Client.populate(topClientsPdfData, { path: '_id', select: 'name code' });
+
+        const companyTopClients = await Company.findById(companyId);
+        doc.fontSize(16).text(companyTopClients?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyTopClients?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('TOP CLIENTS BY REVENUE', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const tcHeaders = ['Code', 'Client Name', 'Invoices', 'Total Revenue'];
+        const tcColWidths = [60, 150, 60, 80];
+        doc.fontSize(9).font('Helvetica-Bold');
+        let tcX = 30;
+        tcHeaders.forEach((header, i) => {
+          doc.text(header, tcX, doc.y, { width: tcColWidths[i] });
+          tcX += tcColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        let totalClientRevenue = 0;
+        topClientsPdfData.forEach(c => {
+          totalClientRevenue += c.revenue || 0;
+          const rowData = [
+            c._id?.code || 'N/A',
+            (c._id?.name || 'Unknown').substring(0, 30),
+            c.invoiceCount?.toString() || '0',
+            (c.revenue || 0).toFixed(2)
+          ];
+          tcX = 30;
+          rowData.forEach((cell, i) => {
+            doc.text(cell, tcX, doc.y, { width: tcColWidths[i] });
+            tcX += tcColWidths[i];
+          });
+          doc.moveDown(0.3);
+        });
+        doc.moveDown(1);
+        doc.fontSize(10).font('Helvetica-Bold');
+        doc.text(`Total Clients: ${topClientsPdfData.length}`, 30);
+        doc.text(`Total Revenue: ${totalClientRevenue.toFixed(2)}`, 200);
+        break;
+
+      case 'top-suppliers':
+      case 'supplier-purchase':
+        const topSuppliersPdfData = await Purchase.aggregate([
+          { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: reportPeriodStart, $lte: reportPeriodEnd } } },
+          { $group: { _id: '$supplier', total: { $sum: '$grandTotal' }, purchaseCount: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+          { $limit: 50 }
+        ]);
+        await Supplier.populate(topSuppliersPdfData, { path: '_id', select: 'name code' });
+
+        const companyTopSup = await Company.findById(companyId);
+        doc.fontSize(16).text(companyTopSup?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyTopSup?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('TOP SUPPLIERS BY PURCHASE', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const tsHeaders = ['Code', 'Supplier Name', 'Purchases', 'Total Purchases'];
+        const tsColWidths = [60, 150, 60, 80];
+        doc.fontSize(9).font('Helvetica-Bold');
+        let tsX = 30;
+        tsHeaders.forEach((header, i) => {
+          doc.text(header, tsX, doc.y, { width: tsColWidths[i] });
+          tsX += tsColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        let totalSupplierPurchase = 0;
+        topSuppliersPdfData.forEach(s => {
+          totalSupplierPurchase += s.total || 0;
+          const rowData = [
+            s._id?.code || 'N/A',
+            (s._id?.name || 'Unknown').substring(0, 30),
+            s.purchaseCount?.toString() || '0',
+            (s.total || 0).toFixed(2)
+          ];
+          tsX = 30;
+          rowData.forEach((cell, i) => {
+            doc.text(cell, tsX, doc.y, { width: tsColWidths[i] });
+            tsX += tsColWidths[i];
+          });
+          doc.moveDown(0.3);
+        });
+        doc.moveDown(1);
+        doc.fontSize(10).font('Helvetica-Bold');
+        doc.text(`Total Suppliers: ${topSuppliersPdfData.length}`, 30);
+        doc.text(`Total Purchases: ${totalSupplierPurchase.toFixed(2)}`, 200);
+        break;
+
+      case 'credit-limit':
+        const creditLimitPdfClients = await Client.find({ company: companyId, isActive: true })
+          .select('name code creditLimit outstandingBalance')
+          .lean();
+
+        const companyCreditLimit = await Company.findById(companyId);
+        doc.fontSize(16).text(companyCreditLimit?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyCreditLimit?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CLIENT CREDIT LIMIT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const clHeaders = ['Code', 'Client Name', 'Credit Limit', 'Outstanding', 'Utilization %'];
+        const clColWidths = [50, 120, 70, 70, 60];
+        doc.fontSize(9).font('Helvetica-Bold');
+        let clX = 30;
+        clHeaders.forEach((header, i) => {
+          doc.text(header, clX, doc.y, { width: clColWidths[i] });
+          clX += clColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        let totalCreditLimit = 0;
+        let totalOutstanding = 0;
+        creditLimitPdfClients.forEach(c => {
+          const limit = c.creditLimit || 0;
+          const outstanding = c.outstandingBalance || 0;
+          const utilization = limit > 0 ? (outstanding / limit) * 100 : 0;
+          totalCreditLimit += limit;
+          totalOutstanding += outstanding;
+          const rowData = [
+            c.code || 'N/A',
+            (c.name || '-').substring(0, 25),
+            limit.toFixed(2),
+            outstanding.toFixed(2),
+            utilization.toFixed(1) + '%'
+          ];
+          clX = 30;
+          rowData.forEach((cell, i) => {
+            doc.text(cell, clX, doc.y, { width: clColWidths[i] });
+            clX += clColWidths[i];
+          });
+          doc.moveDown(0.3);
+        });
+        doc.moveDown(1);
+        doc.fontSize(10).font('Helvetica-Bold');
+        doc.text(`Total Clients: ${creditLimitPdfClients.length}`, 30);
+        doc.text(`Total Credit Limit: ${totalCreditLimit.toFixed(2)}`, 180);
+        doc.text(`Total Outstanding: ${totalOutstanding.toFixed(2)}`, 320);
+        break;
+
+      case 'new-clients':
+        const newClientsPdf = await Client.find({
+          company: companyId,
+          createdAt: { $gte: reportPeriodStart, $lte: reportPeriodEnd }
+        })
+        .select('name code createdAt')
+        .sort({ createdAt: -1 });
+
+        const companyNewClients = await Company.findById(companyId);
+        doc.fontSize(16).text(companyNewClients?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyNewClients?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('NEW CLIENTS REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const ncHeaders = ['Code', 'Client Name', 'Registration Date'];
+        const ncColWidths = [60, 180, 100];
+        doc.fontSize(9).font('Helvetica-Bold');
+        let ncX = 30;
+        ncHeaders.forEach((header, i) => {
+          doc.text(header, ncX, doc.y, { width: ncColWidths[i] });
+          ncX += ncColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        newClientsPdf.forEach(c => {
+          const rowData = [
+            c.code || 'N/A',
+            (c.name || '-').substring(0, 40),
+            c.createdAt ? new Date(c.createdAt).toLocaleDateString() : 'N/A'
+          ];
+          ncX = 30;
+          rowData.forEach((cell, i) => {
+            doc.text(cell, ncX, doc.y, { width: ncColWidths[i] });
+            ncX += ncColWidths[i];
+          });
+          doc.moveDown(0.3);
+        });
+        doc.moveDown(1);
+        doc.fontSize(10).font('Helvetica-Bold');
+        doc.text(`Total New Clients: ${newClientsPdf.length}`, 30);
+        break;
+
+      case 'inactive-clients':
+        const cutoffDatePdf = new Date();
+        cutoffDatePdf.setDate(cutoffDatePdf.getDate() - 90);
+        
+        const allClientsPdf = await Client.find({ company: companyId, isActive: true })
+          .select('name code lastPurchaseDate outstandingBalance')
+          .lean();
+
+        const inactiveClientsPdf = allClientsPdf.filter(c => {
+          if (!c.lastPurchaseDate) return true;
+          return new Date(c.lastPurchaseDate) < cutoffDatePdf;
+        });
+
+        const companyInactive = await Company.findById(companyId);
+        doc.fontSize(16).text(companyInactive?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyInactive?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('INACTIVE CLIENTS REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Clients with no purchase in 90+ days`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const icHeaders = ['Code', 'Client Name', 'Last Purchase', 'Days Inactive', 'Outstanding'];
+        const icColWidths = [50, 120, 70, 60, 70];
+        doc.fontSize(9).font('Helvetica-Bold');
+        let icX = 30;
+        icHeaders.forEach((header, i) => {
+          doc.text(header, icX, doc.y, { width: icColWidths[i] });
+          icX += icColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        inactiveClientsPdf.forEach(c => {
+          const lastDate = c.lastPurchaseDate ? new Date(c.lastPurchaseDate) : null;
+          const days = lastDate ? Math.floor((new Date() - lastDate) / (1000 * 60 * 60 * 24)) : 'N/A';
+          const rowData = [
+            c.code || 'N/A',
+            (c.name || '-').substring(0, 25),
+            lastDate ? lastDate.toLocaleDateString() : 'No purchases',
+            typeof days === 'number' ? days + ' days' : 'N/A',
+            (c.outstandingBalance || 0).toFixed(2)
+          ];
+          icX = 30;
+          rowData.forEach((cell, i) => {
+            doc.text(cell, icX, doc.y, { width: icColWidths[i] });
+            icX += icColWidths[i];
+          });
+          doc.moveDown(0.3);
+        });
+        doc.moveDown(1);
+        doc.fontSize(10).font('Helvetica-Bold');
+        doc.text(`Total Inactive Clients: ${inactiveClientsPdf.length}`, 30);
+        break;
+
+      case 'client-statement':
+        const companyClientStmt = await Company.findById(companyId);
+        doc.fontSize(16).text(companyClientStmt?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyClientStmt?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CLIENT STATEMENT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Generate client statement data - either for all clients or specific client
+        const clientStmtReport = await reportGeneratorService.generateClientStatementReport(
+          companyId,
+          reportPeriodStart,
+          reportPeriodEnd,
+          clientId
+        );
+        
+        if (clientStmtReport && clientStmtReport.length > 0 && clientStmtReport[0].transactions) {
+          const clientData = clientStmtReport[0];
+          
+          // Summary
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text('Summary:', 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.text(`Total Invoiced: ${(clientData.totalInvoiced || 0).toFixed(2)}`, 50);
+          doc.text(`Total Paid: ${(clientData.totalPaid || 0).toFixed(2)}`, 50);
+          doc.text(`Balance Due: ${(clientData.balance || 0).toFixed(2)}`, 50);
+          doc.moveDown(1);
+          
+          // Transactions table
+          const stmtHeaders = ['Date', 'Type', 'Reference', 'Amount', 'Paid', 'Balance'];
+          const stmtColWidths = [60, 70, 80, 70, 70, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let stmtX = 30;
+          stmtHeaders.forEach((header, i) => {
+            doc.text(header, stmtX, doc.y, { width: stmtColWidths[i] });
+            stmtX += stmtColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          clientData.transactions.forEach(tx => {
+            stmtX = 30;
+            const rowData = [
+              tx.date ? new Date(tx.date).toLocaleDateString() : '-',
+              tx.type || '-',
+              tx.reference || '-',
+              (tx.amount || 0).toFixed(2),
+              (tx.paid || 0).toFixed(2),
+              (tx.balance || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), stmtX, doc.y, { width: stmtColWidths[i] });
+              stmtX += stmtColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else if (clientId) {
+          doc.fontSize(10).text('No transactions found for the selected client in this period.', { align: 'center' });
+        } else {
+          doc.fontSize(10).text('Note: Please use the client filter to generate a statement for a specific client.', { align: 'center' });
+        }
+        break;
+
+      case 'supplier-statement':
+        const companySupplierStmt = await Company.findById(companyId);
+        doc.fontSize(16).text(companySupplierStmt?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySupplierStmt?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SUPPLIER STATEMENT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        // Generate supplier statement data - either for all suppliers or specific supplier
+        const supplierStmtReport = await reportGeneratorService.generateSupplierStatementReport(
+          companyId,
+          reportPeriodStart,
+          reportPeriodEnd,
+          supplierId
+        );
+        
+        if (supplierStmtReport && supplierStmtReport.length > 0 && supplierStmtReport[0].transactions) {
+          const supplierData = supplierStmtReport[0];
+          
+          // Summary
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text('Summary:', 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.text(`Total Purchases: ${(supplierData.totalInvoiced || 0).toFixed(2)}`, 50);
+          doc.text(`Total Paid: ${(supplierData.totalPaid || 0).toFixed(2)}`, 50);
+          doc.text(`Balance Due: ${(supplierData.balance || 0).toFixed(2)}`, 50);
+          doc.moveDown(1);
+          
+          // Transactions table
+          const suppStmtHeaders = ['Date', 'Type', 'Reference', 'Amount', 'Paid', 'Balance'];
+          const suppStmtColWidths = [60, 70, 80, 70, 70, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let suppStmtX = 30;
+          suppStmtHeaders.forEach((header, i) => {
+            doc.text(header, suppStmtX, doc.y, { width: suppStmtColWidths[i] });
+            suppStmtX += suppStmtColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          supplierData.transactions.forEach(tx => {
+            suppStmtX = 30;
+            const rowData = [
+              tx.date ? new Date(tx.date).toLocaleDateString() : '-',
+              tx.type || '-',
+              tx.reference || '-',
+              (tx.amount || 0).toFixed(2),
+              (tx.paid || 0).toFixed(2),
+              (tx.balance || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), suppStmtX, doc.y, { width: suppStmtColWidths[i] });
+              suppStmtX += suppStmtColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else if (supplierId) {
+          doc.fontSize(10).text('No transactions found for the selected supplier in this period.', { align: 'center' });
+        } else {
+          doc.fontSize(10).text('Note: Please use the supplier filter to generate a statement for a specific supplier.', { align: 'center' });
+        }
+        break;
+
+      case 'purchase-by-product':
+        const companyPurchaseProduct = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPurchaseProduct?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPurchaseProduct?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PURCHASE BY PRODUCT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const purchaseByProductData = await reportGeneratorService.generatePurchaseByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
+        
+        if (purchaseByProductData && purchaseByProductData.data && purchaseByProductData.data.length > 0) {
+          const ppHeaders = ['Product', 'SKU', 'Quantity', 'Total Amount'];
+          const ppColWidths = [120, 60, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let ppX = 30;
+          ppHeaders.forEach((header, i) => {
+            doc.text(header, ppX, doc.y, { width: ppColWidths[i] });
+            ppX += ppColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalAmount = 0;
+          purchaseByProductData.data.forEach(item => {
+            ppX = 30;
+            totalAmount += item.totalAmount || 0;
+            const rowData = [
+              (item.product?.name || '-').substring(0, 25),
+              item.product?.sku || '-',
+              (item.totalQuantity || 0).toString(),
+              (item.totalAmount || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), ppX, doc.y, { width: ppColWidths[i] });
+              ppX += ppColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Products: ${purchaseByProductData.data.length}`, 30);
+          doc.text(`Total Amount: ${totalAmount.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No purchase data found for this period.', { align: 'center' });
+        }
+        break;
+
+      case 'purchase-by-category':
+        const companyPurchaseCategory = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPurchaseCategory?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPurchaseCategory?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PURCHASE BY CATEGORY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const purchaseByCategoryData = await reportGeneratorService.generatePurchaseByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        
+        if (purchaseByCategoryData && purchaseByCategoryData.data && purchaseByCategoryData.data.length > 0) {
+          const pcHeaders = ['Category', 'Products', 'Quantity', 'Total Amount'];
+          const pcColWidths = [120, 60, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let pcX = 30;
+          pcHeaders.forEach((header, i) => {
+            doc.text(header, pcX, doc.y, { width: pcColWidths[i] });
+            pcX += pcColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalAmount = 0;
+          purchaseByCategoryData.data.forEach(item => {
+            pcX = 30;
+            totalAmount += item.totalAmount || 0;
+            const rowData = [
+              (item.category || '-').substring(0, 25),
+              (item.productCount || 0).toString(),
+              (item.totalQuantity || 0).toString(),
+              (item.totalAmount || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), pcX, doc.y, { width: pcColWidths[i] });
+              pcX += pcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Categories: ${purchaseByCategoryData.data.length}`, 30);
+          doc.text(`Total Amount: ${totalAmount.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No purchase data found for this period.', { align: 'center' });
+        }
+        break;
+
+      case 'accounts-payable':
+        const companyAP = await Company.findById(companyId);
+        doc.fontSize(16).text(companyAP?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyAP?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('ACCOUNTS PAYABLE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const accountsPayableData = await reportGeneratorService.generateAccountsPayableReport(companyId);
+        
+        if (accountsPayableData && accountsPayableData.data && accountsPayableData.data.length > 0) {
+          const apHeaders = ['Invoice #', 'Supplier', 'Date', 'Total', 'Paid', 'Balance'];
+          const apColWidths = [50, 100, 50, 60, 60, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let apX = 30;
+          apHeaders.forEach((header, i) => {
+            doc.text(header, apX, doc.y, { width: apColWidths[i] });
+            apX += apColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalBalance = 0;
+          accountsPayableData.data.forEach(item => {
+            apX = 30;
+            totalBalance += item.balance || 0;
+            const rowData = [
+              item.purchaseNumber || '-',
+              (item.supplier?.name || '-').substring(0, 20),
+              item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : '-',
+              (item.total || 0).toFixed(2),
+              (item.paid || 0).toFixed(2),
+              (item.balance || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), apX, doc.y, { width: apColWidths[i] });
+              apX += apColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Invoices: ${accountsPayableData.data.length}`, 30);
+          doc.text(`Total Payable: ${totalBalance.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No accounts payable found.', { align: 'center' });
+        }
+        break;
+
+      case 'supplier-aging':
+        const companySA = await Company.findById(companyId);
+        doc.fontSize(16).text(companySA?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySA?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SUPPLIER AGING REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const supplierAgingData = await reportGeneratorService.generateSupplierAgingReport(companyId);
+        
+        if (supplierAgingData && supplierAgingData.data && supplierAgingData.data.length > 0) {
+          const saHeaders = ['Supplier', 'Code', 'Total Balance', 'Invoices'];
+          const saColWidths = [120, 60, 80, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let saX = 30;
+          saHeaders.forEach((header, i) => {
+            doc.text(header, saX, doc.y, { width: saColWidths[i] });
+            saX += saColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalOutstanding = 0;
+          supplierAgingData.data.forEach(item => {
+            saX = 30;
+            totalOutstanding += item.totalBalance || 0;
+            const rowData = [
+              (item.supplier?.name || '-').substring(0, 25),
+              item.supplier?.code || '-',
+              (item.totalBalance || 0).toFixed(2),
+              (item.invoices?.length || 0).toString()
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), saX, doc.y, { width: saColWidths[i] });
+              saX += saColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Suppliers: ${supplierAgingData.data.length}`, 30);
+          doc.text(`Total Outstanding: ${totalOutstanding.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No supplier aging data found.', { align: 'center' });
+        }
+        break;
+
+      case 'purchase-returns':
+        const companyPR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PURCHASE RETURNS REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const purchaseReturnsData = await reportGeneratorService.generatePurchaseReturnsReport(companyId, reportPeriodStart, reportPeriodEnd);
+        
+        if (purchaseReturnsData && purchaseReturnsData.data && purchaseReturnsData.data.length > 0) {
+          const prHeaders = ['Return #', 'Supplier', 'Date', 'Amount', 'Status'];
+          const prColWidths = [60, 100, 60, 70, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let prX = 30;
+          prHeaders.forEach((header, i) => {
+            doc.text(header, prX, doc.y, { width: prColWidths[i] });
+            prX += prColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalAmount = 0;
+          purchaseReturnsData.data.forEach(item => {
+            prX = 30;
+            totalAmount += item.total || 0;
+            const rowData = [
+              item.returnNumber || '-',
+              (item.supplier?.name || '-').substring(0, 20),
+              item.returnDate ? new Date(item.returnDate).toLocaleDateString() : '-',
+              (item.total || 0).toFixed(2),
+              item.status || '-'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), prX, doc.y, { width: prColWidths[i] });
+              prX += prColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Returns: ${purchaseReturnsData.data.length}`, 30);
+          doc.text(`Total Amount: ${totalAmount.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No purchase returns found for this period.', { align: 'center' });
+        }
+        break;
+
+      case 'purchase-order-status':
+        const companyPOS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPOS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPOS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PURCHASE ORDER STATUS REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const purchaseOrderStatusData = await reportGeneratorService.generatePurchaseOrderStatusReport(companyId, reportPeriodStart, reportPeriodEnd);
+        
+        if (purchaseOrderStatusData && purchaseOrderStatusData.summary) {
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text('Summary by Status:', 30);
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(9);
+          
+          const statusSummary = purchaseOrderStatusData.summary.byStatus;
+          doc.text(`Draft: ${statusSummary.draft?.count || 0} orders, Total: ${(statusSummary.draft?.total || 0).toFixed(2)}`, 50);
+          doc.text(`Ordered: ${statusSummary.ordered?.count || 0} orders, Total: ${(statusSummary.ordered?.total || 0).toFixed(2)}`, 50);
+          doc.text(`Received: ${statusSummary.received?.count || 0} orders, Total: ${(statusSummary.received?.total || 0).toFixed(2)}`, 50);
+          doc.text(`Partial: ${statusSummary.partial?.count || 0} orders, Total: ${(statusSummary.partial?.total || 0).toFixed(2)}`, 50);
+          doc.text(`Paid: ${statusSummary.paid?.count || 0} orders, Total: ${(statusSummary.paid?.total || 0).toFixed(2)}`, 50);
+          doc.text(`Cancelled: ${statusSummary.cancelled?.count || 0} orders, Total: ${(statusSummary.cancelled?.total || 0).toFixed(2)}`, 50);
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Orders: ${purchaseOrderStatusData.summary.totalOrders || 0}`, 30);
+        } else {
+          doc.fontSize(10).text('No purchase order data found for this period.', { align: 'center' });
+        }
+        break;
+
+      case 'supplier-performance':
+        const companySP = await Company.findById(companyId);
+        doc.fontSize(16).text(companySP?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySP?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SUPPLIER PERFORMANCE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const supplierPerformanceData = await reportGeneratorService.generateSupplierPerformanceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        
+        if (supplierPerformanceData && supplierPerformanceData.data && supplierPerformanceData.data.length > 0) {
+          const spHeaders = ['Supplier', 'Orders', 'Total Amount', 'On-Time %', 'Avg Order'];
+          const spColWidths = [100, 50, 80, 60, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let spX = 30;
+          spHeaders.forEach((header, i) => {
+            doc.text(header, spX, doc.y, { width: spColWidths[i] });
+            spX += spColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          supplierPerformanceData.data.forEach(item => {
+            spX = 30;
+            const rowData = [
+              (item.supplier?.name || '-').substring(0, 20),
+              (item.totalOrders || 0).toString(),
+              (item.totalAmount || 0).toFixed(2),
+              (item.onTimeRate || 0).toFixed(1) + '%',
+              (item.avgOrderValue || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), spX, doc.y, { width: spColWidths[i] });
+              spX += spColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Suppliers: ${supplierPerformanceData.data.length}`, 30);
+          doc.text(`Avg On-Time Rate: ${(supplierPerformanceData.summary?.avgOnTimeRate || 0).toFixed(1)}%`, 200);
+        } else {
+          doc.fontSize(10).text('No supplier performance data found for this period.', { align: 'center' });
+        }
+        break;
+
+      // ============================================
+      // NEW SALES REPORTS
+      // ============================================
+      case 'sales-by-product': {
+        const companySBP = await Company.findById(companyId);
+        doc.fontSize(16).text(companySBP?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySBP?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SALES BY PRODUCT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const salesByProductPdf = await reportGeneratorService.generateSalesByProductReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (salesByProductPdf && salesByProductPdf.data && salesByProductPdf.data.length > 0) {
+          const sbpHeaders = ['SKU', 'Product Name', 'Qty Sold', 'Revenue'];
+          const sbpColWidths = [60, 150, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let sbpX = 30;
+          sbpHeaders.forEach((header, i) => {
+            doc.text(header, sbpX, doc.y, { width: sbpColWidths[i] });
+            sbpX += sbpColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalRevenue = 0;
+          salesByProductPdf.data.forEach(item => {
+            totalRevenue += item.revenue || 0;
+            sbpX = 30;
+            const rowData = [
+              item.product?.sku || '-',
+              (item.product?.name || 'Unknown').substring(0, 30),
+              (item.quantitySold || 0).toString(),
+              (item.revenue || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), sbpX, doc.y, { width: sbpColWidths[i] });
+              sbpX += sbpColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Products: ${salesByProductPdf.data.length}`, 30);
+          doc.text(`Total Revenue: ${totalRevenue.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No sales data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'sales-by-category': {
+        const companySBC = await Company.findById(companyId);
+        doc.fontSize(16).text(companySBC?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySBC?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SALES BY CATEGORY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const salesByCategoryPdf = await reportGeneratorService.generateSalesByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (salesByCategoryPdf && salesByCategoryPdf.data && salesByCategoryPdf.data.length > 0) {
+          const sbcHeaders = ['Category', 'Products', 'Qty Sold', 'Revenue'];
+          const sbcColWidths = [100, 60, 60, 100];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let sbcX = 30;
+          sbcHeaders.forEach((header, i) => {
+            doc.text(header, sbcX, doc.y, { width: sbcColWidths[i] });
+            sbcX += sbcColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalRevenue = 0;
+          salesByCategoryPdf.data.forEach(item => {
+            totalRevenue += item.revenue || 0;
+            sbcX = 30;
+            const rowData = [
+              (item.category || 'Uncategorized').substring(0, 20),
+              (item.productCount || 0).toString(),
+              (item.quantitySold || 0).toString(),
+              (item.revenue || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), sbcX, doc.y, { width: sbcColWidths[i] });
+              sbcX += sbcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Categories: ${salesByCategoryPdf.data.length}`, 30);
+          doc.text(`Total Revenue: ${totalRevenue.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No sales data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'sales-by-client': {
+        const companySBCt = await Company.findById(companyId);
+        doc.fontSize(16).text(companySBCt?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySBCt?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SALES BY CLIENT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const salesByClientPdf = await reportGeneratorService.generateSalesByClientReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (salesByClientPdf && salesByClientPdf.data && salesByClientPdf.data.length > 0) {
+          const sbcHeaders = ['Code', 'Client Name', 'Invoices', 'Total Sales'];
+          const sbcColWidths = [60, 150, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let sbcX = 30;
+          sbcHeaders.forEach((header, i) => {
+            doc.text(header, sbcX, doc.y, { width: sbcColWidths[i] });
+            sbcX += sbcColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalSales = 0;
+          salesByClientPdf.data.forEach(item => {
+            totalSales += item.totalSales || 0;
+            sbcX = 30;
+            const rowData = [
+              item.client?.code || '-',
+              (item.client?.name || 'Unknown').substring(0, 30),
+              (item.invoiceCount || 0).toString(),
+              (item.totalSales || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), sbcX, doc.y, { width: sbcColWidths[i] });
+              sbcX += sbcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Clients: ${salesByClientPdf.data.length}`, 30);
+          doc.text(`Total Sales: ${totalSales.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No sales data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'sales-by-salesperson': {
+        const companySBS = await Company.findById(companyId);
+        doc.fontSize(16).text(companySBS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySBS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SALES BY SALESPERSON REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const salesBySalespersonPdf = await reportGeneratorService.generateSalesBySalespersonReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (salesBySalespersonPdf && salesBySalespersonPdf.data && salesBySalespersonPdf.data.length > 0) {
+          const sbsHeaders = ['Salesperson', 'Invoices', 'Total Sales'];
+          const sbsColWidths = [150, 80, 120];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let sbsX = 30;
+          sbsHeaders.forEach((header, i) => {
+            doc.text(header, sbsX, doc.y, { width: sbsColWidths[i] });
+            sbsX += sbsColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalSales = 0;
+          salesBySalespersonPdf.data.forEach(item => {
+            totalSales += item.totalSales || 0;
+            sbsX = 30;
+            const rowData = [
+              (item.salesperson?.name || 'Unknown').substring(0, 30),
+              (item.invoiceCount || 0).toString(),
+              (item.totalSales || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), sbsX, doc.y, { width: sbsColWidths[i] });
+              sbsX += sbsColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Salespersons: ${salesBySalespersonPdf.data.length}`, 30);
+          doc.text(`Total Sales: ${totalSales.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No sales data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'invoice-aging': {
+        const companyIA = await Company.findById(companyId);
+        doc.fontSize(16).text(companyIA?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyIA?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('INVOICE AGING REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const invoiceAgingPdf = await reportGeneratorService.generateInvoiceAgingReport(companyId);
+        if (invoiceAgingPdf && invoiceAgingPdf.buckets) {
+          const allInvoices = [...(invoiceAgingPdf.buckets.current || []), ...(invoiceAgingPdf.buckets['1-30'] || []), ...(invoiceAgingPdf.buckets['31-60'] || []), ...(invoiceAgingPdf.buckets['61-90'] || []), ...(invoiceAgingPdf.buckets['90+'] || [])];
+          
+          if (allInvoices.length > 0) {
+            const iaHeaders = ['Invoice #', 'Client', 'Due Date', 'Days', 'Balance'];
+            const iaColWidths = [60, 120, 60, 50, 80];
+            doc.fontSize(9).font('Helvetica-Bold');
+            let iaX = 30;
+            iaHeaders.forEach((header, i) => {
+              doc.text(header, iaX, doc.y, { width: iaColWidths[i] });
+              iaX += iaColWidths[i];
+            });
+            doc.moveDown(0.5);
+            doc.font('Helvetica').fontSize(8);
+            
+            let totalBalance = 0;
+            allInvoices.forEach(item => {
+              totalBalance += item.balance || 0;
+              iaX = 30;
+              const rowData = [
+                item.invoice?.invoiceNumber || '-',
+                (item.invoice?.client?.name || '-').substring(0, 25),
+                item.invoice?.dueDate ? new Date(item.invoice.dueDate).toLocaleDateString() : '-',
+                (item.days || 0).toString(),
+                (item.balance || 0).toFixed(2)
+              ];
+              rowData.forEach((cell, i) => {
+                doc.text(String(cell), iaX, doc.y, { width: iaColWidths[i] });
+                iaX += iaColWidths[i];
+              });
+              doc.moveDown(0.3);
+            });
+            doc.moveDown(1);
+            doc.fontSize(10).font('Helvetica-Bold');
+            doc.text(`Total Invoices: ${allInvoices.length}`, 30);
+            doc.text(`Total Balance: ${totalBalance.toFixed(2)}`, 200);
+          } else {
+            doc.fontSize(10).text('No outstanding invoices found.', { align: 'center' });
+          }
+        } else {
+          doc.fontSize(10).text('No aging data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'accounts-receivable': {
+        const companyAR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyAR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyAR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('ACCOUNTS RECEIVABLE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const arPdf = await reportGeneratorService.generateAccountsReceivableReport(companyId);
+        if (arPdf && arPdf.data && arPdf.data.length > 0) {
+          const arHeaders = ['Invoice #', 'Client', 'Date', 'Total', 'Paid', 'Balance'];
+          const arColWidths = [50, 100, 50, 60, 60, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let arX = 30;
+          arHeaders.forEach((header, i) => {
+            doc.text(header, arX, doc.y, { width: arColWidths[i] });
+            arX += arColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalBalance = 0;
+          arPdf.data.forEach(item => {
+            totalBalance += item.balance || 0;
+            arX = 30;
+            const rowData = [
+              item.invoiceNumber || '-',
+              (item.client?.name || '-').substring(0, 20),
+              item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : '-',
+              (item.total || 0).toFixed(2),
+              (item.paid || 0).toFixed(2),
+              (item.balance || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), arX, doc.y, { width: arColWidths[i] });
+              arX += arColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Invoices: ${arPdf.data.length}`, 30);
+          doc.text(`Total Receivable: ${totalBalance.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No accounts receivable found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'credit-notes':
+      case 'credit-notes-report': {
+        const companyCNR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyCNR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyCNR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CREDIT NOTES REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const cnPdf = await reportGeneratorService.generateCreditNotesReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (cnPdf && cnPdf.data && cnPdf.data.length > 0) {
+          const cnHeaders = ['Credit Note #', 'Client', 'Date', 'Amount', 'Status'];
+          const cnColWidths = [60, 100, 60, 80, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let cnX = 30;
+          cnHeaders.forEach((header, i) => {
+            doc.text(header, cnX, doc.y, { width: cnColWidths[i] });
+            cnX += cnColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalAmount = 0;
+          cnPdf.data.forEach(item => {
+            totalAmount += item.grandTotal || 0;
+            cnX = 30;
+            const rowData = [
+              item.creditNoteNumber || '-',
+              (item.client?.name || '-').substring(0, 20),
+              item.issueDate ? new Date(item.issueDate).toLocaleDateString() : '-',
+              (item.grandTotal || 0).toFixed(2),
+              item.status || '-'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), cnX, doc.y, { width: cnColWidths[i] });
+              cnX += cnColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Credit Notes: ${cnPdf.data.length}`, 30);
+          doc.text(`Total Amount: ${totalAmount.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No credit notes found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'quotation-conversion': {
+        const companyQCR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyQCR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyQCR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('QUOTATION CONVERSION REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const qcPdf = await reportGeneratorService.generateQuotationConversionReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (qcPdf && qcPdf.data && qcPdf.data.length > 0) {
+          const qcHeaders = ['Quotation #', 'Client', 'Date', 'Amount', 'Status'];
+          const qcColWidths = [60, 100, 60, 80, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let qcX = 30;
+          qcHeaders.forEach((header, i) => {
+            doc.text(header, qcX, doc.y, { width: qcColWidths[i] });
+            qcX += qcColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          qcPdf.data.forEach(item => {
+            qcX = 30;
+            const rowData = [
+              item.quotationNumber || '-',
+              (item.client?.name || '-').substring(0, 20),
+              item.quotationDate ? new Date(item.quotationDate).toLocaleDateString() : '-',
+              (item.grandTotal || 0).toFixed(2),
+              item.status || '-'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), qcX, doc.y, { width: qcColWidths[i] });
+              qcX += qcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Quotations: ${qcPdf.data.length}`, 30);
+        } else {
+          doc.fontSize(10).text('No quotation data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'recurring-invoice': {
+        const companyRIR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyRIR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyRIR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('RECURRING INVOICE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const riPdf = await reportGeneratorService.generateRecurringInvoiceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (riPdf && riPdf.data && riPdf.data.length > 0) {
+          const riHeaders = ['Invoice #', 'Client', 'Date', 'Amount', 'Status'];
+          const riColWidths = [60, 100, 60, 80, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let riX = 30;
+          riHeaders.forEach((header, i) => {
+            doc.text(header, riX, doc.y, { width: riColWidths[i] });
+            riX += riColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalAmount = 0;
+          riPdf.data.forEach(item => {
+            totalAmount += item.grandTotal || 0;
+            riX = 30;
+            const rowData = [
+              item.invoiceNumber || '-',
+              (item.client?.name || '-').substring(0, 20),
+              item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : '-',
+              (item.grandTotal || 0).toFixed(2),
+              item.status || '-'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), riX, doc.y, { width: riColWidths[i] });
+              riX += riColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Invoices: ${riPdf.data.length}`, 30);
+          doc.text(`Total Amount: ${totalAmount.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No recurring invoice data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'discount-report': {
+        const companyDR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyDR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyDR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('DISCOUNT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const drPdf = await reportGeneratorService.generateDiscountReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (drPdf && drPdf.data && drPdf.data.length > 0) {
+          const drHeaders = ['Invoice #', 'Client', 'Subtotal', 'Discount', 'Disc %'];
+          const drColWidths = [60, 100, 70, 70, 50];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let drX = 30;
+          drHeaders.forEach((header, i) => {
+            doc.text(header, drX, doc.y, { width: drColWidths[i] });
+            drX += drColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          let totalDiscounts = 0;
+          drPdf.data.forEach(item => {
+            totalDiscounts += item.totalDiscount || 0;
+            drX = 30;
+            const rowData = [
+              item.invoiceNumber || '-',
+              (item.client?.name || '-').substring(0, 20),
+              (item.subtotal || 0).toFixed(2),
+              (item.totalDiscount || 0).toFixed(2),
+              (item.discountPercent || 0).toFixed(1) + '%'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), drX, doc.y, { width: drColWidths[i] });
+              drX += drColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Invoices with Discounts: ${drPdf.data.length}`, 30);
+          doc.text(`Total Discounts: ${totalDiscounts.toFixed(2)}`, 200);
+        } else {
+          doc.fontSize(10).text('No discount data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'daily-sales-summary': {
+        const companyDSS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyDSS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyDSS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('DAILY SALES SUMMARY', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        const dssPdf = await reportGeneratorService.generateDailySalesSummaryReport(companyId, reportPeriodStart, reportPeriodEnd);
+        if (dssPdf && dssPdf.dailyData && dssPdf.dailyData.length > 0) {
+          const dssHeaders = ['Date', 'Invoices', 'Sales', 'Tax', 'Discounts', 'Net Sales'];
+          const dssColWidths = [50, 40, 70, 60, 60, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let dssX = 30;
+          dssHeaders.forEach((header, i) => {
+            doc.text(header, dssX, doc.y, { width: dssColWidths[i] });
+            dssX += dssColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          dssPdf.dailyData.forEach(item => {
+            dssX = 30;
+            const rowData = [
+              item.date || '-',
+              (item.invoiceCount || 0).toString(),
+              (item.totalSales || 0).toFixed(2),
+              (item.totalTax || 0).toFixed(2),
+              (item.totalDiscounts || 0).toFixed(2),
+              (item.netSales || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), dssX, doc.y, { width: dssColWidths[i] });
+              dssX += dssColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+          doc.moveDown(1);
+          doc.fontSize(10).font('Helvetica-Bold');
+          doc.text(`Total Days: ${dssPdf.dailyData.length}`, 30);
+          if (dssPdf.summary) {
+            doc.text(`Total Sales: ${(dssPdf.summary.totalSales || 0).toFixed(2)}`, 200);
+          }
+        } else {
+          doc.fontSize(10).text('No daily sales data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      // ============================================
+      // EXPENSE REPORTS
+      // ============================================
+      case 'expense-by-category': {
+        const companyEBC = await Company.findById(companyId);
+        doc.fontSize(16).text(companyEBC?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyEBC?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('EXPENSE BY CATEGORY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const expenseByCategoryPdfData = await reportGeneratorService.generateExpenseByCategoryReport(companyId, reportPeriodStart, reportPeriodEnd);
+
+        // Calculate total
+        let totalExpense = 0;
+        if (expenseByCategoryPdfData && expenseByCategoryPdfData.data) {
+          expenseByCategoryPdfData.data.forEach(d => {
+            totalExpense += d.total || 0;
+          });
+        }
+
+        doc.fontSize(10);
+        doc.text(`Total Expenses: ${totalExpense.toFixed(2)}`, 30);
+        doc.moveDown(2);
+
+        // Table header
+        const ebcHeaders = ['Category', 'Description', 'Amount'];
+        const ebcColWidths = [120, 200, 100];
+        
+        doc.fontSize(9).font('Helvetica-Bold');
+        let ebcX = 30;
+        ebcHeaders.forEach((header, i) => {
+          doc.text(header, ebcX, doc.y, { width: ebcColWidths[i] });
+          ebcX += ebcColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        if (expenseByCategoryPdfData && expenseByCategoryPdfData.data) {
+          expenseByCategoryPdfData.data.forEach(item => {
+            const rowData = [
+              item.category || '-',
+              (item.description || '').substring(0, 50),
+              (item.total || 0).toFixed(2)
+            ];
+            
+            ebcX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, ebcX, doc.y, { width: ebcColWidths[i] });
+              ebcX += ebcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'expense-by-period': {
+        const companyEBP = await Company.findById(companyId);
+        doc.fontSize(16).text(companyEBP?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyEBP?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('EXPENSE BY PERIOD REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const expenseByPeriodPdfData = await reportGeneratorService.generateExpenseByPeriodReport(companyId, reportPeriodStart, reportPeriodEnd);
+
+        // Calculate total
+        let totalExpensePeriod = 0;
+        if (expenseByPeriodPdfData && expenseByPeriodPdfData.data) {
+          expenseByPeriodPdfData.data.forEach(d => {
+            totalExpensePeriod += d.total || 0;
+          });
+        }
+
+        doc.fontSize(10);
+        doc.text(`Total Expenses: ${totalExpensePeriod.toFixed(2)}`, 30);
+        doc.moveDown(2);
+
+        // Table header
+        const ebpHeaders = ['Period', 'Category', 'Amount'];
+        const ebpColWidths = [100, 150, 100];
+        
+        doc.fontSize(9).font('Helvetica-Bold');
+        let ebpX = 30;
+        ebpHeaders.forEach((header, i) => {
+          doc.text(header, ebpX, doc.y, { width: ebpColWidths[i] });
+          ebpX += ebpColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        if (expenseByPeriodPdfData && expenseByPeriodPdfData.data) {
+          expenseByPeriodPdfData.data.forEach(item => {
+            const rowData = [
+              item.period || '-',
+              item.category || '-',
+              (item.total || 0).toFixed(2)
+            ];
+            
+            ebpX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, ebpX, doc.y, { width: ebpColWidths[i] });
+              ebpX += ebpColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'expense-vs-budget': {
+        const companyEVB = await Company.findById(companyId);
+        doc.fontSize(16).text(companyEVB?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyEVB?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('EXPENSE VS BUDGET REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const expenseVsBudgetPdfData = await reportGeneratorService.generateExpenseVsBudgetReport(companyId, reportPeriodStart, reportPeriodEnd);
+
+        // Calculate totals
+        let totalBudget = 0, totalActual = 0;
+        if (expenseVsBudgetPdfData && expenseVsBudgetPdfData.data) {
+          expenseVsBudgetPdfData.data.forEach(d => {
+            totalBudget += d.budget || 0;
+            totalActual += d.actual || 0;
+          });
+        }
+
+        doc.fontSize(10);
+        doc.text(`Total Budget: ${totalBudget.toFixed(2)}`, 30);
+        doc.text(`Total Actual: ${totalActual.toFixed(2)}`, 200);
+        doc.moveDown(0.5);
+        doc.text(`Variance: ${(totalBudget - totalActual).toFixed(2)}`, 30);
+        doc.moveDown(2);
+
+        // Table header
+        const evbHeaders = ['Category', 'Budget', 'Actual', 'Variance', 'Variance %'];
+        const evbColWidths = [100, 80, 80, 80, 70];
+        
+        doc.fontSize(9).font('Helvetica-Bold');
+        let evbX = 30;
+        evbHeaders.forEach((header, i) => {
+          doc.text(header, evbX, doc.y, { width: evbColWidths[i] });
+          evbX += evbColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        if (expenseVsBudgetPdfData && expenseVsBudgetPdfData.data) {
+          expenseVsBudgetPdfData.data.forEach(item => {
+            const rowData = [
+              item.category || '-',
+              (item.budget || 0).toFixed(2),
+              (item.actual || 0).toFixed(2),
+              (item.variance || 0).toFixed(2),
+              (item.variancePercent || 0).toFixed(1) + '%'
+            ];
+            
+            evbX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, evbX, doc.y, { width: evbColWidths[i] });
+              evbX += evbColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'employee-expense': {
+        const companyEE = await Company.findById(companyId);
+        doc.fontSize(16).text(companyEE?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyEE?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('EMPLOYEE EXPENSE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const employeeExpensePdfData = await reportGeneratorService.generateEmployeeExpenseReport(companyId, reportPeriodStart, reportPeriodEnd);
+
+        // Calculate total
+        let totalEmployeeExpense = 0;
+        if (employeeExpensePdfData && employeeExpensePdfData.data) {
+          employeeExpensePdfData.data.forEach(d => {
+            totalEmployeeExpense += d.total || 0;
+          });
+        }
+
+        doc.fontSize(10);
+        doc.text(`Total Employee Expenses: ${totalEmployeeExpense.toFixed(2)}`, 30);
+        doc.moveDown(2);
+
+        // Table header
+        const eeHeaders = ['Employee', 'Category', 'Count', 'Total Amount'];
+        const eeColWidths = [120, 100, 60, 100];
+        
+        doc.fontSize(9).font('Helvetica-Bold');
+        let eeX = 30;
+        eeHeaders.forEach((header, i) => {
+          doc.text(header, eeX, doc.y, { width: eeColWidths[i] });
+          eeX += eeColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        if (employeeExpensePdfData && employeeExpensePdfData.data) {
+          employeeExpensePdfData.data.forEach(item => {
+            const rowData = [
+              item.employee || '-',
+              item.category || '-',
+              (item.count || 0).toString(),
+              (item.total || 0).toFixed(2)
+            ];
+            
+            eeX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, eeX, doc.y, { width: eeColWidths[i] });
+              eeX += eeColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'petty-cash': {
+        const companyPC = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPC?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPC?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PETTY CASH REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleDateString()}`, { align: 'center' });
+        doc.moveDown(2);
+
+        const pettyCashPdfData = await reportGeneratorService.generatePettyCashReport(companyId, reportPeriodStart, reportPeriodEnd);
+
+        // Calculate total
+        let totalPettyCash = 0;
+        if (pettyCashPdfData && pettyCashPdfData.data) {
+          pettyCashPdfData.data.forEach(d => {
+            totalPettyCash += d.amount || 0;
+          });
+        }
+
+        doc.fontSize(10);
+        doc.text(`Total Petty Cash: ${totalPettyCash.toFixed(2)}`, 30);
+        doc.moveDown(2);
+
+        // Table header
+        const pcHeaders = ['Date', 'Description', 'Category', 'Amount', 'Status'];
+        const pcColWidths = [60, 150, 80, 80, 60];
+        
+        doc.fontSize(9).font('Helvetica-Bold');
+        let pcX = 30;
+        pcHeaders.forEach((header, i) => {
+          doc.text(header, pcX, doc.y, { width: pcColWidths[i] });
+          pcX += pcColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(8);
+
+        if (pettyCashPdfData && pettyCashPdfData.data) {
+          pettyCashPdfData.data.forEach(item => {
+            const rowData = [
+              item.date ? new Date(item.date).toLocaleDateString() : '-',
+              (item.description || '').substring(0, 35),
+              item.category || '-',
+              (item.amount || 0).toFixed(2),
+              item.status || '-'
+            ];
+            
+            pcX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, pcX, doc.y, { width: pcColWidths[i] });
+              pcX += pcColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      // ============================================
+      // TAX REPORTS
+      // ============================================
+      case 'vat-return': {
+        const vatPdfData = await reportGeneratorService.generateVATReturnReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyVat = await Company.findById(companyId);
+        doc.fontSize(16).text(companyVat?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyVat?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('VAT RETURN REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (vatPdfData && vatPdfData.data) {
+          doc.fontSize(11).text('Output VAT (Sales)', { underline: true });
+          doc.fontSize(10).text(`Total Sales: ${(vatPdfData.data.outputVAT.totalSales || 0).toFixed(2)}`, 30);
+          doc.text(`Total VAT: ${(vatPdfData.data.outputVAT.totalVAT || 0).toFixed(2)}`, 30);
+          doc.moveDown(1);
+          doc.fontSize(11).text('Input VAT (Purchases)', { underline: true });
+          doc.fontSize(10).text(`Total Purchases: ${(vatPdfData.data.inputVAT.totalPurchases || 0).toFixed(2)}`, 30);
+          doc.text(`Total VAT: ${(vatPdfData.data.inputVAT.totalVAT || 0).toFixed(2)}`, 30);
+          doc.moveDown(1);
+          doc.fontSize(12).font('Helvetica-Bold');
+          doc.text(`NET VAT: ${(vatPdfData.data.netVAT || 0).toFixed(2)} (${vatPdfData.data.status})`, 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.moveDown(1);
+          doc.text(`RRA Form: ${vatPdfData.data.rraFilingInfo.formType}`, 30);
+          doc.text(`Due Date: ${new Date(vatPdfData.data.rraFilingInfo.dueDate).toLocaleDateString()}`, 30);
+        }
+        break;
+      }
+
+      case 'paye-report': {
+        const payePdfData = await reportGeneratorService.generatePAYEReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyPaye = await Company.findById(companyId);
+        doc.fontSize(16).text(companyPaye?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyPaye?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('PAYE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (payePdfData && payePdfData.data) {
+          doc.fontSize(10).text(`Total Employees: ${payePdfData.data.totalEmployees}`, 30);
+          doc.text(`Total Gross Salary: ${(payePdfData.data.totalGrossSalary || 0).toFixed(2)}`, 30);
+          doc.moveDown(0.5);
+          doc.fontSize(12).font('Helvetica-Bold');
+          doc.text(`Total PAYE: ${(payePdfData.data.totalPAYE || 0).toFixed(2)}`, 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.moveDown(1);
+          doc.text(`RRA Form: ${payePdfData.data.rraFilingInfo.formType}`, 30);
+          doc.text(`Due Date: ${new Date(payePdfData.data.rraFilingInfo.dueDate).toLocaleDateString()}`, 30);
+        }
+        break;
+      }
+
+      case 'withholding-tax': {
+        const whtPdfData = await reportGeneratorService.generateWithholdingTaxReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyWht = await Company.findById(companyId);
+        doc.fontSize(16).text(companyWht?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyWht?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('WITHHOLDING TAX REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (whtPdfData && whtPdfData.data) {
+          doc.fontSize(10).text(`Withholding Tax Collected: ${(whtPdfData.data.withholdingTaxCollected.amount || 0).toFixed(2)}`, 30);
+          doc.text(`Withholding Tax Paid: ${(whtPdfData.data.withholdingTaxPaid.amount || 0).toFixed(2)}`, 30);
+          doc.moveDown(0.5);
+          doc.fontSize(12).font('Helvetica-Bold');
+          doc.text(`Net Withholding: ${(whtPdfData.data.netWithholding || 0).toFixed(2)}`, 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.moveDown(1);
+          doc.text(`RRA Form: ${whtPdfData.data.rraFilingInfo.formType}`, 30);
+          doc.text(`Due Date: ${new Date(whtPdfData.data.rraFilingInfo.dueDate).toLocaleDateString()}`, 30);
+        }
+        break;
+      }
+
+      case 'corporate-tax': {
+        const corpTaxPdfData = await reportGeneratorService.generateCorporateTaxReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyCorpTax = await Company.findById(companyId);
+        doc.fontSize(16).text(companyCorpTax?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyCorpTax?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('CORPORATE TAX REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (corpTaxPdfData && corpTaxPdfData.data) {
+          doc.fontSize(10).text(`Gross Income: ${(corpTaxPdfData.data.grossIncome || 0).toFixed(2)}`, 30);
+          doc.text(`Total Deductions: ${(corpTaxPdfData.data.deductions.total || 0).toFixed(2)}`, 30);
+          doc.moveDown(0.5);
+          doc.fontSize(11).font('Helvetica-Bold');
+          doc.text(`Taxable Income: ${(corpTaxPdfData.data.taxableIncome || 0).toFixed(2)}`, 30);
+          doc.fontSize(12);
+          doc.text(`Corporate Tax (${corpTaxPdfData.data.taxRate}%): ${(corpTaxPdfData.data.corporateTax || 0).toFixed(2)}`, 30);
+          doc.font('Helvetica').fontSize(9);
+          doc.moveDown(1);
+          doc.text(`RRA Form: ${corpTaxPdfData.data.rraFilingInfo.formType}`, 30);
+          doc.text(`Due Date: ${new Date(corpTaxPdfData.data.rraFilingInfo.dueDate).toLocaleDateString()}`, 30);
+        }
+        break;
+      }
+
+      case 'tax-payment-history': {
+        const taxPayPdfData = await reportGeneratorService.generateTaxPaymentHistory(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyTaxPay = await Company.findById(companyId);
+        doc.fontSize(16).text(companyTaxPay?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyTaxPay?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('TAX PAYMENT HISTORY', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (taxPayPdfData && taxPayPdfData.data) {
+          doc.fontSize(10).text(`Total Payments: ${taxPayPdfData.data.summary.totalPayments}`, 30);
+          doc.text(`Total Amount: ${(taxPayPdfData.data.summary.totalAmount || 0).toFixed(2)}`, 30);
+          doc.moveDown(2);
+          const taxHeaders = ['Date', 'Tax Type', 'Amount', 'Status'];
+          const taxColWidths = [80, 100, 80, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let taxX = 30;
+          taxHeaders.forEach((header, i) => {
+            doc.text(header, taxX, doc.y, { width: taxColWidths[i] });
+            taxX += taxColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          if (taxPayPdfData.data.payments) {
+            taxPayPdfData.data.payments.slice(0, 20).forEach(item => {
+              const rowData = [
+                item.date ? new Date(item.date).toLocaleDateString() : '-',
+                item.taxType || '-',
+                (item.amount || 0).toFixed(2),
+                item.status || '-'
+              ];
+              taxX = 30;
+              rowData.forEach((cell, i) => {
+                doc.text(cell, taxX, doc.y, { width: taxColWidths[i] });
+                taxX += taxColWidths[i];
+              });
+              doc.moveDown(0.3);
+            });
+          }
+        }
+        break;
+      }
+
+      case 'tax-calendar': {
+        const taxCalPdfData = await reportGeneratorService.generateTaxCalendarReport(companyId, reportPeriodStart ? new Date(reportPeriodStart).getFullYear().toString() : null);
+        const companyTaxCal = await Company.findById(companyId);
+        doc.fontSize(16).text(companyTaxCal?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyTaxCal?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('TAX CALENDAR', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Year: ${taxCalPdfData?.data?.year || new Date().getFullYear()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        if (taxCalPdfData && taxCalPdfData.data) {
+          doc.fontSize(10).text(`Total Due: ${taxCalPdfData.data.summary.totalDue}`, 30);
+          doc.text(`Filed: ${taxCalPdfData.data.summary.filed}`, 30);
+          doc.text(`Pending: ${taxCalPdfData.data.summary.pending}`, 30);
+          doc.text(`Overdue: ${taxCalPdfData.data.summary.overdue}`, 30);
+          doc.moveDown(2);
+          const calHeaders = ['Tax Type', 'Period', 'Due Date', 'Status'];
+          const calColWidths = [100, 100, 80, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let calX = 30;
+          calHeaders.forEach((header, i) => {
+            doc.text(header, calX, doc.y, { width: calColWidths[i] });
+            calX += calColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          if (taxCalPdfData.data.calendar) {
+            taxCalPdfData.data.calendar.forEach(item => {
+              const rowData = [
+                item.taxName || '-',
+                item.period || '-',
+                item.dueDate ? new Date(item.dueDate).toLocaleDateString() : '-',
+                item.status || '-'
+              ];
+              calX = 30;
+              rowData.forEach((cell, i) => {
+                doc.text(cell, calX, doc.y, { width: calColWidths[i] });
+                calX += calColWidths[i];
+              });
+              doc.moveDown(0.3);
+            });
+          }
+        }
+        break;
+      }
+
+      // ============================================
+      // ASSET REPORTS
+      // ============================================
+      case 'asset-register': {
+        const assetRegPdf = await reportGeneratorService.generateAssetRegisterReport(companyId);
+        const companyAR = await Company.findById(companyId);
+        doc.fontSize(16).text(companyAR?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyAR?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('ASSET REGISTER REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (assetRegPdf && assetRegPdf.summary) {
+          doc.fontSize(10).text(`Total Assets: ${assetRegPdf.summary.totalAssets}`, 30);
+          doc.text(`Active: ${assetRegPdf.summary.activeAssets}`, 30);
+          doc.text(`Disposed: ${assetRegPdf.summary.disposedAssets}`, 30);
+          doc.text(`Fully Depreciated: ${assetRegPdf.summary.fullyDepreciated}`, 30);
+          doc.moveDown(1);
+          doc.text(`Total Purchase Cost: ${assetRegPdf.summary.totalPurchaseCost.toFixed(2)}`, 30);
+          doc.text(`Total Accum. Depreciation: ${assetRegPdf.summary.totalAccumulatedDepreciation.toFixed(2)}`, 30);
+          doc.text(`Total Net Book Value: ${assetRegPdf.summary.totalNetBookValue.toFixed(2)}`, 30);
+          doc.moveDown(2);
+        }
+        
+        const arHeaders = ['Code', 'Name', 'Category', 'Status', 'Cost', 'Accum Depr', 'NBV'];
+        const arColWidths = [50, 100, 60, 50, 60, 70, 60];
+        doc.fontSize(8).font('Helvetica-Bold');
+        let arX = 30;
+        arHeaders.forEach((header, i) => {
+          doc.text(header, arX, doc.y, { width: arColWidths[i] });
+          arX += arColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(7);
+        if (assetRegPdf && assetRegPdf.data) {
+          assetRegPdf.data.forEach(item => {
+            const rowData = [
+              (item.assetCode || '-').substring(0, 10),
+              (item.name || '-').substring(0, 20),
+              (item.category || '-').substring(0, 12),
+              (item.status || '-').substring(0, 10),
+              (item.purchaseCost || 0).toFixed(2),
+              (item.accumulatedDepreciation || 0).toFixed(2),
+              (item.netBookValue || 0).toFixed(2)
+            ];
+            arX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, arX, doc.y, { width: arColWidths[i] });
+              arX += arColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'depreciation-schedule': {
+        const depSchedPdf = await reportGeneratorService.generateDepreciationScheduleReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyDS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyDS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyDS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('DEPRECIATION SCHEDULE', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (depSchedPdf && depSchedPdf.summary) {
+          doc.fontSize(10).text(`Total Assets: ${depSchedPdf.summary.totalAssets}`, 30);
+          doc.text(`Total Depreciation Periods: ${depSchedPdf.summary.totalDepreciationPeriods}`, 30);
+          doc.moveDown(1);
+        }
+        
+        const dsHeaders = ['Asset', 'Year', 'Annual Depr', 'Accum Depr', 'NBV'];
+        const dsColWidths = [80, 40, 70, 80, 70];
+        doc.fontSize(8).font('Helvetica-Bold');
+        let dsX = 30;
+        dsHeaders.forEach((header, i) => {
+          doc.text(header, dsX, doc.y, { width: dsColWidths[i] });
+          dsX += dsColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(7);
+        if (depSchedPdf && depSchedPdf.data) {
+          depSchedPdf.data.forEach(asset => {
+            if (asset.schedule) {
+              asset.schedule.forEach(period => {
+                const rowData = [
+                  (asset.assetCode || '-').substring(0, 15),
+                  (period.year || '-').toString(),
+                  (period.annualDepreciation || 0).toFixed(2),
+                  (period.accumulatedDepreciation || 0).toFixed(2),
+                  (period.netBookValue || 0).toFixed(2)
+                ];
+                dsX = 30;
+                rowData.forEach((cell, i) => {
+                  doc.text(cell, dsX, doc.y, { width: dsColWidths[i] });
+                  dsX += dsColWidths[i];
+                });
+                doc.moveDown(0.3);
+              });
+            }
+          });
+        }
+        break;
+      }
+
+      case 'asset-disposal': {
+        const assetDispPdf = await reportGeneratorService.generateAssetDisposalReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyAD = await Company.findById(companyId);
+        doc.fontSize(16).text(companyAD?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyAD?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('ASSET DISPOSAL REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart ? reportPeriodStart.toLocaleDateString() : 'All'} - ${reportPeriodEnd ? reportPeriodEnd.toLocaleDateString() : 'All'}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (assetDispPdf && assetDispPdf.summary) {
+          doc.fontSize(10).text(`Total Disposed: ${assetDispPdf.summary.totalDisposed}`, 30);
+          doc.text(`Total Proceeds: ${assetDispPdf.summary.totalDisposalProceeds.toFixed(2)}`, 30);
+          doc.text(`Total Gain/Loss: ${assetDispPdf.summary.totalGainLoss.toFixed(2)}`, 30);
+          doc.moveDown(2);
+        }
+        
+        const dispHeaders = ['Code', 'Name', 'Cost', 'NBV', 'Proceeds', 'Gain/Loss'];
+        const dispColWidths = [50, 100, 60, 60, 60, 60];
+        doc.fontSize(8).font('Helvetica-Bold');
+        let dispX = 30;
+        dispHeaders.forEach((header, i) => {
+          doc.text(header, dispX, doc.y, { width: dispColWidths[i] });
+          dispX += dispColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(7);
+        if (assetDispPdf && assetDispPdf.data) {
+          assetDispPdf.data.forEach(item => {
+            const rowData = [
+              (item.assetCode || '-').substring(0, 10),
+              (item.name || '-').substring(0, 20),
+              (item.purchaseCost || 0).toFixed(2),
+              (item.netBookValue || 0).toFixed(2),
+              (item.disposalAmount || 0).toFixed(2),
+              (item.gainLoss || 0).toFixed(2)
+            ];
+            dispX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, dispX, doc.y, { width: dispColWidths[i] });
+              dispX += dispColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      case 'asset-maintenance': {
+        const assetMaintPdf = await reportGeneratorService.generateAssetMaintenanceReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyAM = await Company.findById(companyId);
+        doc.fontSize(16).text(companyAM?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyAM?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('ASSET MAINTENANCE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart ? reportPeriodStart.toLocaleDateString() : 'All'} - ${reportPeriodEnd ? reportPeriodEnd.toLocaleDateString() : 'All'}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (assetMaintPdf && assetMaintPdf.summary) {
+          doc.fontSize(10).text(`Assets with Maintenance: ${assetMaintPdf.summary.totalAssetsWithMaintenance}`, 30);
+          doc.text(`Total Records: ${assetMaintPdf.summary.totalMaintenanceRecords}`, 30);
+          doc.text(`Total Cost: ${assetMaintPdf.summary.totalMaintenanceCost.toFixed(2)}`, 30);
+          doc.moveDown(2);
+        }
+        
+        const maintHeaders = ['Asset', 'Date', 'Type', 'Description', 'Cost'];
+        const maintColWidths = [60, 60, 60, 180, 50];
+        doc.fontSize(8).font('Helvetica-Bold');
+        let maintX = 30;
+        maintHeaders.forEach((header, i) => {
+          doc.text(header, maintX, doc.y, { width: maintColWidths[i] });
+          maintX += maintColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(7);
+        if (assetMaintPdf && assetMaintPdf.data) {
+          assetMaintPdf.data.forEach(asset => {
+            if (asset.maintenanceRecords) {
+              asset.maintenanceRecords.forEach(record => {
+                const rowData = [
+                  (asset.assetCode || '-').substring(0, 12),
+                  record.date ? new Date(record.date).toLocaleDateString() : '-',
+                  (record.type || '-').substring(0, 12),
+                  (record.description || '-').substring(0, 40),
+                  (record.cost || 0).toFixed(2)
+                ];
+                maintX = 30;
+                rowData.forEach((cell, i) => {
+                  doc.text(cell, maintX, doc.y, { width: maintColWidths[i] });
+                  maintX += maintColWidths[i];
+                });
+                doc.moveDown(0.3);
+              });
+            }
+          });
+        }
+        break;
+      }
+
+      case 'net-book-value': {
+        const nbvPdf = await reportGeneratorService.generateNetBookValueReport(companyId);
+        const companyNBV = await Company.findById(companyId);
+        doc.fontSize(16).text(companyNBV?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyNBV?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('NET BOOK VALUE REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (nbvPdf && nbvPdf.summary) {
+          doc.fontSize(10).text(`Total Assets: ${nbvPdf.summary.totalAssets}`, 30);
+          doc.text(`Active: ${nbvPdf.summary.activeAssets}`, 30);
+          doc.text(`Disposed: ${nbvPdf.summary.disposedAssets}`, 30);
+          doc.text(`Fully Depreciated: ${nbvPdf.summary.fullyDepreciated}`, 30);
+          doc.moveDown(1);
+          doc.text(`Total Purchase Cost: ${nbvPdf.summary.totalPurchaseCost.toFixed(2)}`, 30);
+          doc.text(`Total Accum. Depreciation: ${nbvPdf.summary.totalAccumulatedDepreciation.toFixed(2)}`, 30);
+          doc.text(`Total Net Book Value: ${nbvPdf.summary.totalNetBookValue.toFixed(2)}`, 30);
+          doc.moveDown(2);
+        }
+        
+        const nbvHeaders = ['Code', 'Name', 'Category', 'Status', 'Cost', 'NBV', 'Rem. Life'];
+        const nbvColWidths = [45, 90, 50, 50, 55, 55, 55];
+        doc.fontSize(8).font('Helvetica-Bold');
+        let nbvX = 30;
+        nbvHeaders.forEach((header, i) => {
+          doc.text(header, nbvX, doc.y, { width: nbvColWidths[i] });
+          nbvX += nbvColWidths[i];
+        });
+        doc.moveDown(0.5);
+        doc.font('Helvetica').fontSize(7);
+        if (nbvPdf && nbvPdf.data) {
+          nbvPdf.data.forEach(item => {
+            const rowData = [
+              (item.assetCode || '-').substring(0, 8),
+              (item.name || '-').substring(0, 18),
+              (item.category || '-').substring(0, 10),
+              (item.status || '-').substring(0, 10),
+              (item.purchaseCost || 0).toFixed(2),
+              (item.netBookValue || 0).toFixed(2),
+              item.remainingLife ? item.remainingLife.toFixed(1) : '0'
+            ];
+            nbvX = 30;
+            rowData.forEach((cell, i) => {
+              doc.text(cell, nbvX, doc.y, { width: nbvColWidths[i] });
+              nbvX += nbvColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        }
+        break;
+      }
+
+      // ============================================
+      // STOCK & INVENTORY REPORTS
+      // ============================================
+      case 'stock-movement': {
+        const stockMovPdf = await reportGeneratorService.generateStockMovementReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companySM = await Company.findById(companyId);
+        doc.fontSize(16).text(companySM?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySM?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('STOCK MOVEMENT REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (stockMovPdf && stockMovPdf.data && stockMovPdf.data.length > 0) {
+          const smHeaders = ['SKU', 'Product', 'Total In', 'Total Out', 'Net Change', 'Movements'];
+          const smColWidths = [60, 120, 60, 60, 60, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let smX = 30;
+          smHeaders.forEach((header, i) => {
+            doc.text(header, smX, doc.y, { width: smColWidths[i] });
+            smX += smColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          stockMovPdf.data.forEach(item => {
+            smX = 30;
+            const rowData = [
+              item.product?.sku || '-',
+              (item.product?.name || 'Unknown').substring(0, 25),
+              (item.totalIn || 0).toString(),
+              (item.totalOut || 0).toString(),
+              (item.netChange || 0).toString(),
+              (item.movementCount || 0).toString()
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), smX, doc.y, { width: smColWidths[i] });
+              smX += smColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No stock movement data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'low-stock': {
+        const lowStockPdf = await reportGeneratorService.generateLowStockReport(companyId);
+        const companyLS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyLS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyLS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('LOW STOCK REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (lowStockPdf && lowStockPdf.data && lowStockPdf.data.length > 0) {
+          const lsHeaders = ['SKU', 'Product', 'Current Stock', 'Threshold', 'Shortage', 'Est. Reorder Cost'];
+          const lsColWidths = [50, 100, 50, 50, 50, 70];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let lsX = 30;
+          lsHeaders.forEach((header, i) => {
+            doc.text(header, lsX, doc.y, { width: lsColWidths[i] });
+            lsX += lsColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          lowStockPdf.data.forEach(item => {
+            lsX = 30;
+            const rowData = [
+              item.sku || '-',
+              (item.name || 'Unknown').substring(0, 20),
+              (item.currentStock || 0).toString(),
+              (item.lowStockThreshold || 0).toString(),
+              (item.shortage || 0).toString(),
+              (item.estimatedReorderCost || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), lsX, doc.y, { width: lsColWidths[i] });
+              lsX += lsColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No low stock items found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'dead-stock': {
+        const deadStockPdf = await reportGeneratorService.generateDeadStockReport(companyId);
+        const companyDS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyDS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyDS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('DEAD STOCK REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (deadStockPdf && deadStockPdf.data && deadStockPdf.data.length > 0) {
+          const dsHeaders = ['SKU', 'Product', 'Current Stock', 'Stock Value', 'Days Since Movement'];
+          const dsColWidths = [60, 120, 60, 80, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let dsX = 30;
+          dsHeaders.forEach((header, i) => {
+            doc.text(header, dsX, doc.y, { width: dsColWidths[i] });
+            dsX += dsColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          deadStockPdf.data.forEach(item => {
+            dsX = 30;
+            const rowData = [
+              item.sku || '-',
+              (item.name || 'Unknown').substring(0, 25),
+              (item.currentStock || 0).toString(),
+              (item.stockValue || 0).toFixed(2),
+              (item.daysSinceMovement || 0).toString()
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), dsX, doc.y, { width: dsColWidths[i] });
+              dsX += dsColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No dead stock items found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'stock-aging': {
+        const stockAgingPdf = await reportGeneratorService.generateStockAgingReport(companyId);
+        const companySA = await Company.findById(companyId);
+        doc.fontSize(16).text(companySA?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySA?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('STOCK AGING REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (stockAgingPdf && stockAgingPdf.data) {
+          const allBatches = [
+            ...(stockAgingPdf.data['0-30'] || []),
+            ...(stockAgingPdf.data['31-60'] || []),
+            ...(stockAgingPdf.data['61-90'] || []),
+            ...(stockAgingPdf.data['91-180'] || []),
+            ...(stockAgingPdf.data['180+'] || [])
+          ];
+          
+          if (allBatches.length > 0) {
+            const saHeaders = ['Batch', 'Product', 'Quantity', 'Value', 'Days Old', 'Status'];
+            const saColWidths = [50, 100, 50, 60, 50, 50];
+            doc.fontSize(9).font('Helvetica-Bold');
+            let saX = 30;
+            saHeaders.forEach((header, i) => {
+              doc.text(header, saX, doc.y, { width: saColWidths[i] });
+              saX += saColWidths[i];
+            });
+            doc.moveDown(0.5);
+            doc.font('Helvetica').fontSize(8);
+            
+            allBatches.forEach(item => {
+              saX = 30;
+              const rowData = [
+                item.batchNumber || '-',
+                (item.product?.name || 'Unknown').substring(0, 20),
+                (item.quantity || 0).toString(),
+                (item.totalValue || 0).toFixed(2),
+                (item.daysOld || 0).toString(),
+                item.status || '-'
+              ];
+              rowData.forEach((cell, i) => {
+                doc.text(String(cell), saX, doc.y, { width: saColWidths[i] });
+                saX += saColWidths[i];
+              });
+              doc.moveDown(0.3);
+            });
+          } else {
+            doc.fontSize(10).text('No stock aging data found.', { align: 'center' });
+          }
+        } else {
+          doc.fontSize(10).text('No stock aging data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'inventory-turnover': {
+        const invTurnPdf = await reportGeneratorService.generateInventoryTurnoverReport(companyId, reportPeriodStart, reportPeriodEnd);
+        const companyIT = await Company.findById(companyId);
+        doc.fontSize(16).text(companyIT?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyIT?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('INVENTORY TURNOVER REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Period: ${reportPeriodStart.toLocaleDateString()} - ${reportPeriodEnd.toLocaleDateString()}`, { align: 'center' });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (invTurnPdf && invTurnPdf.data && invTurnPdf.data.length > 0) {
+          const itHeaders = ['SKU', 'Product', 'Inventory Value', 'COGS', 'Turnover', 'Turnover Days'];
+          const itColWidths = [50, 100, 70, 60, 50, 60];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let itX = 30;
+          itHeaders.forEach((header, i) => {
+            doc.text(header, itX, doc.y, { width: itColWidths[i] });
+            itX += itColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          invTurnPdf.data.forEach(item => {
+            itX = 30;
+            const rowData = [
+              item.sku || '-',
+              (item.name || 'Unknown').substring(0, 20),
+              (item.inventoryValue || 0).toFixed(2),
+              (item.cogs || 0).toFixed(2),
+              (item.turnover || 0).toFixed(2),
+              (item.turnoverDays || 0).toString()
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), itX, doc.y, { width: itColWidths[i] });
+              itX += itColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No inventory turnover data found for this period.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'batch-expiry': {
+        const batchExpPdf = await reportGeneratorService.generateBatchExpiryReport(companyId);
+        const companyBE = await Company.findById(companyId);
+        doc.fontSize(16).text(companyBE?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyBE?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('BATCH/EXPIRY REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (batchExpPdf && batchExpPdf.data && batchExpPdf.data.length > 0) {
+          const beHeaders = ['Batch', 'Product', 'Quantity', 'Expiry Date', 'Days Left', 'Status'];
+          const beColWidths = [50, 100, 50, 60, 50, 50];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let beX = 30;
+          beHeaders.forEach((header, i) => {
+            doc.text(header, beX, doc.y, { width: beColWidths[i] });
+            beX += beColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          batchExpPdf.data.forEach(item => {
+            beX = 30;
+            const rowData = [
+              item.batchNumber || '-',
+              (item.product?.name || 'Unknown').substring(0, 20),
+              (item.quantity || 0).toString(),
+              item.expiryDate ? new Date(item.expiryDate).toLocaleDateString() : '-',
+              (item.daysUntilExpiry || 0).toString(),
+              item.status || '-'
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), beX, doc.y, { width: beColWidths[i] });
+              beX += beColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No batch/expiry data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'serial-number-tracking': {
+        const serialPdf = await reportGeneratorService.generateSerialNumberTrackingReport(companyId);
+        const companySN = await Company.findById(companyId);
+        doc.fontSize(16).text(companySN?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companySN?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('SERIAL NUMBER TRACKING REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (serialPdf && serialPdf.data && serialPdf.data.length > 0) {
+          const snHeaders = ['Serial Number', 'Product', 'Status', 'Purchase Date', 'Sale Date', 'Client'];
+          const snColWidths = [80, 80, 50, 60, 60, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let snX = 30;
+          snHeaders.forEach((header, i) => {
+            doc.text(header, snX, doc.y, { width: snColWidths[i] });
+            snX += snColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          serialPdf.data.forEach(item => {
+            snX = 30;
+            const rowData = [
+              item.serialNumber || '-',
+              (item.product?.name || 'Unknown').substring(0, 15),
+              item.status || '-',
+              item.purchaseDate ? new Date(item.purchaseDate).toLocaleDateString() : '-',
+              item.saleDate ? new Date(item.saleDate).toLocaleDateString() : '-',
+              (item.client?.name || 'N/A').substring(0, 15)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), snX, doc.y, { width: snColWidths[i] });
+              snX += snColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No serial number tracking data found.', { align: 'center' });
+        }
+        break;
+      }
+
+      case 'warehouse-stock': {
+        const warehousePdf = await reportGeneratorService.generateWarehouseStockReport(companyId);
+        const companyWS = await Company.findById(companyId);
+        doc.fontSize(16).text(companyWS?.name || 'Company', { align: 'center' });
+        doc.fontSize(10).text(`TIN: ${companyWS?.tin || 'N/A'}`, { align: 'center' });
+        doc.moveDown(0.5);
+        doc.fontSize(14).text('WAREHOUSE STOCK REPORT', { align: 'center', underline: true });
+        doc.fontSize(9).text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+        doc.moveDown(2);
+        
+        if (warehousePdf && warehousePdf.data && warehousePdf.data.length > 0) {
+          const wsHeaders = ['Warehouse', 'Code', 'Products', 'Total Quantity', 'Total Value'];
+          const wsColWidths = [120, 50, 50, 70, 80];
+          doc.fontSize(9).font('Helvetica-Bold');
+          let wsX = 30;
+          wsHeaders.forEach((header, i) => {
+            doc.text(header, wsX, doc.y, { width: wsColWidths[i] });
+            wsX += wsColWidths[i];
+          });
+          doc.moveDown(0.5);
+          doc.font('Helvetica').fontSize(8);
+          
+          warehousePdf.data.forEach(item => {
+            wsX = 30;
+            const rowData = [
+              (item.name || 'Unknown').substring(0, 25),
+              item.code || '-',
+              (item.totalProducts || 0).toString(),
+              (item.totalQuantity || 0).toString(),
+              (item.totalValue || 0).toFixed(2)
+            ];
+            rowData.forEach((cell, i) => {
+              doc.text(String(cell), wsX, doc.y, { width: wsColWidths[i] });
+              wsX += wsColWidths[i];
+            });
+            doc.moveDown(0.3);
+          });
+        } else {
+          doc.fontSize(10).text('No warehouse stock data found.', { align: 'center' });
+        }
+        break;
+      }
 
       default:
         doc.fontSize(12).text('Invalid report type', { align: 'center' });
@@ -2711,9 +7025,24 @@ exports.getBalanceSheet = async (req, res, next) => {
     }, 0);
 
     // Calculate derived values
-    // Show Cash & Bank as total invoice payments (totalInflows) — money received from goods sold.
-    // Subtract credit note amounts since money is being returned to customers.
-    const cashAndBank = netCashInflows || 0;
+    // Get actual bank account balances from BankAccount model
+    // This pulls from the real bank account balances updated via CSV import and manual transactions
+    let cashAndBank = 0;
+    let bankAccountsData = null;
+    try {
+      bankAccountsData = await BankAccount.getTotalCashPosition(companyId);
+      cashAndBank = bankAccountsData.total || 0;
+    } catch (bankError) {
+      console.error('Error fetching bank accounts for Balance Sheet:', bankError);
+      // Fall back to calculated cash flow if bank accounts fail
+      cashAndBank = netCashInflows || 0;
+    }
+    
+    // If no bank accounts exist (total is 0), fall back to calculated cash flow
+    // This handles the case where bank accounts haven't been set up yet
+    if (cashAndBank === 0 && (totalInflows > 0 || totalOutflows > 0)) {
+      cashAndBank = netCashInflows || 0;
+    }
     // Get Prepaid Expenses from Company settings (manual entry)
     const prepaidExpenses = company?.assets?.prepaidExpenses || 0;
     // VAT Receivable = Net Input VAT - Output VAT + Credit Note VAT
@@ -2867,8 +7196,263 @@ exports.getBalanceSheet = async (req, res, next) => {
           endDate: periodEnd.toISOString(),
           formatted: `${periodStart.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} – ${periodEnd.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}`
         },
-        details: { totalInflows, totalOutflows, outputVAT, inputVAT, inputVATReturn, netInputVAT, incomeTaxPayable, totalCreditNoteAmount, pl: pl_debug }
+        details: { 
+          totalInflows, 
+          totalOutflows, 
+          outputVAT, 
+          inputVAT, 
+          inputVATReturn, 
+          netInputVAT, 
+          incomeTaxPayable, 
+          totalCreditNoteAmount, 
+          pl: pl_debug,
+          bankAccounts: bankAccountsData || { total: 0, byType: {}, accounts: [] }
+        }
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get period-based report (daily, weekly, monthly, quarterly, semi-annual, annual)
+// @route   GET /api/reports/period/:periodType
+// @access  Private
+exports.getPeriodReport = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { periodType } = req.params;
+    const { year, periodNumber, reportType = 'profit-loss', clientId, supplierId } = req.query;
+
+    const validPeriodTypes = ['daily', 'weekly', 'monthly', 'quarterly', 'semi-annual', 'annual'];
+    if (!validPeriodTypes.includes(periodType)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Invalid period type. Valid types: ${validPeriodTypes.join(', ')}` 
+      });
+    }
+
+    let periodYear = year ? parseInt(year) : new Date().getFullYear();
+    let periodNum = periodNumber ? parseInt(periodNumber) : null;
+
+    if (!periodNum) {
+      const currentInfo = reportGeneratorService.getCurrentPeriodInfo(periodType);
+      periodYear = currentInfo.year;
+      periodNum = currentInfo.periodNumber;
+    }
+
+    const reportData = await reportGeneratorService.getReportData(
+      companyId,
+      reportType,
+      periodType,
+      periodYear,
+      periodNum,
+      clientId,
+      supplierId
+    );
+
+    const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, periodYear, periodNum);
+
+    // Serialize dates to ISO strings for proper JSON serialization
+    const serializeDate = (date) => date instanceof Date ? date.toISOString() : date;
+    const periodStart = serializeDate(startDate);
+    const periodEnd = serializeDate(endDate);
+
+    // Also serialize dates in reportData if they exist
+    const serializedReportData = {
+      ...reportData,
+      periodStart: reportData.periodStart ? serializeDate(reportData.periodStart) : undefined,
+      periodEnd: reportData.periodEnd ? serializeDate(reportData.periodEnd) : undefined,
+      generatedAt: reportData.generatedAt ? serializeDate(reportData.generatedAt) : undefined
+    };
+
+    res.json({
+      success: true,
+      data: {
+        ...serializedReportData,
+        period: {
+          type: periodType,
+          year: periodYear,
+          periodNumber: periodNum,
+          startDate: periodStart,
+          endDate: periodEnd,
+          label
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get available periods for a period type
+// @route   GET /api/reports/periods/:periodType/available
+// @access  Private
+exports.getAvailablePeriods = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { periodType } = req.params;
+    const ReportSnapshot = require('../models/ReportSnapshot');
+
+    const validPeriodTypes = ['daily', 'weekly', 'monthly', 'quarterly', 'semi-annual', 'annual'];
+    if (!validPeriodTypes.includes(periodType)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Invalid period type. Valid types: ${validPeriodTypes.join(', ')}` 
+      });
+    }
+
+    const currentYear = new Date().getFullYear();
+    const availablePeriods = [];
+
+    const snapshots = await ReportSnapshot.find({
+      company: companyId,
+      periodType,
+      status: 'completed'
+    }).sort({ year: -1, periodNumber: -1 }).limit(50);
+
+    const snapshotMap = new Map();
+    snapshots.forEach(s => {
+      const key = `${s.year}-${s.periodNumber}`;
+      snapshotMap.set(key, { hasSnapshot: true, generatedAt: s.generatedAt });
+    });
+
+    let maxPeriods;
+    switch (periodType) {
+      case 'daily':
+        maxPeriods = 7;
+        for (let i = 0; i < maxPeriods; i++) {
+          const date = new Date();
+          date.setDate(date.getDate() - i);
+          const year = date.getFullYear();
+          const dayOfYear = Math.ceil((date - new Date(year, 0, 0)) / (1000 * 60 * 60 * 24));
+          const key = `${year}-${dayOfYear}`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, year, dayOfYear);
+          availablePeriods.push({ year, periodNumber: dayOfYear, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: i === 0, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+      case 'weekly':
+        maxPeriods = 52;
+        for (let i = 0; i < Math.min(maxPeriods, 52); i++) {
+          const weekNum = Math.ceil((new Date() - new Date(currentYear, 0, 1)) / (1000 * 60 * 60 * 24 * 7)) - i;
+          if (weekNum < 1) continue;
+          const weekYear = weekNum > 52 ? currentYear - 1 : currentYear;
+          const adjustedWeekNum = weekNum > 52 ? weekNum - 52 : weekNum;
+          const key = `${weekYear}-${adjustedWeekNum}`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, weekYear, adjustedWeekNum);
+          availablePeriods.push({ year: weekYear, periodNumber: adjustedWeekNum, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: i === 0, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+      case 'monthly':
+        maxPeriods = 24;
+        for (let i = 0; i < maxPeriods; i++) {
+          const date = new Date();
+          date.setMonth(date.getMonth() - i);
+          const monthYear = date.getFullYear();
+          const monthNum = date.getMonth() + 1;
+          const key = `${monthYear}-${monthNum}`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, monthYear, monthNum);
+          availablePeriods.push({ year: monthYear, periodNumber: monthNum, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: i === 0, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+      case 'quarterly':
+        maxPeriods = 8;
+        for (let i = 0; i < maxPeriods; i++) {
+          const date = new Date();
+          date.setMonth(date.getMonth() - (i * 3));
+          const qYear = date.getFullYear();
+          const qNum = Math.floor(date.getMonth() / 3) + 1;
+          const key = `${qYear}-${qNum}`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, qYear, qNum);
+          availablePeriods.push({ year: qYear, periodNumber: qNum, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: i === 0, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+      case 'semi-annual':
+        maxPeriods = 4;
+        for (let i = 0; i < maxPeriods; i++) {
+          const date = new Date();
+          date.setMonth(date.getMonth() - (i * 6));
+          const hYear = date.getFullYear();
+          const hNum = date.getMonth() < 6 ? 1 : 2;
+          const key = `${hYear}-${hNum}`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, hYear, hNum);
+          availablePeriods.push({ year: hYear, periodNumber: hNum, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: i === 0, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+      case 'annual':
+        for (let y = currentYear; y >= currentYear - 10; y--) {
+          const key = `${y}-1`;
+          const snapshot = snapshotMap.get(key);
+          const { startDate, endDate, label } = reportGeneratorService.getPeriodDates(periodType, y, 1);
+          availablePeriods.push({ year: y, periodNumber: 1, label, startDate, endDate, hasSnapshot: !!snapshot?.hasSnapshot, isCurrent: y === currentYear, generatedAt: snapshot?.generatedAt });
+        }
+        break;
+    }
+
+    // Convert Date objects to ISO strings for proper JSON serialization
+    const serializeDate = (date) => date instanceof Date ? date.toISOString() : date;
+
+    // Build available periods list
+    const availablePeriodsWithDates = availablePeriods.map(period => ({
+      ...period,
+      startDate: serializeDate(period.startDate),
+      endDate: serializeDate(period.endDate),
+      generatedAt: serializeDate(period.generatedAt)
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        periodType,
+        currentPeriod: reportGeneratorService.getCurrentPeriodInfo(periodType),
+        availablePeriods: availablePeriodsWithDates
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Generate manual snapshot for a period
+// @route   POST /api/reports/generate-snapshot
+// @access  Private (admin, manager)
+exports.generateManualSnapshot = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { periodType, year, periodNumber, reportTypes } = req.body;
+    const userId = req.user._id;
+
+    const validPeriodTypes = ['daily', 'weekly', 'monthly', 'quarterly', 'semi-annual', 'annual'];
+    if (!validPeriodTypes.includes(periodType)) {
+      return res.status(400).json({ success: false, message: `Invalid period type. Valid types: ${validPeriodTypes.join(', ')}` });
+    }
+
+    if (!year || !periodNumber) {
+      return res.status(400).json({ success: false, message: 'Year and periodNumber are required' });
+    }
+
+    const reportTypesToGenerate = reportTypes || ['profit-loss', 'balance-sheet', 'vat-summary', 'product-performance', 'customer-summary', 'sales-summary', 'purchases', 'stock-valuation', 'suppliers', 'aging', 'cash-flow', 'financial-ratios', 'top-products', 'top-customers', 'client-statement', 'supplier-statement', 'top-clients', 'top-suppliers', 'credit-limit', 'new-clients', 'inactive-clients', 'purchase-by-supplier', 'purchase-by-product', 'purchase-by-category', 'accounts-payable', 'supplier-aging', 'purchase-returns', 'purchase-order-status', 'supplier-performance', 'sales-by-product', 'sales-by-category', 'sales-by-client', 'sales-by-salesperson', 'invoice-aging', 'accounts-receivable', 'credit-notes', 'quotation-conversion', 'recurring-invoice', 'discount-report', 'daily-sales-summary'];
+    const results = [];
+    
+    for (const reportType of reportTypesToGenerate) {
+      try {
+        const snapshots = await reportGeneratorService.generateAllReports(companyId, periodType, parseInt(year), parseInt(periodNumber), userId);
+        results.push({ reportType, success: true, snapshotsGenerated: snapshots.length });
+      } catch (error) {
+        results.push({ reportType, success: false, error: error.message });
+      }
+    }
+
+    const allSuccessful = results.every(r => r.success);
+    res.json({
+      success: allSuccessful,
+      message: allSuccessful ? `Successfully generated ${results.length} report snapshots` : 'Some reports failed to generate',
+      results
     });
   } catch (error) {
     next(error);

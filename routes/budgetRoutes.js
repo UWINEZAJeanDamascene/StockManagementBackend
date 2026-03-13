@@ -12,7 +12,10 @@ const {
   getAllBudgetsComparison,
   getBudgetSummary,
   cloneBudget,
-  closeBudget
+  closeBudget,
+  getRevenueForecast,
+  getExpenseForecast,
+  getCashFlowForecast
 } = require('../controllers/budgetController');
 const { protect, authorize } = require('../middleware/auth');
 const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
@@ -30,6 +33,16 @@ router.route('/summary')
 
 router.route('/compare/all')
   .get(getAllBudgetsComparison);
+
+// Forecast routes
+router.route('/forecast/revenue')
+  .get(getRevenueForecast);
+
+router.route('/forecast/expense')
+  .get(getExpenseForecast);
+
+router.route('/forecast/cashflow')
+  .get(getCashFlowForecast);
 
 router.route('/:id')
   .get(getBudgetById)

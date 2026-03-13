@@ -102,7 +102,7 @@ const invoiceSchema = new mongoose.Schema({
   // Invoice status
   status: {
     type: String,
-    enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled'],
+    enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled', 'bad_debt'],
     default: 'draft'
   },
   
@@ -215,8 +215,27 @@ const invoiceSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
-  cancellationReason: String
-  ,
+  cancellationReason: String,
+  
+  // Bad debt tracking
+  badDebtWrittenOff: {
+    type: Boolean,
+    default: false
+  },
+  writtenOffAt: Date,
+  writtenOffBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  badDebtReason: String,
+  badDebtNotes: String,
+  reversedFromBadDebt: {
+    type: Boolean,
+    default: false
+  },
+  reverseBadDebtReason: String,
+  reverseBadDebtAt: Date,
+  
   // Link to recurring template if generated automatically
   generatedFromRecurring: {
     type: mongoose.Schema.Types.ObjectId,

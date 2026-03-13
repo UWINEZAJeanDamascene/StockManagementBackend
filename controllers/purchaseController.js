@@ -5,6 +5,8 @@ const StockMovement = require('../models/StockMovement');
 const PDFDocument = require('pdfkit');
 const { notifyStockReceived, notifyLowStock, notifyOutOfStock } = require('../services/notificationHelper');
 const cacheService = require('../services/cacheService');
+const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const JournalService = require('../services/journalService');
 
 // @desc    Get all purchases
 // @route   GET /api/purchases
@@ -255,6 +257,9 @@ exports.receivePurchase = async (req, res, next) => {
       });
     }
 
+    // Fetch supplier early (used in notifications) to avoid temporal-dead-zone errors
+    const supplier = await Supplier.findOne({ _id: purchase.supplier, company: companyId });
+
     // Add stock for each item
     for (const item of purchase.items) {
       const product = await Product.findOne({ _id: item.product._id, company: companyId });
@@ -327,8 +332,21 @@ exports.receivePurchase = async (req, res, next) => {
     purchase.confirmedBy = req.user.id;
     await purchase.save();
 
-    // Update supplier stats
-    const supplier = await Supplier.findOne({ _id: purchase.supplier, company: companyId });
+    // Create journal entry for the purchase (Inventory + VAT Debit, Accounts Payable Credit)
+    try {
+      await JournalService.createPurchaseEntry(companyId, req.user.id, {
+        _id: purchase._id,
+        purchaseNumber: purchase.purchaseNumber,
+        date: purchase.purchaseDate,
+        total: purchase.roundedAmount,
+        vatAmount: purchase.totalTax
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for purchase:', journalError);
+      // Don't fail the purchase receipt if journal entry fails
+    }
+
+    // Update supplier stats (supplier was fetched above)
     if (supplier) {
       supplier.totalPurchases += purchase.roundedAmount;
       supplier.outstandingBalance += purchase.roundedAmount;
@@ -400,6 +418,9 @@ exports.recordPayment = async (req, res, next) => {
     purchase.balance = purchase.grandTotal - purchase.amountPaid;
     if (purchase.balance < 0) purchase.balance = 0;
 
+    // Fetch supplier early (used in notifications and supplier updates)
+    const supplier = await Supplier.findOne({ _id: purchase.supplier, company: companyId });
+
     // Auto-receive if stock not yet added and payment is made
     if (!purchase.stockAdded && purchase.status === 'draft' && (paymentMethod === 'cash' || paymentMethod === 'card')) {
       // Add stock
@@ -462,8 +483,7 @@ exports.recordPayment = async (req, res, next) => {
       purchase.receivedDate = new Date();
     }
 
-    // Update supplier stats
-    const supplier = await Supplier.findOne({ _id: purchase.supplier, company: companyId });
+    // Update supplier stats (supplier was fetched earlier)
     if (supplier) {
       supplier.outstandingBalance -= amount;
       if (supplier.outstandingBalance < 0) supplier.outstandingBalance = 0;
@@ -476,6 +496,65 @@ exports.recordPayment = async (req, res, next) => {
 
     await purchase.save();
 
+    // Create journal entry for payment (Accounts Payable Debit, Cash/Bank Credit)
+    try {
+      await JournalService.createPurchasePaymentEntry(companyId, req.user.id, {
+        purchaseNumber: purchase.purchaseNumber,
+        date: new Date(),
+        amount: amount,
+        paymentMethod: paymentMethod
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for purchase payment:', journalError);
+      // Don't fail the payment if journal entry fails
+    }
+
+    // Create bank transaction if payment method is bank transfer and bank account is specified
+    let bankTransaction = null;
+    if (paymentMethod === 'bank_transfer' && req.body.bankAccountId) {
+      try {
+        const bankAccount = await BankAccount.findOne({
+          _id: req.body.bankAccountId,
+          company: companyId,
+          isActive: true
+        });
+        
+        if (bankAccount) {
+          // Get current balance
+          const currentBalance = bankAccount.currentBalance;
+          
+          // Create withdrawal transaction (debit)
+          const transaction = new BankTransaction({
+            company: companyId,
+            account: bankAccount._id,
+            type: 'withdrawal',
+            amount: amount,
+            balanceAfter: currentBalance - amount,
+            description: `Payment made: Purchase #${purchase.purchaseNumber}`,
+            date: new Date(),
+            referenceNumber: reference || purchase.purchaseNumber,
+            paymentMethod: 'bank_transfer',
+            status: 'completed',
+            reference: purchase._id,
+            referenceType: 'Purchase',
+            createdBy: req.user._id,
+            notes: notes || `Payment for purchase ${purchase.purchaseNumber} to ${supplier?.name || 'Supplier'}`
+          });
+          
+          await transaction.save();
+          
+          // Update bank account balance
+          bankAccount.currentBalance = currentBalance - amount;
+          await bankAccount.save();
+          
+          bankTransaction = transaction;
+        }
+      } catch (bankError) {
+        console.error('Error creating bank transaction:', bankError);
+        // Don't fail the payment if bank transaction fails
+      }
+    }
+
     // Invalidate report cache - payment affects Balance Sheet (cash, payables) and P&L
     try {
       await cacheService.invalidateByCompany(companyId, 'report');
@@ -486,7 +565,8 @@ exports.recordPayment = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Payment recorded successfully',
-      data: purchase
+      data: purchase,
+      bankTransaction: bankTransaction
     });
   } catch (error) {
     next(error);

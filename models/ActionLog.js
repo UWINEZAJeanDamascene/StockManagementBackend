@@ -20,7 +20,8 @@ const actionLogSchema = new mongoose.Schema({
     type: String,
     enum: [
       'product', 'stock', 'supplier', 'client', 
-      'quotation', 'invoice', 'user', 'category', 'report', 'purchase', 'company'
+      'quotation', 'invoice', 'user', 'category', 'report', 'purchase', 'company', 'department', 'receivable',
+      'delivery_note'
     ],
     required: true
   },

@@ -26,6 +26,10 @@ require('./models/Loan');
 require('./models/PrecomputedAggregation');
 require('./models/Expense');
 require('./models/PurchaseReturn');
+require('./models/Testimonial');
+require('./models/DeliveryNote');
+require('./models/PettyCash');
+require('./models/BankAccount');
 
 const app = express();
 
@@ -83,9 +87,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Body parser
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Body parser - increased limit for CSV imports
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Session management with Redis
 app.use(sessionMiddleware);
@@ -135,14 +139,47 @@ app.use('/api/loans', require('./routes/loanRoutes'));
 // Budget Management
 app.use('/api/budgets', require('./routes/budgetRoutes'));
 
+// Tax Management
+app.use('/api/taxes', require('./routes/taxRoutes'));
+
+// Payroll Management
+app.use('/api/payroll', require('./routes/payrollRoutes'));
+
 // Expenses
 app.use('/api/expenses', require('./routes/expenseRoutes'));
+
+// Petty Cash
+app.use('/api/petty-cash', require('./routes/pettyCashRoutes'));
+
+// Bank Accounts & Cash Management
+app.use('/api/bank-accounts', require('./routes/bankAccountRoutes'));
 
 // Purchase Returns
 app.use('/api/purchase-returns', require('./routes/purchaseReturnRoutes'));
 
+// Accounts Payable Management
+app.use('/api/payables', require('./routes/payableRoutes'));
+
+// Accounts Receivable Management
+app.use('/api/receivables', require('./routes/receivableRoutes'));
+
+// Delivery Notes
+app.use('/api/delivery-notes', require('./routes/deliveryNoteRoutes'));
+
+// Departments
+app.use('/api/departments', require('./routes/departmentRoutes'));
+
+// Bulk Data Import/Export
+app.use('/api/bulk', require('./routes/bulkDataRoutes'));
+
+// Audit Trail
+app.use('/api/audit-trail', require('./routes/auditTrailRoutes'));
+
 // AI Chatbot (Gemini)
 app.use('/api/chat', require('./routes/chatRoutes'));
+
+// Journal Entries & Accounting
+app.use('/api/journal-entries', require('./routes/journalRoutes'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -227,6 +264,17 @@ try {
   console.warn('Could not start backup scheduler', err);
 }
 
+// Start report scheduler (snapshot generation for weekly/monthly/quarterly/etc.)
+try {
+  const reportScheduler = require('./services/reportSchedulerService');
+  if (reportScheduler && typeof reportScheduler.initializeScheduler === 'function') {
+    reportScheduler.initializeScheduler(app);
+    console.log('Report scheduler initialized');
+  }
+} catch (err) {
+  console.warn('Could not initialize report scheduler', err && err.message ? err.message : err);
+}
+
 // Initialize Background Job Queue (BullMQ)
 // Runs nightly aggregations, report generation, email notifications
 try {
@@ -242,6 +290,14 @@ try {
   console.log('Background job system initialized');
 } catch (err) {
   console.warn('Could not initialize job queue:', err.message || err);
+}
+
+// Verify email server connection (non-blocking)
+try {
+  const { testConnection } = require('./config/email');
+  testConnection();
+} catch (err) {
+  console.warn('Could not verify email server:', err.message || err);
 }
 
 const server = app.listen(PORT, () => {

@@ -1,4 +1,5 @@
 const Loan = require('../models/Loan');
+const JournalService = require('../services/journalService');
 
 // @desc    Get all loans for a company
 // @route   GET /api/loans
@@ -69,6 +70,23 @@ exports.createLoan = async (req, res, next) => {
       company: companyId,
       createdBy: req.user._id
     });
+
+    // Create journal entry for loan received if loan is active
+    if (loan.status === 'active' && loan.originalAmount > 0) {
+      try {
+        await JournalService.createLoanReceivedEntry(companyId, req.user.id, {
+          _id: loan._id,
+          loanNumber: loan.loanNumber,
+          loanType: loan.loanType,
+          principalAmount: loan.originalAmount,
+          disbursementDate: loan.startDate,
+          paymentMethod: loan.paymentMethod || 'bank'
+        });
+      } catch (journalError) {
+        console.error('Error creating journal entry for loan:', journalError);
+        // Don't fail the loan creation if journal entry fails
+      }
+    }
 
     res.status(201).json({ success: true, data: loan });
   } catch (error) {
@@ -155,6 +173,20 @@ exports.recordPayment = async (req, res, next) => {
     }
 
     await loan.save();
+
+    // Create journal entry for loan payment
+    try {
+      await JournalService.createLoanPaymentEntry(companyId, req.user.id, {
+        loanNumber: loan.loanNumber,
+        date: new Date(),
+        principalAmount: amount,
+        interestAmount: req.body.interestAmount || 0,
+        paymentMethod: paymentMethod
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for loan payment:', journalError);
+      // Don't fail the payment if journal entry fails
+    }
 
     res.json({ success: true, data: loan });
   } catch (error) {

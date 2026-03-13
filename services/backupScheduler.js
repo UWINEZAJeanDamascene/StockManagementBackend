@@ -106,7 +106,7 @@ const processScheduledBackups = async () => {
         await runAutomatedBackup(backupSettings.company._id, {
           storageLocation: backupSettings.storageLocation,
           retention: backupSettings.retention,
-          autoVerify: backupSettings.autoVerify
+          autoVerify: backupSettings.schedule?.autoVerify || false
         });
 
         // Update next run time

@@ -69,6 +69,35 @@ const fixedAssetSchema = new mongoose.Schema({
   serialNumber: String,
   notes: String,
   
+  // Disposal details
+  disposalDate: {
+    type: Date
+  },
+  disposalAmount: {
+    type: Number,
+    default: 0
+  },
+  disposalMethod: {
+    type: String,
+    enum: ['sold', 'scrapped', 'donated', 'trade-in', 'other'],
+  },
+  disposalNotes: String,
+  
+  // Maintenance tracking
+  maintenanceHistory: [
+    {
+      date: Date,
+      type: {
+        type: String,
+        enum: ['preventive', 'corrective', 'inspection', 'upgrade', 'other']
+      },
+      description: String,
+      cost: Number,
+      vendor: String,
+      nextMaintenanceDate: Date
+    }
+  ],
+  
   // User tracking
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

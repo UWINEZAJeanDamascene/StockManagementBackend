@@ -551,13 +551,25 @@ ${recentExpenses.length > 0
     });
 
     // Convert conversation history to Gemini format (keep last 20 messages for context)
-    const chatHistory = history
+    // IMPORTANT: Gemini requires the first message to be from 'user' role, so we filter
+    // to start from the first user message and exclude any leading assistant messages
+    const validHistory = history
       .slice(-20)
-      .filter(msg => msg.role && msg.content)
-      .map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
-      }));
+      .filter(msg => msg.role && msg.content);
+    
+    // Find the index of the first user message
+    const firstUserIndex = validHistory.findIndex(msg => msg.role === 'user');
+    
+    // If there's no user message, we can't use history - start fresh
+    // Otherwise, only use messages from the first user message onwards
+    const filteredHistory = firstUserIndex >= 0 
+      ? validHistory.slice(firstUserIndex) 
+      : [];
+    
+    const chatHistory = filteredHistory.map(msg => ({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }],
+    }));
 
     const chat = model.startChat({ history: chatHistory });
     const result = await chat.sendMessage(message.trim());

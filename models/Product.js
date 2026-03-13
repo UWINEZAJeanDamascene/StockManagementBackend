@@ -100,6 +100,20 @@ const productSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Additional product attributes
+  weight: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  brand: {
+    type: String,
+    trim: true
+  },
+  location: {
+    type: String,
+    trim: true
+  },
   // Advanced inventory tracking flags
   trackBatch: {
     type: Boolean,

@@ -1,4 +1,5 @@
 const FixedAsset = require('../models/FixedAsset');
+const JournalService = require('../services/journalService');
 
 // @desc    Get all fixed assets for a company
 // @route   GET /api/fixed-assets
@@ -70,6 +71,22 @@ exports.createFixedAsset = async (req, res, next) => {
       company: companyId,
       createdBy: req.user._id
     });
+
+    // Create journal entry for asset purchase
+    try {
+      await JournalService.createAssetPurchaseEntry(companyId, req.user.id, {
+        _id: asset._id,
+        name: asset.name,
+        assetCode: asset.assetCode,
+        category: asset.category,
+        purchaseDate: asset.purchaseDate,
+        purchaseCost: asset.purchaseCost,
+        paymentMethod: asset.paymentMethod || 'cash'
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for asset purchase:', journalError);
+      // Don't fail the asset creation if journal entry fails
+    }
 
     res.status(201).json({ success: true, data: asset });
   } catch (error) {

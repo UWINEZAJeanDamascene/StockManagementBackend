@@ -8,6 +8,8 @@ const notificationService = require('../services/notificationHelper');
 const emailService = require('../services/emailService');
 const Company = require('../models/Company');
 const cacheService = require('../services/cacheService');
+const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const JournalService = require('../services/journalService');
 
 const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notifyInvoiceSent } = require('../services/notificationHelper');
 
@@ -381,6 +383,20 @@ exports.confirmInvoice = async (req, res, next) => {
     invoice.confirmedBy = req.user.id;
     await invoice.save();
 
+    // Create journal entry for the sale (Accounts Receivable Debit, Sales Revenue + VAT Credit)
+    try {
+      await JournalService.createInvoiceEntry(companyId, req.user.id, {
+        _id: invoice._id,
+        invoiceNumber: invoice.invoiceNumber,
+        date: invoice.invoiceDate,
+        total: invoice.roundedAmount,
+        vatAmount: invoice.totalTax
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for invoice:', journalError);
+      // Don't fail the invoice confirmation if journal entry fails
+    }
+
     // Notify payment received
     try {
       await notifyPaymentReceived(companyId, invoice, 0);
@@ -520,6 +536,65 @@ exports.recordPayment = async (req, res, next) => {
 
     await invoice.save();
 
+    // Create journal entry for payment (Cash/Bank Debit, Accounts Receivable Credit)
+    try {
+      await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
+        invoiceNumber: invoice.invoiceNumber,
+        date: new Date(),
+        amount: amount,
+        paymentMethod: paymentMethod
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for payment:', journalError);
+      // Don't fail the payment if journal entry fails
+    }
+
+    // Create bank transaction if payment method is bank transfer and bank account is specified
+    let bankTransaction = null;
+    if (paymentMethod === 'bank_transfer' && req.body.bankAccountId) {
+      try {
+        const bankAccount = await BankAccount.findOne({
+          _id: req.body.bankAccountId,
+          company: companyId,
+          isActive: true
+        });
+        
+        if (bankAccount) {
+          // Get current balance
+          const currentBalance = bankAccount.currentBalance;
+          
+          // Create deposit transaction
+          const transaction = new BankTransaction({
+            company: companyId,
+            account: bankAccount._id,
+            type: 'deposit',
+            amount: amount,
+            balanceAfter: currentBalance + amount,
+            description: `Payment received: Invoice #${invoice.invoiceNumber}`,
+            date: new Date(),
+            referenceNumber: reference || invoice.invoiceNumber,
+            paymentMethod: 'bank_transfer',
+            status: 'completed',
+            reference: invoice._id,
+            referenceType: 'Invoice',
+            createdBy: req.user._id,
+            notes: notes || `Payment for invoice ${invoice.invoiceNumber} from ${invoice.client?.name || 'Customer'}`
+          });
+          
+          await transaction.save();
+          
+          // Update bank account balance
+          bankAccount.currentBalance = currentBalance + amount;
+          await bankAccount.save();
+          
+          bankTransaction = transaction;
+        }
+      } catch (bankError) {
+        console.error('Error creating bank transaction:', bankError);
+        // Don't fail the payment if bank transaction fails
+      }
+    }
+
     // Notify payment recorded
     try {
       await notifyPaymentReceived(companyId, invoice, amount);
@@ -537,7 +612,8 @@ exports.recordPayment = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Payment recorded successfully',
-      data: invoice
+      data: invoice,
+      bankTransaction: bankTransaction
     });
   } catch (error) {
     next(error);

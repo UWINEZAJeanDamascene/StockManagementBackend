@@ -815,3 +815,409 @@ exports.closeBudget = async (req, res, next) => {
     next(error);
   }
 };
+
+// @desc    Get revenue forecast
+// @route   GET /api/budgets/forecast/revenue
+// @access  Private
+exports.getRevenueForecast = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { months = 6 } = req.query;
+    const forecastMonths = parseInt(months);
+    
+    // Get historical revenue data (last 12 months)
+    const now = new Date();
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 12, 1);
+    
+    // Get paid invoices for the last 12 months
+    const historicalRevenue = await Invoice.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: 'paid',
+          paidDate: { $gte: twelveMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$paidDate' },
+            month: { $month: '$paidDate' }
+          },
+          total: { $sum: '$grandTotal' },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+    
+    // Calculate average monthly revenue
+    const totalRevenue = historicalRevenue.reduce((sum, item) => sum + item.total, 0);
+    const avgMonthlyRevenue = historicalRevenue.length > 0 ? totalRevenue / historicalRevenue.length : 0;
+    
+    // Calculate trend (simple linear regression)
+    let trend = 0;
+    if (historicalRevenue.length >= 2) {
+      const n = historicalRevenue.length;
+      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+      historicalRevenue.forEach((item, index) => {
+        const x = index;
+        const y = item.total;
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumX2 += x * x;
+      });
+      trend = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    }
+    
+    // Generate forecast
+    const forecast = [];
+    let runningTotal = 0;
+    
+    for (let i = 1; i <= forecastMonths; i++) {
+      const forecastDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const baseForecast = avgMonthlyRevenue + trend * i;
+      // Apply seasonal adjustment if we have enough data
+      let seasonalAdjustment = 1;
+      if (historicalRevenue.length >= 6) {
+        const monthIndex = forecastDate.getMonth();
+        const sameMonthHistorical = historicalRevenue.filter(h => 
+          (h._id.month - 1) === monthIndex
+        );
+        if (sameMonthHistorical.length > 0) {
+          const avgForMonth = sameMonthHistorical.reduce((s, h) => s + h.total, 0) / sameMonthHistorical.length;
+          seasonalAdjustment = avgForMonth / avgMonthlyRevenue;
+        }
+      }
+      const forecastValue = Math.max(0, baseForecast * seasonalAdjustment);
+      runningTotal += forecastValue;
+      
+      forecast.push({
+        year: forecastDate.getFullYear(),
+        month: forecastDate.getMonth() + 1,
+        monthName: forecastDate.toLocaleString('default', { month: 'short' }),
+        projectedRevenue: Math.round(forecastValue * 100) / 100,
+        confidence: calculateConfidence(historicalRevenue.length, i),
+        trend: i === 1 ? (trend >= 0 ? 'up' : 'down') : null
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        historical: historicalRevenue.map(h => ({
+          year: h._id.year,
+          month: h._id.month,
+          revenue: h.total,
+          count: h.count
+        })),
+        forecast,
+        summary: {
+          averageMonthlyRevenue: Math.round(avgMonthlyRevenue * 100) / 100,
+          totalProjected: Math.round(runningTotal * 100) / 100,
+          trend: Math.round(trend * 100) / 100,
+          trendDirection: trend >= 0 ? 'positive' : 'negative',
+          dataPoints: historicalRevenue.length
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get expense forecast
+// @route   GET /api/budgets/forecast/expense
+// @access  Private
+exports.getExpenseForecast = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { months = 6 } = req.query;
+    const forecastMonths = parseInt(months);
+    
+    const now = new Date();
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 12, 1);
+    
+    // Get paid purchases for the last 12 months
+    const historicalExpenses = await Purchase.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: 'paid',
+          paidDate: { $gte: twelveMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$paidDate' },
+            month: { $month: '$paidDate' }
+          },
+          total: { $sum: '$grandTotal' },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+    
+    // Calculate average monthly expense
+    const totalExpenses = historicalExpenses.reduce((sum, item) => sum + item.total, 0);
+    const avgMonthlyExpense = historicalExpenses.length > 0 ? totalExpenses / historicalExpenses.length : 0;
+    
+    // Calculate trend
+    let trend = 0;
+    if (historicalExpenses.length >= 2) {
+      const n = historicalExpenses.length;
+      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+      historicalExpenses.forEach((item, index) => {
+        const x = index;
+        const y = item.total;
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumX2 += x * x;
+      });
+      trend = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    }
+    
+    // Generate forecast
+    const forecast = [];
+    let runningTotal = 0;
+    
+    for (let i = 1; i <= forecastMonths; i++) {
+      const forecastDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const baseForecast = avgMonthlyExpense + trend * i;
+      
+      let seasonalAdjustment = 1;
+      if (historicalExpenses.length >= 6) {
+        const monthIndex = forecastDate.getMonth();
+        const sameMonthHistorical = historicalExpenses.filter(h => 
+          (h._id.month - 1) === monthIndex
+        );
+        if (sameMonthHistorical.length > 0) {
+          const avgForMonth = sameMonthHistorical.reduce((s, h) => s + h.total, 0) / sameMonthHistorical.length;
+          seasonalAdjustment = avgForMonth / avgMonthlyExpense;
+        }
+      }
+      const forecastValue = Math.max(0, baseForecast * seasonalAdjustment);
+      runningTotal += forecastValue;
+      
+      forecast.push({
+        year: forecastDate.getFullYear(),
+        month: forecastDate.getMonth() + 1,
+        monthName: forecastDate.toLocaleString('default', { month: 'short' }),
+        projectedExpense: Math.round(forecastValue * 100) / 100,
+        confidence: calculateConfidence(historicalExpenses.length, i),
+        trend: i === 1 ? (trend >= 0 ? 'up' : 'down') : null
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        historical: historicalExpenses.map(h => ({
+          year: h._id.year,
+          month: h._id.month,
+          expense: h.total,
+          count: h.count
+        })),
+        forecast,
+        summary: {
+          averageMonthlyExpense: Math.round(avgMonthlyExpense * 100) / 100,
+          totalProjected: Math.round(runningTotal * 100) / 100,
+          trend: Math.round(trend * 100) / 100,
+          trendDirection: trend >= 0 ? 'increasing' : 'decreasing',
+          dataPoints: historicalExpenses.length
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get cash flow forecast
+// @route   GET /api/budgets/forecast/cashflow
+// @access  Private
+exports.getCashFlowForecast = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { months = 6 } = req.query;
+    const forecastMonths = parseInt(months);
+    
+    const now = new Date();
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 12, 1);
+    
+    // Get historical revenue (paid invoices)
+    const historicalRevenue = await Invoice.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: 'paid',
+          paidDate: { $gte: twelveMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$paidDate' },
+            month: { $month: '$paidDate' }
+          },
+          total: { $sum: '$grandTotal' }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+    
+    // Get historical expenses (paid purchases)
+    const historicalExpenses = await Purchase.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: 'paid',
+          paidDate: { $gte: twelveMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: '$paidDate' },
+            month: { $month: '$paidDate' }
+          },
+          total: { $sum: '$grandTotal' }
+        }
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1 } }
+    ]);
+    
+    // Calculate averages
+    const avgMonthlyRevenue = historicalRevenue.length > 0 
+      ? historicalRevenue.reduce((s, h) => s + h.total, 0) / historicalRevenue.length 
+      : 0;
+    const avgMonthlyExpense = historicalExpenses.length > 0 
+      ? historicalExpenses.reduce((s, h) => s + h.total, 0) / historicalExpenses.length 
+      : 0;
+    
+    // Calculate trends
+    const getTrend = (data) => {
+      if (data.length < 2) return 0;
+      const n = data.length;
+      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+      data.forEach((item, index) => {
+        const x = index;
+        const y = item.total;
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumX2 += x * x;
+      });
+      return (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    };
+    
+    const revenueTrend = getTrend(historicalRevenue);
+    const expenseTrend = getTrend(historicalExpenses);
+    
+    // Get current cash position (outstanding receivables - outstanding payables)
+    const currentReceivables = await Invoice.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: { $in: ['sent', 'overdue'] }
+        }
+      },
+      { $group: { _id: null, total: { $sum: '$grandTotal' } } }
+    ]);
+    
+    const currentPayables = await Purchase.aggregate([
+      {
+        $match: {
+          company: companyId,
+          status: { $in: ['received', 'pending'] }
+        }
+      },
+      { $group: { _id: null, total: { $sum: '$grandTotal' } } }
+    ]);
+    
+    const receivablesTotal = currentReceivables[0]?.total || 0;
+    const payablesTotal = currentPayables[0]?.total || 0;
+    
+    // Generate forecast
+    const forecast = [];
+    let runningBalance = 0; // Net cash position change
+    
+    for (let i = 1; i <= forecastMonths; i++) {
+      const forecastDate = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      
+      // Projected revenue with trend
+      const projectedRevenue = Math.max(0, avgMonthlyRevenue + revenueTrend * i);
+      // Projected expense with trend
+      const projectedExpense = Math.max(0, avgMonthlyExpense + expenseTrend * i);
+      
+      const netCashFlow = projectedRevenue - projectedExpense;
+      runningBalance += netCashFlow;
+      
+      forecast.push({
+        year: forecastDate.getFullYear(),
+        month: forecastDate.getMonth() + 1,
+        monthName: forecastDate.toLocaleString('default', { month: 'short' }),
+        projectedRevenue: Math.round(projectedRevenue * 100) / 100,
+        projectedExpense: Math.round(projectedExpense * 100) / 100,
+        netCashFlow: Math.round(netCashFlow * 100) / 100,
+        cumulativeCashFlow: Math.round(runningBalance * 100) / 100
+      });
+    }
+    
+    // Calculate current position
+    const currentCashPosition = receivablesTotal - payablesTotal;
+    
+    res.json({
+      success: true,
+      data: {
+        currentPosition: {
+          receivables: Math.round(receivablesTotal * 100) / 100,
+          payables: Math.round(payablesTotal * 100) / 100,
+          netPosition: Math.round(currentCashPosition * 100) / 100
+        },
+        historicalNetFlow: historicalRevenue.map(r => {
+          const matchingExpense = historicalExpenses.find(e => 
+            e._id.year === r._id.year && e._id.month === r._id.month
+          );
+          return {
+            year: r._id.year,
+            month: r._id.month,
+            revenue: r.total,
+            expense: matchingExpense?.total || 0,
+            netFlow: r.total - (matchingExpense?.total || 0)
+          };
+        }),
+        forecast,
+        summary: {
+          averageMonthlyRevenue: Math.round(avgMonthlyRevenue * 100) / 100,
+          averageMonthlyExpense: Math.round(avgMonthlyExpense * 100) / 100,
+          averageNetCashFlow: Math.round((avgMonthlyRevenue - avgMonthlyExpense) * 100) / 100,
+          projectedTotalRevenue: Math.round(forecast.reduce((s, f) => s + f.projectedRevenue, 0) * 100) / 100,
+          projectedTotalExpense: Math.round(forecast.reduce((s, f) => s + f.projectedExpense, 0) * 100) / 100,
+          projectedNetCashFlow: Math.round(forecast.reduce((s, f) => s + f.netCashFlow, 0) * 100) / 100,
+          revenueTrend: Math.round(revenueTrend * 100) / 100,
+          expenseTrend: Math.round(expenseTrend * 100) / 100,
+          dataPoints: Math.max(historicalRevenue.length, historicalExpenses.length)
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Helper function to calculate confidence based on data points
+function calculateConfidence(dataPoints, forecastMonth) {
+  if (dataPoints >= 12) {
+    return forecastMonth <= 3 ? 'high' : forecastMonth <= 6 ? 'medium' : 'low';
+  } else if (dataPoints >= 6) {
+    return forecastMonth <= 3 ? 'medium' : 'low';
+  } else if (dataPoints >= 3) {
+    return 'low';
+  }
+  return 'very_low';
+}

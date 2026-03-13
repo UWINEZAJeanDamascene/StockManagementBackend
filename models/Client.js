@@ -30,10 +30,20 @@ const clientSchema = new mongoose.Schema({
       lowercase: true,
       trim: true
     },
+    fax: String,
+    website: String,
     address: String,
     city: String,
-    country: String
+    state: String,
+    zipCode: String,
+    country: String,
+    contactPerson: String
   },
+  salesArea: String,
+  salesRepId: String,
+  region: String,
+  industry: String,
+  registrationDate: Date,
   taxId: String,
   paymentTerms: {
     type: String,

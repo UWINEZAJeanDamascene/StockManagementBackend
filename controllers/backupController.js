@@ -713,10 +713,10 @@ exports.getBackupSettings = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
     
-    // Get the most recent backup settings or create default
+    // Get the backup settings document (type: 'scheduled')
     let settings = await Backup.findOne({ 
       company: companyId,
-      'schedule.enabled': true
+      type: 'scheduled'
     }).sort({ createdAt: -1 });
 
     // Return default settings if none exist
@@ -736,11 +736,11 @@ exports.getBackupSettings = async (req, res) => {
     res.json({
       success: true,
       data: {
-        enabled: settings.schedule.enabled,
-        frequency: settings.schedule.frequency,
-        retention: settings.retention.keepForDays,
-        storageLocation: settings.storageLocation,
-        autoVerify: settings.retention.autoDelete,
+        enabled: settings.schedule?.enabled || false,
+        frequency: settings.schedule?.frequency || 'daily',
+        retention: settings.retention?.keepForDays || 30,
+        storageLocation: settings.storageLocation || 'local',
+        autoVerify: settings.schedule?.autoVerify || false,
         cloudConfig: settings.cloudConfig
       }
     });
@@ -765,7 +765,8 @@ exports.updateBackupSettings = async (req, res) => {
       frequency,
       retention,
       storageLocation,
-      cloudConfig 
+      cloudConfig,
+      autoVerify
     } = req.body;
 
     // Create or update backup settings
@@ -785,6 +786,7 @@ exports.updateBackupSettings = async (req, res) => {
 
     backupSettings.schedule.enabled = enabled || false;
     backupSettings.schedule.frequency = frequency || 'daily';
+    backupSettings.schedule.autoVerify = autoVerify || false;
     backupSettings.retention.keepForDays = retention || 30;
     backupSettings.storageLocation = storageLocation || 'local';
     

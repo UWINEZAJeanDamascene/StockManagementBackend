@@ -25,10 +25,21 @@ const supplierSchema = new mongoose.Schema({
       lowercase: true,
       trim: true
     },
+    fax: String,
+    website: String,
     address: String,
     city: String,
-    country: String
+    state: String,
+    zipCode: String,
+    country: String,
+    contactPerson: String
   },
+  region: String,
+  currency: String,
+  leadTime: Number,
+  minimumOrder: Number,
+  bankName: String,
+  bankAccount: String,
   productsSupplied: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Product'
