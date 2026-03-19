@@ -1,487 +1,253 @@
+const mongoose = require('mongoose');
 const PurchaseReturn = require('../models/PurchaseReturn');
-const Product = require('../models/Product');
+const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const InventoryBatch = require('../models/InventoryBatch');
 const StockMovement = require('../models/StockMovement');
-const Purchase = require('../models/Purchase');
+const Product = require('../models/Product');
 const JournalService = require('../services/journalService');
+const transactionService = require('../services/transactionService');
+const PurchaseOrder = require('../models/PurchaseOrder');
+const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 
-// @desc    Get all purchase returns for a company
-// @route   GET /api/purchase-returns
-// @access  Private
-exports.getPurchaseReturns = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { supplierId, status, startDate, endDate, page = 1, limit = 50 } = req.query;
-    
-    const query = { company: companyId };
-    
-    if (supplierId) {
-      query.supplier = supplierId;
-    }
-    
-    if (status && status !== 'all') {
-      query.status = status;
-    }
-    
-    if (startDate || endDate) {
-      query.returnDate = {};
-      if (startDate) query.returnDate.$gte = new Date(startDate);
-      if (endDate) query.returnDate.$lte = new Date(endDate);
-    }
-    
-    const purchaseReturns = await PurchaseReturn.find(query)
-      .populate('supplier', 'name code')
-      .populate('purchase', 'purchaseNumber')
-      .populate('items.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email')
-      .sort({ returnDate: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
-    
-    const total = await PurchaseReturn.countDocuments(query);
-    
-    res.json({
-      success: true,
-      count: purchaseReturns.length,
-      total,
-      pages: Math.ceil(total / limit),
-      data: purchaseReturns
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Get single purchase return
-// @route   GET /api/purchase-returns/:id
-// @access  Private
-exports.getPurchaseReturn = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    
-    const purchaseReturn = await PurchaseReturn.findOne({
-      _id: req.params.id,
-      company: companyId
-    })
-      .populate('supplier', 'name code contact')
-      .populate('purchase', 'purchaseNumber')
-      .populate('items.product', 'name sku unit averageCost')
-      .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email');
-    
-    if (!purchaseReturn) {
-      return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    }
-    
-    res.json({
-      success: true,
-      data: purchaseReturn
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Create new purchase return
-// @route   POST /api/purchase-returns
-// @access  Private
 exports.createPurchaseReturn = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
-    // If linking to a purchase, check if it exists and get payment status
-    let originalPurchasePaid = false;
-    let originalPurchasePaymentDate = null;
-    
-    let computedTotalTax = req.body.totalTax || 0;
+    const payload = req.body;
+    payload.company = companyId;
+    payload.createdBy = req.user.id;
+    payload.status = payload.status || 'draft';
 
-    if (req.body.purchase) {
-      const purchase = await Purchase.findOne({
-        _id: req.body.purchase,
-        company: companyId
-      });
-      
-      if (purchase) {
-        originalPurchasePaid = purchase.status === 'paid';
-        if (purchase.payments && purchase.payments.length > 0) {
-          const paidPayments = purchase.payments.filter(p => p.status === 'completed');
-          if (paidPayments.length > 0) {
-            originalPurchasePaymentDate = paidPayments[paidPayments.length - 1].paidDate;
-          }
-        }
+    // Validate GRN exists and is confirmed
+    const grn = await GoodsReceivedNote.findOne({ _id: payload.grn, company: companyId });
+    if (!grn) return res.status(404).json({ success: false, message: 'GRN not found' });
+    if (grn.status !== 'confirmed') return res.status(409).json({ success: false, message: 'Can only return against confirmed GRN' });
 
-        // Auto-compute totalTax if frontend didn't supply it (or sent 0)
-        // Use proportional calculation: (returnSubtotal / purchaseSubtotal) * purchaseTotalTax
-        if (computedTotalTax === 0 && purchase.subtotal > 0 && purchase.totalTax > 0) {
-          const returnSubtotal = req.body.subtotal || 0;
-          computedTotalTax = (returnSubtotal / purchase.subtotal) * purchase.totalTax;
-        }
-      }
-    }
-    
-    const purchaseReturn = new PurchaseReturn({
-      ...req.body,
-      totalTax: computedTotalTax,
-      company: companyId,
-      createdBy: req.user._id,
-      originalPurchasePaid,
-      originalPurchasePaymentDate
-    });
-    
-    await purchaseReturn.save();
-    
-    res.status(201).json({
-      success: true,
-      data: purchaseReturn
-    });
-  } catch (error) {
-    next(error);
-  }
+    const pr = await PurchaseReturn.create(payload);
+    res.status(201).json({ success: true, data: pr });
+  } catch (err) { next(err); }
 };
 
-// @desc    Update purchase return
-// @route   PUT /api/purchase-returns/:id
-// @access  Private
 exports.updatePurchaseReturn = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
-    let purchaseReturn = await PurchaseReturn.findOne({
-      _id: req.params.id,
-      company: companyId
-    });
-    
-    if (!purchaseReturn) {
-      return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    }
-    
-    // Don't allow changing company, createdBy, or approved status if already approved
-    const { company, createdBy, approvedBy, ...updateData } = req.body;
-    
-    // If changing purchase link, re-check payment status
-    if (updateData.purchase && updateData.purchase !== purchaseReturn.purchase?.toString()) {
-      const purchase = await Purchase.findOne({
-        _id: updateData.purchase,
-        company: companyId
-      });
-      
-      if (purchase) {
-        updateData.originalPurchasePaid = purchase.status === 'paid';
-        if (purchase.payments && purchase.payments.length > 0) {
-          const paidPayments = purchase.payments.filter(p => p.status === 'completed');
-          if (paidPayments.length > 0) {
-            updateData.originalPurchasePaymentDate = paidPayments[paidPayments.length - 1].paidDate;
-          }
-        }
-      }
-    }
-    
-    Object.assign(purchaseReturn, updateData);
-    await purchaseReturn.save();
-    
-    res.json({
-      success: true,
-      data: purchaseReturn
-    });
-  } catch (error) {
-    next(error);
-  }
+    const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId });
+    if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
+    if (pr.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft returns can be edited' });
+
+    Object.assign(pr, req.body);
+    await pr.save();
+    res.json({ success: true, data: pr });
+  } catch (err) { next(err); }
 };
 
-// @desc    Approve purchase return
-// @route   PUT /api/purchase-returns/:id/approve
-// @access  Private
-exports.approvePurchaseReturn = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    
-    const purchaseReturn = await PurchaseReturn.findOne({
-      _id: req.params.id,
-      company: companyId
-    });
-    
-    if (!purchaseReturn) {
-      return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    }
-    
-    if (purchaseReturn.status !== 'draft' && purchaseReturn.status !== 'pending') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Only draft or pending purchase returns can be approved' 
-      });
-    }
-    
-    // Create stock movements for each returned item (out to supplier)
-    for (const item of purchaseReturn.items) {
-      // Update product stock first so we can record previousStock / newStock
-      const product = await Product.findById(item.product);
-      const previousStock = product ? (product.currentStock || 0) : 0;
-      const newStock = Math.max(0, previousStock - item.quantity);
+// Confirm purchase return
+exports.confirmPurchaseReturn = async (req, res, next) => {
+  const companyId = req.user.company._id;
 
-      const stockMovement = new StockMovement({
+  const doConfirm = async (sess) => {
+    const useSession = !!sess;
+    const opts = useSession ? { session: sess } : {};
+
+    const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId }, null, opts);
+    if (!pr) {
+      throw Object.assign(new Error('Purchase return not found'), { status: 404 });
+    }
+    if (pr.status === 'confirmed') throw Object.assign(new Error('Purchase return already confirmed'), { status: 400 });
+
+    // Load GRN
+    const grn = await GoodsReceivedNote.findOne({ _id: pr.grn, company: companyId }).session(sess);
+    if (!grn) throw Object.assign(new Error('GRN not found'), { status: 404 });
+    if (grn.status !== 'confirmed') throw Object.assign(new Error('Cannot return against unconfirmed GRN'), { status: 409 });
+
+    // Track created resources for manual rollback
+    const createdMovements = [];
+    const modifiedBatches = [];
+    const modifiedProducts = new Map();
+
+    let totalReturnNet = 0;
+    let totalReturnTax = 0;
+
+    for (const line of pr.lines) {
+      const grnLine = grn.lines.id(line.grnLine);
+      if (!grnLine) throw Object.assign(new Error('GRN line not found'), { status: 404 });
+
+      // Unit cost must match original GRN unit cost
+      if (Number(line.unitCost) !== Number(grnLine.unitCost)) throw Object.assign(new Error('RETURN_PRICING_MISMATCH'), { status: 422 });
+
+      // Already returned qty across confirmed returns
+      const PurchaseReturnModel = require('../models/PurchaseReturn');
+      const agg = await PurchaseReturnModel.aggregate([
+        { $match: { company: companyId, 'lines.grnLine': new mongoose.Types.ObjectId(String(line.grnLine)), status: 'confirmed' } },
+        { $unwind: '$lines' },
+        { $match: { 'lines.grnLine': new mongoose.Types.ObjectId(String(line.grnLine)) } },
+        { $group: { _id: null, returned: { $sum: '$lines.qtyReturned' } } }
+      ]).session(sess);
+      const alreadyReturned = (agg[0] && agg[0].returned) || 0;
+
+      if (line.qtyReturned + alreadyReturned > grnLine.qtyReceived + 1e-9) {
+        throw Object.assign(new Error('RETURN_EXCEEDS_RECEIVED'), { status: 422 });
+      }
+
+      // Check warehouse stock
+      const product = await Product.findById(line.product).session(sess);
+      if (!product) throw Object.assign(new Error('Product not found'), { status: 404 });
+      if ((product.currentStock || 0) < line.qtyReturned - 1e-9) {
+        throw Object.assign(new Error('INSUFFICIENT_STOCK'), { status: 409 });
+      }
+
+      // Reduce stock_levels qty_on_hand
+      if (!modifiedProducts.has(String(product._id))) modifiedProducts.set(String(product._id), { prevStock: product.currentStock, prevAvg: product.averageCost });
+      product.currentStock = (product.currentStock || 0) - line.qtyReturned;
+      await product.save(opts);
+
+      // FIFO: reduce matching lot's qty_remaining (find batch matching grn line by unitCost/product/warehouse)
+      if (product.costingMethod === 'fifo') {
+        const batch = await InventoryBatch.findOne({ company: companyId, product: line.product, warehouse: pr.warehouse, unitCost: line.unitCost, availableQuantity: { $gte: line.qtyReturned } }).sort({ receivedDate: -1 }).session(sess);
+        if (batch) {
+          modifiedBatches.push({ id: batch._id, prevAvailable: batch.availableQuantity });
+          batch.availableQuantity = batch.availableQuantity - line.qtyReturned;
+          await batch.save(opts);
+        } else {
+          // no matching batch with enough quantity - insufficient stock at lot level
+          throw Object.assign(new Error('INSUFFICIENT_STOCK_LOT'), { status: 409 });
+        }
+      }
+
+      // Create return_out stock movement
+      const movement = new StockMovement({
         company: companyId,
-        product: item.product,
+        product: line.product,
         type: 'out',
         reason: 'return',
-        referenceNumber: purchaseReturn.purchaseReturnNumber,
+        quantity: line.qtyReturned,
+        previousStock: modifiedProducts.get(String(product._id)).prevStock,
+        newStock: product.currentStock,
+        unitCost: line.unitCost,
+        totalCost: line.unitCost * line.qtyReturned,
+        warehouse: pr.warehouse,
         referenceType: 'return',
-        quantity: item.quantity,
-        previousStock,
-        newStock,
-        unitCost: item.unitPrice,
-        totalCost: item.total,
-        supplier: purchaseReturn.supplier,
-        movementDate: purchaseReturn.returnDate,
-        performedBy: req.user._id,
-        notes: `Purchase return to supplier: ${purchaseReturn.purchaseReturnNumber}`
+        referenceNumber: pr.referenceNo || pr.referenceNo || pr.referenceNo,
+        referenceDocument: pr._id,
+        referenceModel: 'CreditNote',
+        performedBy: req.user.id,
+        movementDate: new Date()
       });
-      
-      await stockMovement.save();
-      
-      if (product) {
-        product.currentStock = newStock;
-        await product.save();
-      }
-    }
-    
-    // Reduce Accounts Payable if applicable
-    if (purchaseReturn.accountsPayableReduction > 0 && purchaseReturn.purchase) {
-      const purchase = await Purchase.findById(purchaseReturn.purchase);
-      if (purchase && purchase.status !== 'paid') {
-        // Reduce the balance
-        purchase.balance -= purchaseReturn.accountsPayableReduction;
-        if (purchase.balance < 0) purchase.balance = 0;
-        await purchase.save();
-      }
-    }
-    
-    // Update purchase return status
-    purchaseReturn.status = 'approved';
-    purchaseReturn.approvedBy = req.user._id;
-    await purchaseReturn.save();
+      await movement.save(opts);
+      createdMovements.push(movement._id);
 
-    // Create journal entry for purchase return (Accounts Payable Debit, Inventory + VAT Credit)
+      totalReturnNet += Number(line.unitCost) * line.qtyReturned;
+      // Tax: find tax from original GRN/PO line if available
+      const poLine = await PurchaseOrder.findOne({ 'lines._id': grnLine.purchaseOrderLine }).then(po => po ? po.lines.id(grnLine.purchaseOrderLine) : null);
+      const taxRate = poLine ? (poLine.taxRate || 0) : 0;
+      const lineTax = Number(line.unitCost) * line.qtyReturned * (taxRate/100);
+      totalReturnTax += lineTax;
+    }
+
+    // Build journal lines: DR AP, CR VAT, CR Inventory per product
+    const journalLines = [];
+    // DR Accounts Payable - total incl tax
+    const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
+    journalLines.push(JournalService.createDebitLine(apAcct, totalReturnNet + totalReturnTax, `Purchase Return ${pr.referenceNo || pr.referenceNo} - GRN#${grn.referenceNo}`));
+
+    if (totalReturnTax > 0) {
+      const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
+      journalLines.push(JournalService.createCreditLine(vatAcct, totalReturnTax, `VAT reversal ${pr.referenceNo || pr.referenceNo}`));
+    }
+
+    // CR inventory lines per product
+    const productSums = new Map();
+    for (const l of pr.lines) {
+      const prev = productSums.get(String(l.product)) || 0;
+      productSums.set(String(l.product), prev + (Number(l.unitCost) * l.qtyReturned));
+    }
+    for (const [prodId, amt] of productSums.entries()) {
+      const product = await Product.findById(prodId).lean();
+      const invAcct = product && product.inventoryAccount ? product.inventoryAccount : (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: pr.warehouse }));
+      journalLines.push(JournalService.createCreditLine(invAcct || DEFAULT_ACCOUNTS.inventory, amt, `Inventory reversal ${pr.referenceNo || pr.referenceNo}`));
+    }
+
+    // Post journal
+    const supplier = await (require('../models/Supplier')).findById(pr.supplier).lean();
+    const narration = `Purchase Return - ${supplier ? supplier.name : ''} - GRN#${grn.referenceNo} - PRN#${pr.referenceNo}`;
+
+    let je;
     try {
-      const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-      const total = purchaseReturn.grandTotal || 0;
-      const vatAmount = purchaseReturn.totalTax || 0;
-      const subtotal = total - vatAmount;
-      
-      const lines = [];
-      
-      // Debit: Accounts Payable (to reduce the payable)
-      if (purchaseReturn.accountsPayableReduction > 0) {
-        lines.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.accountsPayable,
-          purchaseReturn.accountsPayableReduction,
-          `Purchase Return ${purchaseReturn.purchaseReturnNumber} - AP Reduction`
-        ));
-      } else {
-        lines.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.accountsPayable,
-          total,
-          `Purchase Return ${purchaseReturn.purchaseReturnNumber}`
-        ));
-      }
-      
-      // Credit: Inventory (reduce inventory value)
-      if (subtotal > 0) {
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.inventory,
-          subtotal,
-          `Purchase Return ${purchaseReturn.purchaseReturnNumber} - Inventory`
-        ));
-      }
-      
-      // Credit: VAT Receivable (to reclaim VAT)
-      if (vatAmount > 0) {
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.vatReceivable,
-          vatAmount,
-          `Purchase Return ${purchaseReturn.purchaseReturnNumber} - VAT`
-        ));
-      }
-      
-      await JournalService.createEntry(companyId, req.user.id, {
-        date: purchaseReturn.returnDate || new Date(),
-        description: `Purchase Return ${purchaseReturn.purchaseReturnNumber}`,
-        sourceType: 'purchase_return',
-        sourceId: purchaseReturn._id,
-        sourceReference: purchaseReturn.purchaseReturnNumber,
-        lines,
-        isAutoGenerated: true
-      });
-    } catch (journalError) {
-      console.error('Error creating journal entry for purchase return:', journalError);
-      // Don't fail the approval if journal entry fails
-    }
-
-    res.json({
-      success: true,
-      message: 'Purchase return approved and stock updated',
-      data: purchaseReturn
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Record refund from supplier
-// @route   PUT /api/purchase-returns/:id/refund
-// @access  Private
-exports.recordRefund = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { refundAmount, refundMethod } = req.body;
-    
-    const purchaseReturn = await PurchaseReturn.findOne({
-      _id: req.params.id,
-      company: companyId
-    });
-    
-    if (!purchaseReturn) {
-      return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    }
-    
-    if (purchaseReturn.status !== 'approved') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Only approved purchase returns can have refunds recorded' 
-      });
-    }
-    
-    // Update refund info
-    purchaseReturn.refundAmount = refundAmount || purchaseReturn.grandTotal;
-    purchaseReturn.refundMethod = refundMethod || 'bank_transfer';
-    purchaseReturn.refunded = true;
-    purchaseReturn.refundDate = new Date();
-    
-    // If partially refunded
-    if (refundAmount < purchaseReturn.grandTotal) {
-      purchaseReturn.status = 'partially_refunded';
-    } else {
-      purchaseReturn.status = 'refunded';
-    }
-    
-    await purchaseReturn.save();
-
-    // Create journal entry for refund (Cash/Bank Debit, Accounts Payable Credit)
-    try {
-      const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-      const cashAccount = refundMethod === 'bank' 
-        ? DEFAULT_ACCOUNTS.cashAtBank 
-        : DEFAULT_ACCOUNTS.cashInHand;
-      
-      await JournalService.createEntry(companyId, req.user.id, {
+      je = await JournalService.createEntry(companyId, req.user.id, {
         date: new Date(),
-        description: `Refund for Purchase Return ${purchaseReturn.purchaseReturnNumber}`,
-        sourceType: 'purchase_return_refund',
-        sourceId: purchaseReturn._id,
-        sourceReference: purchaseReturn.purchaseReturnNumber,
-        lines: [
-          JournalService.createDebitLine(cashAccount, refundAmount || purchaseReturn.grandTotal, `Refund for Purchase Return ${purchaseReturn.purchaseReturnNumber}`),
-          JournalService.createCreditLine(DEFAULT_ACCOUNTS.accountsPayable, refundAmount || purchaseReturn.grandTotal, `Refund for Purchase Return ${purchaseReturn.purchaseReturnNumber}`)
-        ],
-        isAutoGenerated: true
+        description: narration,
+        sourceType: 'purchase_return',
+        sourceId: pr._id,
+        sourceReference: pr.referenceNo,
+        lines: journalLines,
+        isAutoGenerated: true,
+        session: useSession ? sess : null
       });
-    } catch (journalError) {
-      console.error('Error creating journal entry for purchase return refund:', journalError);
-      // Don't fail the refund if journal entry fails
-    }
 
-    res.json({
-      success: true,
-      message: 'Refund recorded successfully',
-      data: purchaseReturn
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+      pr.journalEntry = je._id;
+      pr.status = 'confirmed';
+      pr.confirmedBy = req.user.id;
+      pr.confirmedAt = new Date();
+      await pr.save(opts);
 
-// @desc    Delete (cancel) purchase return
-// @route   DELETE /api/purchase-returns/:id
-// @access  Private
-exports.deletePurchaseReturn = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    
-    const purchaseReturn = await PurchaseReturn.findOne({
-      _id: req.params.id,
-      company: companyId
-    });
-    
-    if (!purchaseReturn) {
-      return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    }
-    
-    // Only allow cancelling draft or pending returns
-    if (purchaseReturn.status !== 'draft' && purchaseReturn.status !== 'pending') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Only draft or pending purchase returns can be cancelled' 
-      });
-    }
-    
-    // Soft delete - mark as cancelled
-    purchaseReturn.status = 'cancelled';
-    await purchaseReturn.save();
-    
-    res.json({
-      success: true,
-      message: 'Purchase return cancelled'
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Get purchase return summary
-// @route   GET /api/purchase-returns/summary
-// @access  Private
-exports.getPurchaseReturnSummary = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { startDate, endDate } = req.query;
-    
-    const match = {
-      company: companyId,
-      status: { $in: ['approved', 'refunded', 'partially_refunded'] }
-    };
-    
-    if (startDate || endDate) {
-      match.returnDate = {};
-      if (startDate) match.returnDate.$gte = new Date(startDate);
-      if (endDate) match.returnDate.$lte = new Date(endDate);
-    }
-    
-    const summary = await PurchaseReturn.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: null,
-          totalReturns: { $sum: '$grandTotal' },
-          totalTax: { $sum: '$totalTax' },
-          totalRefunded: { $sum: '$refundAmount' },
-          totalAPReduction: { $sum: '$accountsPayableReduction' },
-          count: { $sum: 1 }
+      return pr;
+    } catch (jeErr) {
+      // If we're inside a real transaction the DB will rollback when the transaction fails.
+      // If not (no session support), perform manual rollback of created resources.
+      if (!useSession) {
+        try {
+          // remove created stock movements
+          if (createdMovements.length) await StockMovement.deleteMany({ _id: { $in: createdMovements } });
+          // restore modified batches
+          for (const b of modifiedBatches) {
+            try {
+              await InventoryBatch.findByIdAndUpdate(b.id, { $set: { availableQuantity: b.prevAvailable } });
+            } catch (e) { /* best-effort */ }
+          }
+          // restore modified products
+          for (const [pid, vals] of modifiedProducts.entries()) {
+            try {
+              await Product.findByIdAndUpdate(pid, { $set: { currentStock: vals.prevStock, averageCost: vals.prevAvg } });
+            } catch (e) { /* best-effort */ }
+          }
+        } catch (rbErr) {
+          console.error('Rollback failed after journal error', rbErr);
         }
       }
-    ]);
-    
-    const result = {
-      totalReturns: summary[0]?.totalReturns || 0,
-      totalTax: summary[0]?.totalTax || 0,
-      totalRefunded: summary[0]?.totalRefunded || 0,
-      totalAPReduction: summary[0]?.totalAPReduction || 0,
-      count: summary[0]?.count || 0
-    };
-    
-    res.json({
-      success: true,
-      data: result
-    });
-  } catch (error) {
-    next(error);
+      throw jeErr;
+    }
+  };
+
+  try {
+    const result = await transactionService.runInTransaction(async (trx) => await doConfirm(trx));
+    res.json({ success: true, message: 'Purchase return confirmed', data: await PurchaseReturn.findById(result._id) });
+  } catch (err) {
+    if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });
+    next(err);
   }
+};
+
+exports.listPurchaseReturns = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const q = { company: companyId };
+    const { supplier_id, grn_id, status, date_from, date_to } = req.query;
+    if (supplier_id) q.supplier = supplier_id;
+    if (grn_id) q.grn = grn_id;
+    if (status) q.status = status;
+    if (date_from || date_to) q.returnDate = {};
+    if (date_from) q.returnDate.$gte = new Date(date_from);
+    if (date_to) q.returnDate.$lte = new Date(date_to);
+
+    const list = await PurchaseReturn.find(q).sort({ createdAt: -1 }).limit(200);
+    res.json({ success: true, data: list });
+  } catch (err) { next(err); }
+};
+
+exports.getPurchaseReturn = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId });
+    if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
+    res.json({ success: true, data: pr });
+  } catch (err) { next(err); }
 };

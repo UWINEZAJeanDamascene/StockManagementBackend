@@ -142,9 +142,9 @@ exports.createSerialNumber = async (req, res, next) => {
       createdSerials.push(newSerial);
     }
 
-    // Update product stock count
+    // Update product stock count (coerce numeric)
     if (createdSerials.length > 0) {
-      product.currentStock += createdSerials.length;
+      product.currentStock = Number(product.currentStock || 0) + Number(createdSerials.length);
       await product.save();
     }
 
@@ -254,7 +254,7 @@ exports.sellSerialNumber = async (req, res, next) => {
     // Update product stock
     const product = await Product.findOne({ _id: serialNumber.product, company: companyId });
     if (product) {
-      product.currentStock = Math.max(0, product.currentStock - 1);
+      product.currentStock = Math.max(0, Number(product.currentStock || 0) - 1);
       product.lastSaleDate = new Date();
       await product.save();
     }
@@ -322,7 +322,7 @@ exports.returnSerialNumber = async (req, res, next) => {
     // Update product stock
     const product = await Product.findOne({ _id: serialNumber.product, company: companyId });
     if (product) {
-      product.currentStock += 1;
+      product.currentStock = Number(product.currentStock || 0) + 1;
       await product.save();
     }
 

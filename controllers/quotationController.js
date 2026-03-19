@@ -8,33 +8,83 @@ const {
   notifyQuotationExpired
 } = require('../services/notificationHelper');
 
+// Error codes
+const ERR_QUOTATION_NOT_FOUND = 'QUOTATION_NOT_FOUND';
+const ERR_QUOTATION_EXPIRED = 'QUOTATION_EXPIRED';
+const ERR_QUOTATION_REJECTED = 'QUOTATION_REJECTED';
+const ERR_QUOTATION_ALREADY_CONVERTED = 'QUOTATION_ALREADY_CONVERTED';
+const ERR_INVALID_STATUS_TRANSITION = 'INVALID_STATUS_TRANSITION';
+const ERR_INACTIVE_PRODUCT = 'INACTIVE_PRODUCT';
+
+// @desc    Validate products on quotation (check is_active)
+// @access  Private
+const validateQuotationProducts = async (lines, companyId) => {
+  const inactiveProducts = [];
+  
+  for (const line of lines) {
+    const product = await Product.findOne({ _id: line.product, company: companyId });
+    if (!product) {
+      inactiveProducts.push({ product: line.product, reason: 'Product not found' });
+    } else if (!product.isActive) {
+      inactiveProducts.push({ product: line.product, name: product.name, reason: 'Product is inactive' });
+    }
+  }
+  
+  return inactiveProducts;
+};
+
+// @desc    Check if quotation is expired
+// @access  Private
+const isQuotationExpired = (quotation) => {
+  if (!quotation.expiryDate) return false;
+  return new Date() > new Date(quotation.expiryDate);
+};
+
 // @desc    Get all quotations
 // @route   GET /api/quotations
 // @access  Private
 exports.getQuotations = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { page = 1, limit = 20, status, clientId, startDate, endDate } = req.query;
+    const { 
+      page = 1, 
+      limit = 20, 
+      status, 
+      clientId, 
+      client_id,
+      date_from, 
+      date_to, 
+      expiry_before 
+    } = req.query;
     const query = { company: companyId };
 
+    // Filter by status
     if (status) {
       query.status = status;
     }
 
-    if (clientId) {
-      query.client = clientId;
+    // Filter by client (support both clientId and client_id)
+    const clientFilter = clientId || client_id;
+    if (clientFilter) {
+      query.client = clientFilter;
     }
 
-    if (startDate || endDate) {
-      query.createdAt = {};
-      if (startDate) query.createdAt.$gte = new Date(startDate);
-      if (endDate) query.createdAt.$lte = new Date(endDate);
+    // Filter by quotation date range
+    if (date_from || date_to) {
+      query.quotationDate = {};
+      if (date_from) query.quotationDate.$gte = new Date(date_from);
+      if (date_to) query.quotationDate.$lte = new Date(date_to);
+    }
+
+    // Filter by expiry before date (for expired quotations)
+    if (expiry_before) {
+      query.expiryDate = { $lte: new Date(expiry_before) };
     }
 
     const total = await Quotation.countDocuments(query);
     const quotations = await Quotation.find(query)
       .populate('client', 'name code contact taxId')
-      .populate('items.product', 'name sku unit')
+      .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
       .populate('approvedBy', 'name email')
       .sort({ createdAt: -1 })
@@ -62,7 +112,7 @@ exports.getQuotation = async (req, res, next) => {
     const companyId = req.user.company._id;
     const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId })
       .populate('client', 'name code contact type taxId')
-      .populate('items.product', 'name sku unit')
+      .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
       .populate('approvedBy', 'name email')
       .populate('convertedToInvoice');
@@ -89,39 +139,58 @@ exports.getQuotation = async (req, res, next) => {
 exports.createQuotation = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { items } = req.body;
+    const { lines } = req.body;
 
-    // Calculate item totals and prefer product tax defaults when available
-    const processedItems = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const product = await Product.findOne({ _id: item.product, company: companyId });
-      const subtotal = item.quantity * item.unitPrice;
-      const discount = item.discount || 0;
-      const netAmount = subtotal - discount;
-      const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
-      const taxCode = item.taxCode || product?.taxCode || 'A';
-      const taxAmount = netAmount * (taxRate / 100);
-      const total = netAmount + taxAmount;
-      processedItems.push({
-        ...item,
-        itemCode: item.itemCode || `ITEM-${i + 1}`,
-        taxCode,
+    // Validate products are active
+    const inactiveProducts = await validateQuotationProducts(lines, companyId);
+    if (inactiveProducts.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: ERR_INACTIVE_PRODUCT,
+        message: 'One or more products are inactive',
+        inactiveProducts
+      });
+    }
+
+    // Calculate line totals and prefer product tax defaults when available
+    const processedLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const product = await Product.findOne({ _id: line.product, company: companyId });
+      
+      // Get values as numbers
+      const qty = parseFloat(line.qty || line.quantity || 0);
+      const unitPrice = parseFloat(line.unitPrice || 0);
+      const discountPct = parseFloat(line.discountPct || line.discount || 0);
+      const taxRate = parseFloat(line.taxRate != null ? line.taxRate : (product?.taxRate != null ? product.taxRate : 0));
+      
+      // Calculate line totals
+      const lineSubtotal = qty * unitPrice;
+      const lineDiscount = lineSubtotal * (discountPct / 100);
+      const lineTotalAfterDiscount = lineSubtotal - lineDiscount;
+      const lineTax = lineTotalAfterDiscount * (taxRate / 100);
+      const lineTotal = lineTotalAfterDiscount;
+      
+      processedLines.push({
+        ...line,
+        product: line.product,
+        qty,
+        unitPrice,
+        discountPct,
         taxRate,
-        subtotal,
-        taxAmount,
-        total
+        lineTotal,
+        lineTax
       });
     }
 
     const quotation = await Quotation.create({
       ...req.body,
       company: companyId,
-      items: processedItems,
+      lines: processedLines,
       createdBy: req.user.id
     });
 
-    await quotation.populate('client items.product createdBy');
+    await quotation.populate('client lines.product createdBy');
 
     res.status(201).json({
       success: true,
@@ -153,25 +222,59 @@ exports.updateQuotation = async (req, res, next) => {
       });
     }
 
-    // Only draft and sent quotations can be updated
-    if (!['draft', 'sent'].includes(quotation.status)) {
+    // Only draft quotations can be fully edited
+    // For sent quotations, we reset to draft first
+    if (quotation.status === 'sent' && req.body.lines) {
+      // Editing a sent quotation requires reset to draft
+      req.body.status = 'draft';
+    } else if (!['draft'].includes(quotation.status)) {
       return res.status(400).json({
         success: false,
-        message: `Cannot update quotation with status: ${quotation.status}`
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: `Cannot update quotation with status: ${quotation.status}. Only draft quotations can be edited.`
       });
     }
 
-    // Recalculate item totals if items are updated
-    if (req.body.items) {
-      req.body.items = req.body.items.map(item => {
-        const subtotal = item.quantity * item.unitPrice;
-        const total = subtotal - (item.discount || 0) + (subtotal * (item.taxRate || 0) / 100);
-        return {
-          ...item,
-          subtotal,
-          total
-        };
-      });
+    // Validate products are active if lines are being updated
+    if (req.body.lines) {
+      const inactiveProducts = await validateQuotationProducts(req.body.lines, companyId);
+      if (inactiveProducts.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: ERR_INACTIVE_PRODUCT,
+          message: 'One or more products are inactive',
+          inactiveProducts
+        });
+      }
+    }
+
+    // Recalculate line totals if lines are updated
+    if (req.body.lines) {
+      const processedLines = [];
+      for (let i = 0; i < req.body.lines.length; i++) {
+        const line = req.body.lines[i];
+        const qty = parseFloat(line.qty || line.quantity || 0);
+        const unitPrice = parseFloat(line.unitPrice || 0);
+        const discountPct = parseFloat(line.discountPct || line.discount || 0);
+        const taxRate = parseFloat(line.taxRate || 0);
+        
+        const lineSubtotal = qty * unitPrice;
+        const lineDiscount = lineSubtotal * (discountPct / 100);
+        const lineTotalAfterDiscount = lineSubtotal - lineDiscount;
+        const lineTax = lineTotalAfterDiscount * (taxRate / 100);
+        const lineTotal = lineTotalAfterDiscount;
+        
+        processedLines.push({
+          ...line,
+          qty,
+          unitPrice,
+          discountPct,
+          taxRate,
+          lineTotal,
+          lineTax
+        });
+      }
+      req.body.lines = processedLines;
     }
 
     quotation = await Quotation.findOneAndUpdate(
@@ -179,7 +282,7 @@ exports.updateQuotation = async (req, res, next) => {
       req.body,
       { new: true, runValidators: true }
     )
-      .populate('client items.product createdBy');
+      .populate('client lines.product createdBy');
 
     res.json({
       success: true,
@@ -224,10 +327,18 @@ exports.deleteQuotation = async (req, res, next) => {
   }
 };
 
-// @desc    Approve quotation
+// @desc    Approve quotation (deprecated - use acceptQuotation)
 // @route   PUT /api/quotations/:id/approve
 // @access  Private (admin, stock_manager)
 exports.approveQuotation = async (req, res, next) => {
+  // Redirect to acceptQuotation
+  return exports.acceptQuotation(req, res, next);
+};
+
+// @desc    Send quotation
+// @route   POST /api/quotations/:id/send
+// @access  Private (admin, stock_manager, sales)
+exports.sendQuotation = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId });
@@ -235,18 +346,70 @@ exports.approveQuotation = async (req, res, next) => {
     if (!quotation) {
       return res.status(404).json({
         success: false,
+        error: ERR_QUOTATION_NOT_FOUND,
         message: 'Quotation not found'
       });
     }
 
-    if (quotation.status !== 'sent') {
+    // Only draft quotations can be sent
+    if (quotation.status !== 'draft') {
       return res.status(400).json({
         success: false,
-        message: 'Only sent quotations can be approved'
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: `Cannot send quotation with status: ${quotation.status}. Only draft quotations can be sent.`
       });
     }
 
-    quotation.status = 'approved';
+    quotation.status = 'sent';
+    await quotation.save();
+
+    res.json({
+      success: true,
+      message: 'Quotation sent successfully',
+      data: quotation
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Accept quotation
+// @route   POST /api/quotations/:id/accept
+// @access  Private (admin, stock_manager)
+exports.acceptQuotation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId });
+
+    if (!quotation) {
+      return res.status(404).json({
+        success: false,
+        error: ERR_QUOTATION_NOT_FOUND,
+        message: 'Quotation not found'
+      });
+    }
+
+    // Only sent quotations can be accepted
+    if (quotation.status !== 'sent') {
+      return res.status(400).json({
+        success: false,
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: 'Only sent quotations can be accepted'
+      });
+    }
+
+    // Check if quotation is expired
+    if (isQuotationExpired(quotation)) {
+      quotation.status = 'expired';
+      await quotation.save();
+      return res.status(409).json({
+        success: false,
+        error: ERR_QUOTATION_EXPIRED,
+        message: 'Quotation has expired and cannot be accepted'
+      });
+    }
+
+    quotation.status = 'accepted';
     quotation.approvedBy = req.user.id;
     quotation.approvedDate = new Date();
 
@@ -254,10 +417,10 @@ exports.approveQuotation = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Quotation approved successfully',
+      message: 'Quotation accepted successfully',
       data: quotation
     });
-    // Notify quotation approved
+    // Notify quotation accepted
     try {
       await notifyQuotationApproved(companyId, quotation, quotation.convertedToInvoice || null);
     } catch (e) {
@@ -268,58 +431,118 @@ exports.approveQuotation = async (req, res, next) => {
   }
 };
 
+// @desc    Reject quotation
+// @route   POST /api/quotations/:id/reject
+// @access  Private (admin, stock_manager)
+exports.rejectQuotation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId });
+
+    if (!quotation) {
+      return res.status(404).json({
+        success: false,
+        error: ERR_QUOTATION_NOT_FOUND,
+        message: 'Quotation not found'
+      });
+    }
+
+    // Only sent quotations can be rejected
+    if (!['draft', 'sent'].includes(quotation.status)) {
+      return res.status(400).json({
+        success: false,
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: `Cannot reject quotation with status: ${quotation.status}. Only draft or sent quotations can be rejected.`
+      });
+    }
+
+    quotation.status = 'rejected';
+    await quotation.save();
+
+    res.json({
+      success: true,
+      message: 'Quotation rejected successfully',
+      data: quotation
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Convert quotation to invoice
-// @route   POST /api/quotations/:id/convert-to-invoice
+// @route   POST /api/quotations/:id/convert
 // @access  Private (admin, stock_manager, sales)
 exports.convertToInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId })
-      .populate('items.product');
+      .populate('lines.product');
 
     if (!quotation) {
       return res.status(404).json({
         success: false,
+        error: ERR_QUOTATION_NOT_FOUND,
         message: 'Quotation not found'
       });
     }
 
-    // Accept approved status case-insensitively and trim whitespace
-    const status = (quotation.status || '').toString().trim().toLowerCase();
-    if (status !== 'approved') {
-      console.warn(`Attempt to convert quotation ${quotation._id} with status='${quotation.status}'`);
-      return res.status(400).json({
+    // Check if quotation is expired
+    if (isQuotationExpired(quotation)) {
+      quotation.status = 'expired';
+      await quotation.save();
+      return res.status(409).json({
         success: false,
-        message: 'Only approved quotations can be converted to invoice'
+        error: ERR_QUOTATION_EXPIRED,
+        message: 'Expired quotations cannot be converted to invoice'
       });
     }
 
-    if (quotation.convertedToInvoice) {
+    // Check if quotation is rejected
+    if (quotation.status === 'rejected') {
+      return res.status(409).json({
+        success: false,
+        error: ERR_QUOTATION_REJECTED,
+        message: 'Rejected quotations cannot be converted to invoice'
+      });
+    }
+
+    // Check if quotation is already converted
+    if (quotation.status === 'converted' || quotation.convertedToInvoice) {
       return res.status(400).json({
         success: false,
+        error: ERR_QUOTATION_ALREADY_CONVERTED,
         message: 'Quotation has already been converted to invoice'
       });
     }
 
+    // Only accepted quotations can be converted
+    if (quotation.status !== 'accepted') {
+      return res.status(400).json({
+        success: false,
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: 'Only accepted quotations can be converted to invoice'
+      });
+    }
+
     // Create invoice from quotation
-    // Ensure items include invoice's required fields (subtotal, taxAmount, totalWithTax)
-    const processedItems = (quotation.items || []).map((item, idx) => {
-      const quantity = item.quantity || 0;
-      const unitPrice = item.unitPrice || item.unitPrice || 0;
-      const discount = item.discount || 0;
+    // Ensure lines include invoice's required fields
+    const processedItems = (quotation.lines || []).map((line, idx) => {
+      const quantity = parseFloat(line.qty || line.quantity || 0);
+      const unitPrice = parseFloat(line.unitPrice || 0);
+      const discount = parseFloat(line.discountPct || line.discount || 0);
       const subtotal = quantity * unitPrice;
-      const netAmount = subtotal - discount;
-      const taxRate = (item.taxRate != null) ? item.taxRate : (item.product?.taxRate != null ? item.product.taxRate : 0);
-      const taxCode = item.taxCode || item.product?.taxCode || 'A';
+      const netAmount = subtotal - (quantity * unitPrice * discount / 100);
+      const taxRate = parseFloat(line.taxRate != null ? line.taxRate : (line.product?.taxRate != null ? line.product.taxRate : 0));
+      const taxCode = line.taxCode || line.product?.taxCode || 'A';
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
 
       return {
-        product: item.product,
-        itemCode: item.itemCode || `ITEM-${idx + 1}`,
-        description: item.description || (item.product && item.product.name) || '',
+        product: line.product,
+        itemCode: line.itemCode || `ITEM-${idx + 1}`,
+        description: line.description || (line.product && line.product.name) || '',
         quantity,
-        unit: item.unit || (item.product && item.product.unit) || '',
+        unit: line.unit || (line.product && line.product.unit) || '',
         unitPrice,
         discount,
         taxCode,
@@ -373,7 +596,7 @@ exports.getClientQuotations = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const quotations = await Quotation.find({ client: req.params.clientId, company: companyId })
-      .populate('items.product', 'name sku')
+      .populate('lines.product', 'name sku')
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
 
@@ -393,7 +616,7 @@ exports.getClientQuotations = async (req, res, next) => {
 exports.getProductQuotations = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const quotations = await Quotation.find({ 'items.product': req.params.productId, company: companyId })
+    const quotations = await Quotation.find({ 'lines.product': req.params.productId, company: companyId })
       .populate('client', 'name code')
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
@@ -416,7 +639,7 @@ exports.generateQuotationPDF = async (req, res, next) => {
     const companyId = req.user.company._id;
     const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId })
       .populate('client')
-      .populate('items.product')
+      .populate('lines.product')
       .populate('createdBy');
 
     if (!quotation) {
@@ -431,7 +654,7 @@ exports.generateQuotationPDF = async (req, res, next) => {
 
     // Set response headers
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=quotation-${quotation.quotationNumber}.pdf`);
+    res.setHeader('Content-Disposition', `attachment; filename=quotation-${quotation.referenceNo}.pdf`);
 
     // Pipe PDF to response
     doc.pipe(res);
@@ -466,9 +689,9 @@ exports.generateQuotationPDF = async (req, res, next) => {
       const startY = doc.y;
       const lineHeight = 14;
       const leftLines = [
-        `Quotation Number: ${quotation.quotationNumber}`,
-        `Date: ${new Date(quotation.createdAt).toLocaleDateString()}`,
-        `Valid Until: ${quotation.validUntil ? new Date(quotation.validUntil).toLocaleDateString() : 'N/A'}`,
+        `Quotation Number: ${quotation.referenceNo}`,
+        `Date: ${new Date(quotation.quotationDate || quotation.createdAt).toLocaleDateString()}`,
+        `Valid Until: ${quotation.expiryDate ? new Date(quotation.expiryDate).toLocaleDateString() : 'N/A'}`,
         `Status: ${quotation.status?.toUpperCase() || 'N/A'}`
       ];
 
@@ -522,15 +745,15 @@ exports.generateQuotationPDF = async (req, res, next) => {
     renderTableHeader(y);
     y += 34;
 
-    // Items
+    // Lines
     doc.fontSize(9).font('Helvetica');
-    for (let idx = 0; idx < quotation.items.length; idx++) {
-      const item = quotation.items[idx];
-      const desc = item.product?.name || item.description || '';
-      const unit = item.unit || (item.product?.unit || '');
-      const qty = String(item.quantity || '');
-      const unitPrice = `RWF ${Number(item.unitPrice || 0).toFixed(2)}`;
-      const total = `RWF ${Number(item.total || item.totalWithTax || 0).toFixed(2)}`;
+    for (let idx = 0; idx < quotation.lines.length; idx++) {
+      const line = quotation.lines[idx];
+      const desc = line.product?.name || line.description || '';
+      const unit = line.unit || (line.product?.unit || '');
+      const qty = String(line.qty || line.quantity || '');
+      const unitPrice = `RWF ${Number(line.unitPrice || 0).toFixed(2)}`;
+      const total = `RWF ${Number(line.lineTotal || line.total || 0).toFixed(2)}`;
 
       // Measure heights for all cells (so rows expand for any wrapped column)
       const hNo = doc.heightOfString(String(idx + 1), { width: colWidths[0] });
@@ -605,10 +828,10 @@ exports.generateQuotationPDF = async (req, res, next) => {
     doc.text(`${Number(quotation.subtotal || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
     ty += 20;
     doc.text(`VAT (18%):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.totalTax || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
+    doc.text(`${Number(quotation.taxAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
     ty += 22;
     doc.font('Helvetica-Bold').fontSize(12).text(`Value Total Amount (RWF):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.grandTotal || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
+    doc.text(`${Number(quotation.totalAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
     doc.font('Helvetica').fontSize(10);
     // Advance y past totals box
     y = totalsY + totalsBoxHeight + 12;

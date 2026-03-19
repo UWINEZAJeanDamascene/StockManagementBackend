@@ -1,5 +1,10 @@
+const mongoose = require('mongoose');
 const JournalEntry = require('../models/JournalEntry');
+const AccountBalance = require('../models/AccountBalance');
+const cacheService = require('../services/cacheService');
 const { CHART_OF_ACCOUNTS, getAccount, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const accountMappingService = require('./accountMappingService');
+const periodService = require('./periodService');
 
 /**
  * Journal Entry Service
@@ -33,9 +38,28 @@ class JournalService {
       throw new Error('Journal entry must have at least 2 lines');
     }
 
+    // Idempotency: if a sourceType + sourceId is provided, return existing entry
+    // to avoid creating duplicate journal entries for the same source event.
+    if (sourceType && sourceId) {
+      try {
+        const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId });
+        if (existing) return existing;
+      } catch (err) {
+        // Non-fatal - proceed to create and rely on unique index to prevent duplicates
+      }
+    }
+
     // Calculate totals
     const totalDebit = lines.reduce((sum, line) => sum + (line.debit || 0), 0);
     const totalCredit = lines.reduce((sum, line) => sum + (line.credit || 0), 0);
+
+    // Period lock check - ensure target date is not within a closed period
+    const targetDate = date instanceof Date ? date : new Date(date);
+    if (await periodService.isDateInClosedPeriod(companyId, targetDate)) {
+      const err = new Error('Target accounting period is closed');
+      err.code = 'PERIOD_CLOSED';
+      throw err;
+    }
 
     // Validate balance
     if (Math.abs(totalDebit - totalCredit) > 0.01) {
@@ -45,10 +69,8 @@ class JournalService {
     // Generate entry number
     const entryNumber = await JournalEntry.generateEntryNumber(companyId);
 
-    // Create entry
-    let entry;
-    try {
-      entry = await JournalEntry.create({
+    // Prepare document
+    const doc = {
       company: companyId,
       entryNumber,
       date,
@@ -64,14 +86,124 @@ class JournalService {
       postedBy: userId,
       status: 'posted',
       notes
-      });
-    } catch (err) {
-      const enhanced = new Error(`JournalService.createEntry failed: ${err.message}`);
-      enhanced.cause = err;
-      throw enhanced;
+    };
+
+    // If a session is provided in options, use it. Otherwise, attempt to run in a transaction
+    const session = options.session || null;
+
+    const createFn = async (sess) => {
+      // Use document save to pass session option
+      const entryDoc = new JournalEntry(doc);
+      const saved = await entryDoc.save({ session: sess });
+
+      // Update account balances for each line (atomic when session provided)
+      try {
+        for (const line of lines) {
+          const deltaDebit = line.debit || 0;
+          const deltaCredit = line.credit || 0;
+          // adjust will upsert and increment debit/credit
+          await AccountBalance.adjust(doc.company, line.accountCode, deltaDebit, deltaCredit, { session: sess });
+        }
+      } catch (balErr) {
+        // Re-throw so transaction can abort when using withTransaction
+        throw balErr;
+      }
+
+      // If no session provided (non-transactional create), invalidate report cache (best-effort)
+      if (!sess) {
+        try {
+          await cacheService.invalidateByCompany(doc.company, 'report');
+        } catch (e) {
+          console.error('Failed to invalidate report cache after createEntry', e);
+        }
+      }
+
+      return saved;
+    };
+
+    // Coerce Decimal128 fields on returned entries to plain JS numbers for callers/tests
+    function coerceSavedEntry(entry) {
+      if (!entry) return entry;
+      try {
+        const target = entry._doc || entry;
+        if (target.totalDebit !== undefined && target.totalDebit != null) {
+          try { target.totalDebit = Number(target.totalDebit.toString()); } catch (e) {}
+        }
+        if (target.totalCredit !== undefined && target.totalCredit != null) {
+          try { target.totalCredit = Number(target.totalCredit.toString()); } catch (e) {}
+        }
+        if (Array.isArray(target.lines)) {
+          target.lines.forEach(l => {
+            if (l.debit !== undefined && l.debit != null) {
+              try { l.debit = Number(l.debit.toString()); } catch (e) {}
+            }
+            if (l.credit !== undefined && l.credit != null) {
+              try { l.credit = Number(l.credit.toString()); } catch (e) {}
+            }
+          });
+        }
+      } catch (e) {}
+      return entry;
     }
 
-    return entry;
+    // If caller provided a session, use it (caller manages transaction)
+    if (session) {
+      try {
+        const entry = await createFn(session);
+        return coerceSavedEntry(entry);
+      } catch (err) {
+        if (err && err.code === 11000 && sourceType && sourceId) {
+          const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId });
+          if (existing) return existing;
+        }
+        const enhanced = new Error(`JournalService.createEntry failed: ${err.message}`);
+        enhanced.cause = err;
+        throw enhanced;
+      }
+    }
+
+    // No session provided - attempt to start a session and run a transaction if supported
+    let sessionStarted = null;
+    try {
+      sessionStarted = await mongoose.startSession();
+      let resultEntry = null;
+
+      await sessionStarted.withTransaction(async (trxSession) => {
+        try {
+          resultEntry = await createFn(trxSession);
+        } catch (err) {
+          // If duplicate key error, attempt to find existing and return it (abort will be handled by withTransaction)
+          if (err && err.code === 11000 && sourceType && sourceId) {
+            const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId }).session(trxSession);
+            if (existing) {
+              resultEntry = existing;
+              return;
+            }
+          }
+          throw err;
+        }
+      });
+
+      return coerceSavedEntry(resultEntry);
+    } catch (err) {
+      // If transactions not supported or any other error, fallback to non-transactional create
+      if (sessionStarted) sessionStarted.endSession();
+
+      try {
+        const entry = await createFn(null);
+        return coerceSavedEntry(entry);
+      } catch (err2) {
+        if (err2 && err2.code === 11000 && sourceType && sourceId) {
+          const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId });
+          if (existing) return existing;
+        }
+        const enhanced = new Error(`JournalService.createEntry failed: ${err2.message}`);
+        enhanced.cause = err2;
+        throw enhanced;
+      }
+    } finally {
+      if (sessionStarted) sessionStarted.endSession();
+    }
   }
 
   /**
@@ -113,23 +245,25 @@ class JournalService {
    * Debit: Accounts Receivable
    * Credit: Sales Revenue + VAT
    */
-  static async createInvoiceEntry(companyId, userId, invoice) {
+  static async createInvoiceEntry(companyId, userId, invoice, options = {}) {
     const lines = [];
     const total = invoice.total || 0;
     const vatAmount = invoice.vatAmount || 0;
     const subtotal = total - vatAmount;
 
     // Debit: Accounts Receivable
+    const arAccount = await this.getMappedAccountCode(companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable);
     lines.push(this.createDebitLine(
-      DEFAULT_ACCOUNTS.accountsReceivable,
+      arAccount,
       total,
       `Invoice ${invoice.invoiceNumber} - Receivable`
     ));
 
     // Credit: Sales Revenue
     if (subtotal > 0) {
+      const salesAcct = await this.getMappedAccountCode(companyId, 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue);
       lines.push(this.createCreditLine(
-        DEFAULT_ACCOUNTS.salesRevenue,
+        salesAcct,
         subtotal,
         `Invoice ${invoice.invoiceNumber} - Revenue`
       ));
@@ -137,8 +271,9 @@ class JournalService {
 
     // Credit: VAT Payable
     if (vatAmount > 0) {
+      const vatAcct = await this.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
       lines.push(this.createCreditLine(
-        DEFAULT_ACCOUNTS.vatPayable,
+        vatAcct,
         vatAmount,
         `Invoice ${invoice.invoiceNumber} - VAT`
       ));
@@ -152,6 +287,49 @@ class JournalService {
       sourceReference: invoice.invoiceNumber,
       lines,
       isAutoGenerated: true
+    }, { session: options.session });
+  }
+
+  /**
+   * Create COGS journal entry for a sale (single aggregated entry)
+   * Debit: Cost of Goods Sold
+   * Credit: Inventory
+   * options may include { session }
+   */
+  static async createSaleCOGSEntry(companyId, userId, payload, options = {}) {
+    const { invoiceId, invoiceNumber, date, totalCost = 0 } = payload;
+    const lines = [];
+
+    if (!totalCost || totalCost <= 0) {
+      // nothing to record
+      return null;
+    }
+
+    // Debit: Cost of Goods Sold
+    const cogsAcct = await this.getMappedAccountCode(companyId, 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold);
+    lines.push(this.createDebitLine(
+      cogsAcct,
+      totalCost,
+      `COGS for Invoice ${invoiceNumber}`
+    ));
+
+    // Credit: Inventory
+    const invAcct = await this.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory);
+    lines.push(this.createCreditLine(
+      invAcct,
+      totalCost,
+      `Inventory reduction for Invoice ${invoiceNumber}`
+    ));
+
+    return this.createEntry(companyId, userId, {
+      date: date || new Date(),
+      description: `COGS for ${invoiceNumber}`,
+      sourceType: 'cogs',
+      sourceId: invoiceId,
+      sourceReference: invoiceNumber,
+      lines,
+      isAutoGenerated: true,
+      session: options.session
     });
   }
 
@@ -188,8 +366,9 @@ class JournalService {
     ));
 
     // Credit: Accounts Receivable
+    const arAccount = await this.getMappedAccountCode(companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable);
     lines.push(this.createCreditLine(
-      DEFAULT_ACCOUNTS.accountsReceivable,
+      arAccount,
       payment.amount,
       `Payment for ${payment.invoiceNumber}`
     ));
@@ -248,8 +427,9 @@ class JournalService {
 
     // Debit: Sales Returns
     if (subtotal > 0) {
+      const salesReturnsAcct = await this.getMappedAccountCode(companyId, 'sales', 'salesReturns', DEFAULT_ACCOUNTS.salesReturns);
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.salesReturns,
+        salesReturnsAcct,
         subtotal,
         `Credit Note ${creditNote.creditNoteNumber} - Returns`
       ));
@@ -257,8 +437,9 @@ class JournalService {
 
     // Debit: VAT Payable (not VAT Receivable - this is a reduction of output VAT)
     if (vatAmount > 0) {
+      const vatAcct = await this.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.vatPayable,
+        vatAcct,
         vatAmount,
         `Credit Note ${creditNote.creditNoteNumber} - VAT`
       ));
@@ -274,8 +455,9 @@ class JournalService {
       ));
     } else {
       // No immediate refund - reduce AR instead
+      const arAccount = await this.getMappedAccountCode(companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable);
       lines.push(this.createCreditLine(
-        DEFAULT_ACCOUNTS.accountsReceivable,
+        arAccount,
         total,
         `Credit Note ${creditNote.creditNoteNumber}`
       ));
@@ -318,7 +500,7 @@ class JournalService {
    * Debit: Inventory + VAT
    * Credit: Accounts Payable
    */
-  static async createPurchaseEntry(companyId, userId, purchase) {
+  static async createPurchaseEntry(companyId, userId, purchase, options = {}) {
     const lines = [];
     const total = purchase.total || 0;
     const vatAmount = purchase.vatAmount || 0;
@@ -326,8 +508,9 @@ class JournalService {
 
     // Debit: Inventory
     if (subtotal > 0) {
+      const invAcct = await this.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory);
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.inventory,
+        invAcct,
         subtotal,
         `Purchase ${purchase.purchaseNumber} - Inventory`
       ));
@@ -335,16 +518,18 @@ class JournalService {
 
     // Debit: VAT Receivable
     if (vatAmount > 0) {
+      const vatRecv = await this.getMappedAccountCode(companyId, 'purchases', 'vatReceivable', DEFAULT_ACCOUNTS.vatReceivable);
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.vatReceivable,
+        vatRecv,
         vatAmount,
         `Purchase ${purchase.purchaseNumber} - VAT`
       ));
     }
 
     // Credit: Accounts Payable
+    const apAcct = await this.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
     lines.push(this.createCreditLine(
-      DEFAULT_ACCOUNTS.accountsPayable,
+      apAcct,
       total,
       `Purchase ${purchase.purchaseNumber}`
     ));
@@ -357,7 +542,7 @@ class JournalService {
       sourceReference: purchase.purchaseNumber,
       lines,
       isAutoGenerated: true
-    });
+    }, { session: options.session });
   }
 
   /**
@@ -387,7 +572,7 @@ class JournalService {
 
     // Debit: Accounts Payable
     lines.push(this.createDebitLine(
-      DEFAULT_ACCOUNTS.accountsPayable,
+      await this.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable),
       payment.amount,
       `Payment for ${payment.purchaseNumber}`
     ));
@@ -752,6 +937,42 @@ class JournalService {
   // =====================================================
   // HELPER METHODS
   // =====================================================
+
+  /**
+   * Resolve a company-scoped account code via AccountMapping.
+   * Falls back to provided fallback or DEFAULT_ACCOUNTS[key].
+   */
+  static async getMappedAccountCode(companyId, moduleName, key, fallback, context = {}) {
+    try {
+      // If context provides a warehouseId, and the mapping requested is inventory, prefer warehouse-specific inventory account
+      if (context && context.warehouseId && (key === 'inventory' || key === 'inventoryAccount' || key === 'inventory_account')) {
+        try {
+          const Warehouse = require('../models/Warehouse');
+          const wh = await Warehouse.findOne({ _id: context.warehouseId, company: companyId }).lean();
+          if (wh && wh.inventoryAccount) return wh.inventoryAccount;
+        } catch (e) {
+          // ignore and fallback
+        }
+      }
+
+      // If context provides a productId, prefer product-level account when no warehouse-specific account
+      if (context && context.productId && (key === 'inventory' || key === 'inventoryAccount' || key === 'inventory_account')) {
+        try {
+          const Product = require('../models/Product');
+          const prod = await Product.findOne({ _id: context.productId, company: companyId }).lean();
+          if (prod && prod.inventoryAccount) return prod.inventoryAccount;
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      const code = await accountMappingService.resolve(companyId, moduleName, key, fallback);
+      return code || fallback;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
 
   /**
    * Get asset account code based on category

@@ -2,6 +2,9 @@ const JournalEntry = require('../models/JournalEntry');
 const FixedAsset = require('../models/FixedAsset');
 const { CHART_OF_ACCOUNTS, getAccount, getAccountsByType, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const JournalService = require('../services/journalService');
+const AccountBalance = require('../models/AccountBalance');
+const cacheService = require('../services/cacheService');
+const { runInTransaction } = require('../services/transactionService');
 
 // @desc    Get all journal entries
 // @route   GET /api/journal-entries
@@ -159,109 +162,139 @@ exports.postJournalEntry = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const userId = req.user._id;
+    const result = await runInTransaction(async (trx) => {
+      const useSession = !!trx;
+      const opts = useSession ? { session: trx } : {};
 
-    const entry = await JournalEntry.findOne({ _id: req.params.id, company: companyId });
-    if (!entry) {
-      return res.status(404).json({ success: false, message: 'Journal entry not found' });
-    }
+      const entry = useSession
+        ? await JournalEntry.findOne({ _id: req.params.id, company: companyId }).session(trx)
+        : await JournalEntry.findOne({ _id: req.params.id, company: companyId });
 
-    if (entry.status === 'posted') {
-      return res.status(400).json({ success: false, message: 'Entry is already posted' });
-    }
+      if (!entry) throw Object.assign(new Error('Journal entry not found'), { statusCode: 404 });
+      if (entry.status === 'posted') throw Object.assign(new Error('Entry is already posted'), { statusCode: 400 });
+      if (entry.status === 'voided') throw Object.assign(new Error('Cannot post a voided entry'), { statusCode: 400 });
+      if (!entry.isBalanced()) throw Object.assign(new Error('Cannot post unbalanced entry'), { statusCode: 400 });
 
-    if (entry.status === 'voided') {
-      return res.status(400).json({ success: false, message: 'Cannot post a voided entry' });
-    }
+      const periodService = require('../services/periodService');
+      if (await periodService.isDateInClosedPeriod(companyId, entry.date)) {
+        throw Object.assign(new Error('Accounting period is closed'), { statusCode: 400, code: 'PERIOD_CLOSED' });
+      }
 
-    // Ensure the entry is balanced before posting
-    if (!entry.isBalanced()) {
-      return res.status(400).json({ success: false, message: 'Cannot post unbalanced entry' });
-    }
+      entry.status = 'posted';
+      entry.postedBy = userId;
+      const postedEntry = await entry.save(opts);
 
-    entry.status = 'posted';
-    entry.postedBy = userId;
-    await entry.save();
+      for (const line of entry.lines) {
+        const deltaDebit = line.debit || 0;
+        const deltaCredit = line.credit || 0;
+        await AccountBalance.adjust(companyId, line.accountCode, deltaDebit, deltaCredit, opts);
+      }
 
-    res.json({ success: true, data: entry });
+      try {
+        await cacheService.invalidateByCompany(companyId, 'report');
+      } catch (cacheErr) {
+        console.error('Failed to invalidate report cache after posting entry', cacheErr);
+      }
+
+      return postedEntry;
+    });
+
+    return res.json({ success: true, data: result });
   } catch (error) {
+    if (error && error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
+    console.error('reverseJournalEntry error:', error && error.stack ? error.stack : error);
     next(error);
   }
 };
 
-// @desc    Update journal entry (draft only)
-// @route   PUT /api/journal-entries/:id
-// @access  Private
-exports.updateJournalEntry = async (req, res, next) => {
+// @desc    Reverse a posted journal entry
+// @route   POST /api/journal-entries/:id/reverse
+// @access  Private (accountant/admin)
+exports.reverseJournalEntry = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const userId = req.user._id;
+    const reason = req.body.reason || null;
+
     
-    let entry = await JournalEntry.findOne({ 
-      _id: req.params.id, 
-      company: companyId 
-    });
-    
-    if (!entry) {
-      return res.status(404).json({ success: false, message: 'Journal entry not found' });
-    }
-    
-    // Only allow editing draft entries
-    if (entry.status !== 'draft') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Only draft entries can be edited' 
-      });
-    }
-    
-    const { date, description, lines, notes, sourceType, sourceReference } = req.body;
-    
-    if (lines) {
-      // Validate lines
-      for (const line of lines) {
-        if (!line.accountCode || !CHART_OF_ACCOUNTS[line.accountCode]) {
-          return res.status(400).json({
-            success: false,
-            message: `Invalid account code: ${line.accountCode}`
-          });
+
+    const mongoose = require('mongoose');
+    const result = await runInTransaction(async (trx) => {
+      const useSession = !!trx;
+      const opts = useSession ? { session: trx } : {};
+
+      const orig = useSession
+        ? await JournalEntry.findOne({ _id: req.params.id, company: companyId }).session(trx)
+        : await JournalEntry.findOne({ _id: req.params.id, company: companyId });
+
+      if (!orig) throw Object.assign(new Error('Journal entry not found'), { statusCode: 404 });
+
+      // If already reversed, return existing reversal (idempotent)
+      if (orig.reversed && orig.reversalEntryId) {
+        const existingRev = useSession
+          ? await JournalEntry.findById(orig.reversalEntryId).session(trx)
+          : await JournalEntry.findById(orig.reversalEntryId);
+        if (existingRev) return existingRev;
+      }
+
+      if (orig.status !== 'posted') throw Object.assign(new Error('Only posted entries can be reversed'), { statusCode: 400 });
+
+      const periodService = require('../services/periodService');
+      if (await periodService.isDateInClosedPeriod(companyId, orig.date)) {
+        throw Object.assign(new Error('Accounting period is closed; cannot reverse entries in a closed period'), { statusCode: 400, code: 'PERIOD_CLOSED' });
+      }
+
+      const toNum = (v) => {
+        if (v == null) return 0;
+        if (typeof v === 'number') return v;
+        if (typeof v === 'string') return Number(v);
+        if (v && typeof v === 'object') {
+          if (v.$numberDecimal) return Number(v.$numberDecimal);
+          try { return Number(v.toString()); } catch (e) { return 0; }
         }
+        return Number(v) || 0;
+      };
+
+      const revLines = orig.lines.map(line => ({
+        accountCode: line.accountCode,
+        accountName: line.accountName,
+        description: `Reversal: ${line.description || orig.description}`,
+        debit: toNum(line.credit),
+        credit: toNum(line.debit),
+        reference: line.reference || orig.sourceReference || ''
+      }));
+
+      // debug logs removed
+      const reversalEntry = await JournalService.createEntry(companyId, userId, {
+        date: new Date(),
+        description: `Reversal of ${orig.entryNumber}` + (reason ? ` - ${reason}` : ''),
+        sourceType: 'reversal',
+        sourceId: orig._id,
+        sourceReference: orig.entryNumber,
+        lines: revLines,
+        isAutoGenerated: true
+      }, Object.assign({}, { session: useSession ? trx : null }));
+
+      orig.status = 'reversed';
+      orig.reversed = true;
+      orig.reversedAt = new Date();
+      orig.reversedBy = userId;
+      orig.reversalEntryId = reversalEntry._id;
+      orig.notes = (orig.notes || '') + `\nReversed by ${userId} on ${new Date().toISOString()} - reversal entry ${reversalEntry.entryNumber}`;
+      await orig.save(opts);
+
+      try {
+        await cacheService.invalidateByCompany(companyId, 'report');
+      } catch (cacheErr) {
+        console.error('Failed to invalidate report cache after reversal', cacheErr);
       }
-      
-      // Calculate totals
-      const totalDebit = lines.reduce((sum, line) => sum + (line.debit || 0), 0);
-      const totalCredit = lines.reduce((sum, line) => sum + (line.credit || 0), 0);
-      
-      // Validate balance
-      if (Math.abs(totalDebit - totalCredit) > 0.01) {
-        return res.status(400).json({
-          success: false,
-          message: 'Entry is not balanced'
-        });
-      }
-      
-      entry.lines = lines.map(line => {
-        const account = getAccount(line.accountCode);
-        return {
-          accountCode: line.accountCode,
-          accountName: account?.name || 'Unknown Account',
-          description: line.description || '',
-          debit: line.debit || 0,
-          credit: line.credit || 0,
-          reference: line.reference || ''
-        };
-      });
-      entry.totalDebit = totalDebit;
-      entry.totalCredit = totalCredit;
-    }
-    
-    if (date) entry.date = date;
-    if (description) entry.description = description;
-    if (notes !== undefined) entry.notes = notes;
-    if (sourceType) entry.sourceType = sourceType;
-    if (sourceReference) entry.sourceReference = sourceReference;
-    
-    await entry.save();
-    
-    res.json({ success: true, data: entry });
+
+      return reversalEntry;
+    });
+
+    return res.json({ success: true, data: result });
   } catch (error) {
+    if (error && error.statusCode) return res.status(error.statusCode).json({ success: false, message: error.message });
     next(error);
   }
 };
@@ -343,33 +376,52 @@ exports.getTrialBalance = async (req, res, next) => {
       if (endDate) query.date.$lte = new Date(endDate);
     }
     
-    const entries = await JournalEntry.find(query);
-    
-    // Initialize account balances
-    const accountBalances = {};
-    
-    // Process each entry
-    entries.forEach(entry => {
-      entry.lines.forEach(line => {
-        const code = line.accountCode;
-        
-        if (!accountBalances[code]) {
-          const account = getAccount(code);
-          accountBalances[code] = {
-            accountCode: code,
-            accountName: line.accountName,
-            accountType: account?.type || 'unknown',
-            normalBalance: account?.normalBalance || 'debit',
-            debit: 0,
-            credit: 0,
-            balance: 0
-          };
-        }
-
-        accountBalances[code].debit += line.debit || 0;
-        accountBalances[code].credit += line.credit || 0;
+    // If no date range is provided, prefer precomputed AccountBalance collection (fast)
+    let accountBalances = {};
+    if (!startDate && !endDate) {
+      const AccountBalance = require('../models/AccountBalance');
+      const balances = await AccountBalance.find({ company: companyId }).lean();
+      balances.forEach(b => {
+        const account = getAccount(b.accountCode) || {};
+        accountBalances[b.accountCode] = {
+          accountCode: b.accountCode,
+          accountName: account.name || b.accountCode,
+          accountType: account.type || 'unknown',
+          normalBalance: account.normalBalance || 'debit',
+          debit: b.debit || 0,
+          credit: b.credit || 0,
+          balance: 0
+        };
       });
-    });
+    } else {
+      const entries = await JournalEntry.find(query);
+
+      // Initialize account balances
+      accountBalances = {};
+
+      // Process each entry
+      entries.forEach(entry => {
+        entry.lines.forEach(line => {
+          const code = line.accountCode;
+
+          if (!accountBalances[code]) {
+            const account = getAccount(code);
+            accountBalances[code] = {
+              accountCode: code,
+              accountName: line.accountName,
+              accountType: account?.type || 'unknown',
+              normalBalance: account?.normalBalance || 'debit',
+              debit: 0,
+              credit: 0,
+              balance: 0
+            };
+          }
+
+          accountBalances[code].debit += line.debit || 0;
+          accountBalances[code].credit += line.credit || 0;
+        });
+      });
+    }
     
     // Calculate balances based on normal balance
     const report = Object.values(accountBalances).map(account => {

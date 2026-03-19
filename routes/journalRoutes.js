@@ -7,6 +7,7 @@ const {
   updateJournalEntry,
   voidJournalEntry,
   postJournalEntry,
+  reverseJournalEntry,
   getAccounts,
   getTrialBalance,
   getGeneralLedger,
@@ -34,5 +35,8 @@ router.route('/:id')
 
 // Post (finalize) a journal entry
 router.put('/:id/post', postJournalEntry);
+
+// Reverse a posted journal entry
+router.post('/:id/reverse', reverseJournalEntry);
 
 module.exports = router;

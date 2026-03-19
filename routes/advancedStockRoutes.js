@@ -66,6 +66,29 @@ const {
   bulkCreateReorderPoints
 } = require('../controllers/reorderPointController');
 
+// Purchase Order + GRN controllers
+const {
+  createPurchaseOrder,
+  updatePurchaseOrder,
+  approvePurchaseOrder,
+  cancelPurchaseOrder,
+  getPurchaseOrders,
+  getPurchaseOrder
+} = require('../controllers/purchaseOrderController');
+
+const {
+  createGRN,
+  confirmGRN
+} = require('../controllers/grnController');
+
+const {
+  createPurchaseReturn,
+  updatePurchaseReturn,
+  confirmPurchaseReturn,
+  listPurchaseReturns,
+  getPurchaseReturn
+} = require('../controllers/purchaseReturnController');
+
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
 
@@ -161,5 +184,32 @@ const {
 
 router.post('/reorder-points/apply-to-product', authorize('admin', 'stock_manager'), logAction('stock'), applyReorderPointToProduct);
 router.post('/reorder-points/trigger-auto-check', authorize('admin', 'stock_manager'), triggerAutoReorderCheck);
+
+// ========== PURCHASE ORDER ROUTES ==========
+router.route('/purchase-orders')
+  .get(authorize('admin', 'stock_manager'), getPurchaseOrders)
+  .post(authorize('admin', 'stock_manager'), logAction('stock'), createPurchaseOrder);
+
+router.route('/purchase-orders/:id')
+  .get(authorize('admin', 'stock_manager'), getPurchaseOrder)
+  .put(authorize('admin', 'stock_manager'), logAction('stock'), updatePurchaseOrder);
+
+router.post('/purchase-orders/:id/approve', authorize('admin', 'stock_manager'), logAction('stock'), approvePurchaseOrder);
+router.post('/purchase-orders/:id/cancel', authorize('admin', 'stock_manager'), logAction('stock'), cancelPurchaseOrder);
+
+// ========== GRN ROUTES ==========
+router.post('/grn', authorize('admin', 'stock_manager'), logAction('stock'), createGRN);
+router.post('/grn/:id/confirm', authorize('admin', 'stock_manager'), logAction('stock'), confirmGRN);
+
+// ========== PURCHASE RETURNS ==========
+router.route('/purchase-returns')
+  .get(authorize('admin', 'stock_manager'), listPurchaseReturns)
+  .post(authorize('admin', 'stock_manager'), logAction('stock'), createPurchaseReturn);
+
+router.route('/purchase-returns/:id')
+  .get(authorize('admin', 'stock_manager'), getPurchaseReturn)
+  .put(authorize('admin', 'stock_manager'), logAction('stock'), updatePurchaseReturn);
+
+router.post('/purchase-returns/:id/confirm', authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn);
 
 module.exports = router;

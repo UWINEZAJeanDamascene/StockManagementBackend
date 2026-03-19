@@ -190,11 +190,11 @@ exports.createInventoryBatch = async (req, res, next) => {
       createdBy: req.user.id
     });
 
-    // Update product stock
-    product.currentStock += quantity;
+    // Update product stock (coerce numeric values)
+    product.currentStock = Number(product.currentStock || 0) + Number(quantity);
     if (unitCost) {
-      const totalValue = (product.currentStock * product.averageCost) + (quantity * unitCost);
-      product.averageCost = totalValue / product.currentStock;
+      const totalValue = (Number(product.currentStock || 0) * Number(product.averageCost || 0)) + (Number(quantity) * Number(unitCost));
+      product.averageCost = totalValue / Number(product.currentStock || 1);
     }
     product.lastSupplyDate = new Date();
     await product.save();

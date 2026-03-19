@@ -1,18 +1,52 @@
+// Module 7 - Error Codes
+const mongoose = require('mongoose');
 const DeliveryNote = require('../models/DeliveryNote');
 const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
+const InventoryBatch = require('../models/InventoryBatch');
+const StockBatch = require('../models/StockBatch');
+const StockSerialNumber = require('../models/StockSerialNumber');
 const Company = require('../models/Company');
 const PDFDocument = require('pdfkit');
+const JournalService = require('../services/journalService');
+const { runInTransaction } = require('../services/transactionService');
 
-// @desc    Get all delivery notes
+const ERR_DELIVERY_NOT_FOUND = 'ERR_DELIVERY_NOT_FOUND';
+const ERR_DELIVERY_CONFIRMED = 'ERR_DELIVERY_CONFIRMED';
+const ERR_DELIVERY_CANCELLED = 'ERR_DELIVERY_CANCELLED';
+const ERR_INVOICE_NOT_CONFIRMED = 'ERR_INVOICE_NOT_CONFIRMED';
+const ERR_INVOICE_CANCELLED = 'ERR_INVOICE_CANCELLED';
+const ERR_INSUFFICIENT_STOCK = 'ERR_INSUFFICIENT_STOCK';
+const ERR_BATCH_QUARANTINED = 'ERR_BATCH_QUARANTINED';
+const ERR_BATCH_NOT_FOUND = 'ERR_BATCH_NOT_FOUND';
+const ERR_SERIAL_NOT_IN_STOCK = 'ERR_SERIAL_NOT_IN_STOCK';
+const ERR_SERIAL_WRONG_WAREHOUSE = 'ERR_SERIAL_WRONG_WAREHOUSE';
+const ERR_EXCEEDS_INVOICE_QTY = 'ERR_EXCEEDS_INVOICE_QTY';
+const ERR_COST_LOOKUP_FAILED = 'ERR_COST_LOOKUP_FAILED';
+const ERR_COGS_ADJUSTMENT_FAILED = 'ERR_COGS_ADJUSTMENT_FAILED';
+
+// COGS adjustment tolerance (0.01 = 1 cent)
+const COGS_TOLERANCE = 0.01;
+
+// @desc    Get all delivery notes (Module 7 filters)
 // @route   GET /api/delivery-notes
 // @access  Private
 exports.getDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { page = 1, limit = 20, status, clientId, startDate, endDate, quotationId } = req.query;
+    const { 
+      page = 1, 
+      limit = 20, 
+      status, 
+      clientId, 
+      invoiceId,
+      warehouseId,
+      dateFrom, 
+      dateTo 
+    } = req.query;
+    
     const query = { company: companyId };
 
     if (status) {
@@ -23,22 +57,29 @@ exports.getDeliveryNotes = async (req, res, next) => {
       query.client = clientId;
     }
 
-    if (quotationId) {
-      query.quotation = quotationId;
+    // Module 7: Filter by invoice
+    if (invoiceId) {
+      query.invoice = invoiceId;
     }
 
-    if (startDate || endDate) {
+    if (warehouseId) {
+      query.warehouse = warehouseId;
+    }
+
+    if (dateFrom || dateTo) {
       query.deliveryDate = {};
-      if (startDate) query.deliveryDate.$gte = new Date(startDate);
-      if (endDate) query.deliveryDate.$lte = new Date(endDate);
+      if (dateFrom) query.deliveryDate.$gte = new Date(dateFrom);
+      if (dateTo) query.deliveryDate.$lte = new Date(dateTo);
     }
 
     const total = await DeliveryNote.countDocuments(query);
     const deliveryNotes = await DeliveryNote.find(query)
       .populate('client', 'name code contact taxId')
       .populate('quotation', 'quotationNumber')
-      .populate('invoice', 'invoiceNumber')
-      .populate('items.product', 'name sku unit')
+      .populate('invoice', 'invoiceNumber status')
+      .populate('warehouse', 'name code')
+      .populate('lines.product', 'name sku unit')
+      .populate('items.product', 'name sku unit') // Legacy
       .populate('createdBy', 'name email')
       .populate('confirmedBy', 'name email')
       .sort({ createdAt: -1 })
@@ -58,7 +99,7 @@ exports.getDeliveryNotes = async (req, res, next) => {
   }
 };
 
-// @desc    Get single delivery note
+// @desc    Get single delivery note (Module 7)
 // @route   GET /api/delivery-notes/:id
 // @access  Private
 exports.getDeliveryNote = async (req, res, next) => {
@@ -67,10 +108,14 @@ exports.getDeliveryNote = async (req, res, next) => {
     const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
       .populate('client', 'name code contact type taxId address')
       .populate('quotation', 'quotationNumber status items')
-      .populate('invoice', 'invoiceNumber status grandTotal')
-      .populate('items.product', 'name sku unit')
+      .populate('invoice', 'invoiceNumber status grandTotal lines')
+      .populate('warehouse', 'name code')
+      .populate('lines.product', 'name sku unit trackingType')
+      .populate('lines.invoiceLineId')
+      .populate('items.product', 'name sku unit') // Legacy
       .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email');
+      .populate('confirmedBy', 'name email')
+      .populate('cancelledBy', 'name email');
 
     if (!deliveryNote) {
       return res.status(404).json({
@@ -88,77 +133,150 @@ exports.getDeliveryNote = async (req, res, next) => {
   }
 };
 
-// @desc    Create new delivery note
+// @desc    Create new delivery note (Module 7 - requires invoice_id)
 // @route   POST /api/delivery-notes
 // @access  Private
 exports.createDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { quotation: quotationId } = req.body;
+    const { 
+      invoice: invoiceId,
+      lines,
+      quotation: quotationId,
+      carrier,
+      trackingNo,
+      deliveryDate,
+      notes
+    } = req.body;
 
-    // If from quotation, populate items from quotation
-    let items = req.body.items || [];
-    let client = req.body.client;
-    let customerTin = req.body.customerTin;
-    let customerName = req.body.customerName;
-    let customerAddress = req.body.customerAddress;
+    // Module 7: Must have invoice_id
+    if (!invoiceId) {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_INVOICE_REQUIRED',
+        message: 'invoice_id is required to create a delivery note'
+      });
+    }
 
-    if (quotationId) {
-      const quotation = await Quotation.findOne({ _id: quotationId, company: companyId })
-        .populate('client')
-        .populate('items.product');
+    // Validate invoice exists and is confirmed
+    const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
+        message: 'Invoice not found'
+      });
+    }
 
-      if (!quotation) {
-        return res.status(404).json({
-          success: false,
-          message: 'Quotation not found'
+    if (invoice.status !== 'confirmed') {
+      return res.status(400).json({
+        success: false,
+        code: ERR_INVOICE_NOT_CONFIRMED,
+        message: 'Invoice must be confirmed before creating delivery note'
+      });
+    }
+
+    // Get client from invoice
+    const client = invoice.client;
+
+    // Get warehouse - default from first invoice line or require explicitly
+    let warehouse = req.body.warehouse;
+    if (!warehouse && invoice.lines && invoice.lines.length > 0) {
+      warehouse = invoice.lines[0].warehouse;
+    }
+    if (!warehouse) {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_WAREHOUSE_REQUIRED',
+        message: 'warehouse is required'
+      });
+    }
+
+    // Build lines from invoice lines or provided lines
+    let deliveryLines = [];
+    if (lines && lines.length > 0) {
+      // Use provided lines
+      for (const line of lines) {
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        if (!invoiceLine) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_INVALID_INVOICE_LINE',
+            message: `Invoice line ${line.invoiceLineId} not found`
+          });
+        }
+
+        // Calculate remaining qty that can be delivered
+        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
+        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        const qtyToDeliver = line.qtyToDeliver || remainingQty;
+
+        if (qtyToDeliver > remainingQty) {
+          return res.status(422).json({
+            success: false,
+            code: ERR_EXCEEDS_INVOICE_QTY,
+            message: `qty_to_deliver (${qtyToDeliver}) exceeds remaining invoice qty (${remainingQty})`
+          });
+        }
+
+        deliveryLines.push({
+          invoiceLineId: line.invoiceLineId,
+          product: invoiceLine.product,
+          productName: invoiceLine.description,
+          productCode: invoiceLine.itemCode,
+          unit: invoiceLine.unit,
+          orderedQty: invoiceLine.quantity, // Original ordered qty
+          qtyToDeliver: qtyToDeliver,
+          deliveredQty: 0,
+          pendingQty: qtyToDeliver,
+          unitCost: invoiceLine.quantity > 0 ? invoiceLine.cogsAmount / invoiceLine.quantity : 0,
+          batchId: line.batchId || null,
+          serialNumbers: line.serialNumbers || [],
+          notes: line.notes || ''
         });
       }
-
-      // Use quotation client if not provided
-      if (!client) {
-        client = quotation.client._id;
-      }
-
-      // Capture customer details from quotation
-      if (!customerTin && quotation.client) {
-        customerTin = quotation.client.taxId;
-        customerName = quotation.client.name;
-        customerAddress = quotation.client.contact?.address;
-      }
-
-      // If no items provided, use quotation items
-      if (!items || items.length === 0) {
-        items = quotation.items.map(item => ({
-          product: item.product._id,
-          productName: item.product.name,
-          itemCode: item.itemCode || item.product.sku,
-          unit: item.unit || item.product.unit,
-          orderedQty: item.quantity,
-          deliveredQty: 0,
-          pendingQty: item.quantity,
-          notes: ''
-        }));
+    } else {
+      // Auto-create lines for all invoice lines with remaining qty
+      for (const invoiceLine of invoice.lines) {
+        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
+        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        if (remainingQty > 0) {
+          deliveryLines.push({
+            invoiceLineId: invoiceLine._id,
+            product: invoiceLine.product,
+            productName: invoiceLine.description,
+            productCode: invoiceLine.itemCode,
+            unit: invoiceLine.unit,
+            orderedQty: invoiceLine.quantity,
+            qtyToDeliver: remainingQty,
+            deliveredQty: 0,
+            pendingQty: remainingQty,
+            unitCost: invoiceLine.quantity > 0 ? invoiceLine.cogsAmount / invoiceLine.quantity : 0,
+            batchId: null,
+            serialNumbers: [],
+            notes: ''
+          });
+        }
       }
     }
 
     const deliveryNote = await DeliveryNote.create({
-      ...req.body,
       company: companyId,
+      invoice: invoiceId,
+      quotation: quotationId,
       client,
-      customerTin,
-      customerName,
-      customerAddress,
-      items,
+      warehouse,
+      carrier: carrier || null,
+      trackingNo: trackingNo || null,
+      deliveryDate: deliveryDate || new Date(),
+      lines: deliveryLines,
+      items: deliveryLines, // Legacy support
+      notes: notes || '',
+      status: 'draft',
       createdBy: req.user.id
     });
 
-    await deliveryNote.populate('client items.product createdBy');
-
-    // If from quotation, update quotation status to 'delivering'
-    if (quotationId) {
-      await Quotation.findByIdAndUpdate(quotationId, { status: 'delivering' });
-    }
+    await deliveryNote.populate('client lines.product warehouse createdBy invoice');
 
     res.status(201).json({
       success: true,
@@ -169,7 +287,7 @@ exports.createDeliveryNote = async (req, res, next) => {
   }
 };
 
-// @desc    Update delivery note
+// @desc    Update delivery note (Module 7 - draft only)
 // @route   PUT /api/delivery-notes/:id
 // @access  Private
 exports.updateDeliveryNote = async (req, res, next) => {
@@ -184,20 +302,64 @@ exports.updateDeliveryNote = async (req, res, next) => {
       });
     }
 
-    // Only draft delivery notes can be fully updated
+    // Only draft delivery notes can be updated
     if (deliveryNote.status !== 'draft') {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
+        code: ERR_DELIVERY_CONFIRMED,
         message: `Cannot update delivery note with status: ${deliveryNote.status}`
       });
     }
 
-    deliveryNote = await DeliveryNote.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      req.body,
-      { new: true, runValidators: true }
-    )
-      .populate('client items.product createdBy');
+    // Update allowed fields
+    const allowedFields = [
+      'carrier', 'trackingNo', 'deliveryDate', 'notes',
+      'deliveredBy', 'vehicle', 'deliveryAddress'
+    ];
+
+    // If lines are being updated, validate
+    if (req.body.lines) {
+      const invoice = await Invoice.findById(deliveryNote.invoice);
+      if (!invoice) {
+        return res.status(404).json({
+          success: false,
+          message: 'Invoice not found'
+        });
+      }
+
+      for (const line of req.body.lines) {
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        if (!invoiceLine) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_INVALID_INVOICE_LINE',
+            message: `Invoice line ${line.invoiceLineId} not found`
+          });
+        }
+
+        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
+        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        if (line.qtyToDeliver > remainingQty) {
+          return res.status(400).json({
+            success: false,
+            code: ERR_EXCEEDS_INVOICE_QTY,
+            message: `qty_to_deliver exceeds remaining invoice qty`
+          });
+        }
+      }
+
+      deliveryNote.lines = req.body.lines;
+    }
+
+    // Apply allowed fields
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        deliveryNote[field] = req.body[field];
+      }
+    }
+
+    deliveryNote = await deliveryNote.save()
+      .populate('client lines.product warehouse createdBy invoice');
 
     res.json({
       success: true,
@@ -208,7 +370,7 @@ exports.updateDeliveryNote = async (req, res, next) => {
   }
 };
 
-// @desc    Delete delivery note
+// @desc    Delete delivery note (draft only)
 // @route   DELETE /api/delivery-notes/:id
 // @access  Private
 exports.deleteDeliveryNote = async (req, res, next) => {
@@ -247,162 +409,337 @@ exports.deleteDeliveryNote = async (req, res, next) => {
   }
 };
 
-// @desc    Dispatch delivery note (goods leave warehouse)
-// @route   PUT /api/delivery-notes/:id/dispatch
+// @desc    Confirm delivery note (Module 7 - stock consumption)
+// @route   POST /api/delivery-notes/:id/confirm
 // @access  Private
-exports.dispatchDeliveryNote = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { deliveredBy, vehicle, deliveryAddress, deliveryDate } = req.body;
-
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
-
-    if (!deliveryNote) {
-      return res.status(404).json({
-        success: false,
-        message: 'Delivery note not found'
-      });
-    }
-
-    if (deliveryNote.status !== 'draft') {
-      return res.status(400).json({
-        success: false,
-        message: 'Only draft delivery notes can be dispatched'
-      });
-    }
-
-    // Update delivery note
-    deliveryNote = await DeliveryNote.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      {
-        status: 'dispatched',
-        deliveredBy,
-        vehicle,
-        deliveryAddress,
-        deliveryDate: deliveryDate || new Date()
-      },
-      { new: true, runValidators: true }
-    )
-      .populate('client items.product createdBy');
-
-    res.json({
-      success: true,
-      message: 'Delivery note dispatched successfully',
-      data: deliveryNote
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Confirm delivery (client received goods)
-// @route   PUT /api/delivery-notes/:id/confirm
-// @access  Private
+//
+// Module 7: This replaces the old dispatch -> confirm flow.
+// Now it's simply draft -> confirmed directly.
 exports.confirmDelivery = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { receivedBy, receivedDate, clientSignature, clientStamp, notes } = req.body;
+    const deliveryNoteId = req.params.id;
 
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
-      .populate('items.product');
+    // Find delivery note with populated data
+    let deliveryNote = await DeliveryNote.findOne({ _id: deliveryNoteId, company: companyId })
+      .populate('lines.product')
+      .populate('invoice')
+      .populate('warehouse');
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
         message: 'Delivery note not found'
       });
     }
 
-    if (!['draft', 'dispatched'].includes(deliveryNote.status)) {
+    // Validate status is draft
+    if (deliveryNote.status !== 'draft') {
       return res.status(400).json({
         success: false,
+        code: ERR_DELIVERY_CONFIRMED,
         message: `Cannot confirm delivery note with status: ${deliveryNote.status}`
       });
     }
 
-    // Determine status based on delivery
-    let newStatus = 'delivered';
-    let hasPartial = false;
-
-    // Check if any items are partially delivered
-    deliveryNote.items.forEach(item => {
-      if (item.deliveredQty < item.orderedQty) {
-        hasPartial = true;
-      }
-    });
-
-    if (hasPartial) {
-      newStatus = 'partial';
+    // Get the invoice
+    const invoice = await Invoice.findById(deliveryNote.invoice);
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
+        message: 'Invoice not found'
+      });
     }
 
-    // Update delivery note
-    deliveryNote.status = newStatus;
-    deliveryNote.receivedBy = receivedBy;
-    deliveryNote.receivedDate = receivedDate || new Date();
-    deliveryNote.clientSignature = clientSignature;
-    deliveryNote.clientStamp = clientStamp || false;
-    deliveryNote.notes = notes || deliveryNote.notes;
-    deliveryNote.confirmedBy = req.user.id;
-    deliveryNote.confirmedDate = new Date();
-    deliveryNote.stockDeducted = false;
+    // Validate invoice is confirmed
+    if (invoice.status !== 'confirmed') {
+      return res.status(400).json({
+        success: false,
+        code: ERR_INVOICE_NOT_CONFIRMED,
+        message: 'Invoice must be confirmed before confirming delivery'
+      });
+    }
 
-    await deliveryNote.save();
+    // ========== STEP 1: VALIDATION ==========
+    for (const line of deliveryNote.lines) {
+      const invoiceLine = invoice.lines.id(line.invoiceLineId);
+      if (!invoiceLine) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_INVOICE_LINE',
+          message: `Invoice line ${line.invoiceLineId} not found`
+        });
+      }
 
-    // Deduct stock for delivered items
-    try {
-      for (const item of deliveryNote.items) {
-        if (item.deliveredQty > 0) {
-          // Get current stock
-          const product = await Product.findOne({ _id: item.product._id, company: companyId });
-          const previousStock = product.quantity || 0;
-          const newStock = previousStock - item.deliveredQty;
+      // Calculate remaining qty
+      const alreadyDelivered = invoiceLine.qtyDelivered || 0;
+      const remainingQty = invoiceLine.quantity - alreadyDelivered;
 
-          // Update product stock
-          await Product.findByIdAndUpdate(item.product._id, { quantity: Math.max(0, newStock) });
+      // Validate qty_to_deliver doesn't exceed remaining
+      if (line.qtyToDeliver > remainingQty) {
+        return res.status(400).json({
+          success: false,
+          code: ERR_EXCEEDS_INVOICE_QTY,
+          message: `qty_to_deliver (${line.qtyToDeliver}) exceeds remaining invoice qty (${remainingQty}) for ${line.productName}`
+        });
+      }
 
-          // Create stock movement
-          await StockMovement.create({
-            company: companyId,
-            product: item.product._id,
-            type: 'out',
-            reason: 'sale',
-            quantity: item.deliveredQty,
-            previousStock,
-            newStock: Math.max(0, newStock),
-            referenceType: 'delivery_note',
-            referenceNumber: deliveryNote.deliveryNumber,
-            referenceDocument: deliveryNote._id,
-            referenceModel: 'DeliveryNote',
-            notes: `Delivery Note: ${deliveryNote.deliveryNumber}`,
-            performedBy: req.user.id,
-            movementDate: new Date()
+      const product = line.product;
+      if (!product) continue;
+
+      const trackingType = product.trackingType || 'none';
+
+      // Batch validation
+      if (trackingType === 'batch') {
+        if (!line.batchId) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_BATCH_REQUIRED',
+            message: `batch_id required for product ${product.name} (tracking_type=batch)`
+          });
+        }
+
+        const batch = await StockBatch.findOne({
+          _id: line.batchId,
+          company: companyId,
+          product: product._id
+        });
+
+        if (!batch) {
+          return res.status(404).json({
+            success: false,
+            code: ERR_BATCH_NOT_FOUND,
+            message: `Batch not found for product ${product.name}`
+          });
+        }
+
+        if (batch.isQuarantined === true) {
+          return res.status(409).json({
+            success: false,
+            code: ERR_BATCH_QUARANTINED,
+            message: `Batch ${batch.batchNo} is quarantined`
+          });
+        }
+
+        const availableQty = Number(batch.qtyOnHand) || 0;
+        if (availableQty < line.qtyToDeliver) {
+          return res.status(409).json({
+            success: false,
+            code: ERR_INSUFFICIENT_STOCK,
+            message: `Insufficient stock in batch ${batch.batchNo}. Available: ${availableQty}, Requested: ${line.qtyToDeliver}`
           });
         }
       }
-      deliveryNote.stockDeducted = true;
-      await deliveryNote.save();
-    } catch (stockError) {
-      console.error('Error deducting stock:', stockError);
-      // Continue even if stock deduction fails - can be manually fixed
-    }
 
-    // If linked to quotation, update quotation status
-    if (deliveryNote.quotation) {
-      // Check if all items are fully delivered
-      let allDelivered = true;
-      const quotation = await Quotation.findById(deliveryNote.quotation);
-      if (quotation) {
-        // For now mark as delivering, can be marked as delivered when all NDLs are complete
-        quotation.status = 'delivering';
-        await quotation.save();
+      // Serial validation
+      if (trackingType === 'serial') {
+        if (!line.serialNumbers || line.serialNumbers.length === 0) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_SERIAL_REQUIRED',
+            message: `serial_numbers required for product ${product.name} (tracking_type=serial)`
+          });
+        }
+
+        if (line.serialNumbers.length !== line.qtyToDeliver) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_SERIAL_COUNT_MISMATCH',
+            message: `Serial count must equal qty_to_deliver`
+          });
+        }
+
+        for (const serialId of line.serialNumbers) {
+          const serial = await StockSerialNumber.findOne({
+            _id: serialId,
+            company: companyId,
+            product: product._id
+          });
+
+          if (!serial) {
+            return res.status(404).json({
+              success: false,
+              code: 'ERR_SERIAL_NOT_FOUND',
+              message: `Serial number not found`
+            });
+          }
+
+          if (serial.status !== 'in_stock') {
+            return res.status(409).json({
+              success: false,
+              code: ERR_SERIAL_NOT_IN_STOCK,
+              message: `Serial ${serial.serialNo} is ${serial.status}, not in_stock`
+            });
+          }
+
+          if (String(serial.warehouse) !== String(deliveryNote.warehouse._id)) {
+            return res.status(400).json({
+              success: false,
+              code: ERR_SERIAL_WRONG_WAREHOUSE,
+              message: `Serial ${serial.serialNo} is in different warehouse`
+            });
+          }
+        }
       }
     }
 
-    await deliveryNote.populate('client items.product createdBy confirmedBy');
+    // ========== STEPS 2-7: Execute in transaction ==========
+    const inventoryService = require('../services/inventoryService');
+    const cogsAdjustments = [];
+
+    await runInTransaction(async (session) => {
+      // Process each line
+      for (const line of deliveryNote.lines) {
+        if (line.qtyToDeliver <= 0) continue;
+
+        const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(session);
+        if (!product) continue;
+
+        const trackingType = product.trackingType || 'none';
+        let actualUnitCost = 0;
+        let totalCost = 0;
+
+        // ========== STEP 2: CONSUME STOCK (FIFO) ==========
+        if (trackingType === 'none' || trackingType === 'fifo') {
+          // FIFO consumption - consume lots in received_at ASC order
+          const consumeResult = await inventoryService.consume(
+            companyId,
+            product._id,
+            line.qtyToDeliver,
+            { method: 'fifo', warehouse: deliveryNote.warehouse._id, session }
+          );
+          actualUnitCost = consumeResult.averageCost || 0;
+          totalCost = consumeResult.totalCost || 0;
+        } else if (trackingType === 'wac') {
+          // WAC - use average cost from product
+          actualUnitCost = product.averageCost ? Number(product.averageCost.toString()) : 0;
+          totalCost = actualUnitCost * line.qtyToDeliver;
+        } else if (trackingType === 'batch' && line.batchId) {
+          // Batch-specific consumption
+          const batch = await StockBatch.findById(line.batchId).session(session);
+          actualUnitCost = batch?.unitCost || 0;
+          totalCost = actualUnitCost * line.qtyToDeliver;
+          
+          // Deduct from batch
+          batch.qtyOnHand = (batch.qtyOnHand || 0) - line.qtyToDeliver;
+          await batch.save({ session });
+        }
+
+        // ========== STEP 3: UPDATE STOCK LEVELS ==========
+        // Note: Product.currentStock is already updated above
+        // InventoryBatch quantities are managed by inventoryService.consume/reverseConsume
+
+        // Update product quantity using direct update to avoid caching issues
+        const previousStock = product.currentStock || 0;
+        const newStock = Math.max(0, previousStock - line.qtyToDeliver);
+        await Product.findByIdAndUpdate(
+          product._id,
+          { currentStock: newStock },
+          { session }
+        );
+
+        // ========== STEP 4: CREATE STOCK MOVEMENT (dispatch) ==========
+        await StockMovement.create([{
+          company: companyId,
+          product: product._id,
+          warehouse: deliveryNote.warehouse._id,
+          type: 'out',
+          reason: 'dispatch',
+          quantity: line.qtyToDeliver,
+          previousStock,
+          newStock,
+          unitCost: actualUnitCost,
+          totalCost,
+          sourceType: 'delivery_note',
+          sourceId: deliveryNote._id,
+          referenceNumber: deliveryNote.referenceNo,
+          notes: `DN#${deliveryNote.referenceNo} - ${line.productName}`,
+          performedBy: req.user.id,
+          movementDate: new Date()
+        }], { session });
+
+        // ========== STEP 5: UPDATE SERIAL STATUS ==========
+        if (trackingType === 'serial' && line.serialNumbers && line.serialNumbers.length > 0) {
+          await StockSerialNumber.updateMany(
+            { _id: { $in: line.serialNumbers } },
+            {
+              status: 'dispatched',
+              dispatchedVia: line._id,
+              dispatchedAt: new Date(),
+              warehouse: deliveryNote.warehouse._id
+            },
+            { session }
+          );
+        }
+
+        // Store actual cost on line for COGS adjustment
+        line.unitCost = actualUnitCost;
+        line.deliveredQty = line.qtyToDeliver;
+        line.pendingQty = 0;
+
+        // ========== STEP 6: COGS ADJUSTMENT ==========
+        // Compare actual cost vs estimated cost from invoice line
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        if (invoiceLine && invoiceLine.quantity > 0) {
+          const estimatedUnitCost = invoiceLine.cogsAmount / invoiceLine.quantity;
+          const costDifference = totalCost - (estimatedUnitCost * line.qtyToDeliver);
+
+          // Only post adjustment if difference > tolerance
+          if (Math.abs(costDifference) > COGS_TOLERANCE) {
+            cogsAdjustments.push({
+              product: product,
+              line: line,
+              estimatedCost: estimatedUnitCost * line.qtyToDeliver,
+              actualCost: totalCost,
+              difference: costDifference
+            });
+          }
+        }
+
+        // ========== STEP 7: UPDATE INVOICE LINE ==========
+        if (invoiceLine) {
+          invoiceLine.qtyDelivered = (invoiceLine.qtyDelivered || 0) + line.qtyToDeliver;
+        }
+      }
+
+      // Save invoice with updated qtyDelivered
+      await invoice.save({ session });
+
+      // Save delivery note lines
+      deliveryNote.lines.forEach(line => line.markModified('unitCost'));
+      await deliveryNote.save({ session });
+
+      // ========== POST COGS ADJUSTMENTS ==========
+      if (cogsAdjustments.length > 0) {
+        for (const adj of cogsAdjustments) {
+          try {
+            await createCOGSAdjustmentEntry(companyId, req.user.id, {
+              product: adj.product,
+              deliveryNote: deliveryNote,
+              line: adj.line,
+              difference: adj.difference
+            }, { session });
+          } catch (adjErr) {
+            console.error('COGS adjustment failed:', adjErr);
+          }
+        }
+      }
+
+      // Update delivery note status
+      deliveryNote.status = 'confirmed';
+      deliveryNote.confirmedBy = req.user.id;
+      deliveryNote.confirmedDate = new Date();
+      deliveryNote.stockDeducted = true;
+      await deliveryNote.save({ session });
+    });
+
+    await deliveryNote.populate('lines.product warehouse createdBy confirmedBy invoice');
 
     res.json({
       success: true,
-      message: 'Delivery confirmed successfully',
+      message: 'Delivery note confirmed successfully',
       data: deliveryNote
     });
   } catch (error) {
@@ -410,41 +747,220 @@ exports.confirmDelivery = async (req, res, next) => {
   }
 };
 
-// @desc    Cancel delivery note
-// @route   PUT /api/delivery-notes/:id/cancel
+// Helper: Create COGS adjustment journal entry
+async function createCOGSAdjustmentEntry(companyId, userId, data, options = {}) {
+  const { product, deliveryNote, line, difference } = data;
+  const isIncrease = difference > 0;
+
+  // Get accounts from product
+  const cogsAccount = product.cogsAccount || product.cogs_account_id;
+  const inventoryAccount = product.inventoryAccount || product.inventory_account_id;
+
+  if (!cogsAccount || !inventoryAccount) {
+    console.warn('Missing COGS or Inventory account for product:', product._id);
+    return;
+  }
+
+  // Get account names
+  const { getAccount, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+  const cogsAccountName = getAccount(cogsAccount)?.name || 'Cost of Goods Sold';
+  const inventoryAccountName = getAccount(inventoryAccount)?.name || 'Inventory';
+
+  const narration = `COGS Adjustment - ${line.productName} - DN#${deliveryNote.referenceNo} - cost variance`;
+
+  const journalEntry = {
+    date: new Date(),
+    description: narration,
+    sourceType: 'cogs_adjustment',
+    sourceId: deliveryNote._id,
+    sourceReference: `DN-ADJ-${deliveryNote.referenceNo}`,
+    lines: [
+      {
+        accountCode: isIncrease ? cogsAccount : inventoryAccount,
+        accountName: isIncrease ? cogsAccountName : inventoryAccountName,
+        debit: isIncrease ? Math.abs(difference) : 0,
+        credit: isIncrease ? 0 : Math.abs(difference),
+        description: narration
+      },
+      {
+        accountCode: isIncrease ? inventoryAccount : cogsAccount,
+        accountName: isIncrease ? inventoryAccountName : cogsAccountName,
+        debit: isIncrease ? 0 : Math.abs(difference),
+        credit: isIncrease ? Math.abs(difference) : 0,
+        description: narration
+      }
+    ]
+  };
+
+  await JournalService.createEntry(companyId, userId, { ...journalEntry, session: options.session });
+}
+
+// @desc    Cancel confirmed delivery note (Module 7 - reverse stock)
+// @route   POST /api/delivery-notes/:id/cancel
 // @access  Private
 exports.cancelDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { cancellationReason } = req.body;
 
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
+      .populate('lines.product')
+      .populate('warehouse');
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
         message: 'Delivery note not found'
       });
     }
 
-    if (['delivered', 'partial'].includes(deliveryNote.status)) {
+    // Only confirmed delivery notes can be cancelled
+    if (deliveryNote.status !== 'confirmed') {
       return res.status(400).json({
         success: false,
-        message: 'Cannot cancel confirmed delivery notes. Create a credit note instead.'
+        code: ERR_DELIVERY_CONFIRMED,
+        message: `Cannot cancel delivery note with status: ${deliveryNote.status}`
       });
     }
 
-    deliveryNote.status = 'cancelled';
-    deliveryNote.cancellationReason = cancellationReason;
-    deliveryNote.cancelledBy = req.user.id;
-    deliveryNote.cancelledDate = new Date();
-
-    await deliveryNote.save();
-
-    // If linked to quotation, revert status
-    if (deliveryNote.quotation) {
-      await Quotation.findByIdAndUpdate(deliveryNote.quotation, { status: 'approved' });
+    const invoice = await Invoice.findById(deliveryNote.invoice);
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
+      });
     }
+
+    const inventoryService = require('../services/inventoryService');
+
+    // Execute reversal in transaction
+    await runInTransaction(async (session) => {
+      // Reverse each line
+      for (const line of deliveryNote.lines) {
+        if (line.deliveredQty <= 0) continue;
+
+        const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(session);
+        if (!product) continue;
+
+        const trackingType = product.trackingType || 'none';
+
+        // ========== Reverse stock consumption ==========
+        if (trackingType === 'none' || trackingType === 'fifo') {
+          // Reverse FIFO - add back to lots
+          await inventoryService.reverseConsume(
+            companyId,
+            product._id,
+            line.deliveredQty,
+            { warehouse: deliveryNote.warehouse._id, session }
+          );
+        } else if (trackingType === 'wac') {
+          // WAC - stock level will be updated below
+        } else if (trackingType === 'batch' && line.batchId) {
+          // Restore batch quantity
+          const batch = await StockBatch.findById(line.batchId).session(session);
+          if (batch) {
+            batch.qtyOnHand = (batch.qtyOnHand || 0) + line.deliveredQty;
+            await batch.save({ session });
+          }
+        }
+
+        // ========== Restore stock level ==========
+        // Use direct update to avoid mongoose caching issues
+        // Convert to Number to avoid string concatenation (Decimal128 + number = string concat!)
+        const previousStock = Number(product.currentStock) || 0;
+        const newStock = previousStock + Number(line.deliveredQty);
+        await Product.findByIdAndUpdate(
+          product._id,
+          { currentStock: newStock },
+          { session }
+        );
+
+        // ========== Reverse stock movement ==========
+        await StockMovement.create([{
+          company: companyId,
+          product: product._id,
+          warehouse: deliveryNote.warehouse._id,
+          type: 'in',
+          reason: 'dispatch_reversal',
+          quantity: line.deliveredQty,
+          previousStock: newStock - line.deliveredQty,
+          newStock: newStock,
+          unitCost: line.unitCost || 0,
+          totalCost: (line.unitCost || 0) * line.deliveredQty,
+          sourceType: 'delivery_note_cancellation',
+          sourceId: deliveryNote._id,
+          referenceNumber: deliveryNote.referenceNo,
+          notes: `DN#${deliveryNote.referenceNo} Cancellation - ${line.productName}`,
+          performedBy: req.user.id,
+          movementDate: new Date()
+        }], { session });
+
+        // ========== Restore serial status ==========
+        if (trackingType === 'serial' && line.serialNumbers && line.serialNumbers.length > 0) {
+          await StockSerialNumber.updateMany(
+            { _id: { $in: line.serialNumbers } },
+            {
+              status: 'in_stock',
+              dispatchedVia: null,
+              dispatchedAt: null
+            },
+            { session }
+          );
+        }
+
+        // ========== Reverse invoice qty_delivered ==========
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        if (invoiceLine) {
+          invoiceLine.qtyDelivered = Math.max(0, (invoiceLine.qtyDelivered || 0) - line.deliveredQty);
+        }
+      }
+
+      // Save invoice
+      await invoice.save({ session });
+
+      // ========== Reverse COGS adjustment if exists ==========
+      // Find COGS adjustment journal entries for this delivery note
+      const cogsAdjustments = await mongoose.model('JournalEntry').find({
+        company: companyId,
+        sourceType: 'cogs_adjustment',
+        sourceId: deliveryNote._id
+      }).session(session);
+
+      for (const adjEntry of cogsAdjustments) {
+        // Reverse the journal entry
+        adjEntry.status = 'reversed';
+        adjEntry.reversalDate = new Date();
+        adjEntry.reversedBy = req.user.id;
+        await adjEntry.save({ session });
+
+        // Create reverse entry - fix the JournalService.createEntry call
+        await JournalService.createEntry(companyId, userId, {
+          date: new Date(),
+          description: `Reversal of COGS Adjustment - DN#${deliveryNote.referenceNo}`,
+          sourceType: 'cogs_adjustment_reversal',
+          sourceId: deliveryNote._id,
+          sourceReference: `DN-ADJ-REV-${deliveryNote.referenceNo}`,
+          lines: adjEntry.lines.map(e => ({
+            accountCode: e.accountCode,
+            accountName: e.accountName,
+            debit: e.credit,
+            credit: e.debit,
+            description: `Reversed: ${e.description}`
+          }))
+        }, { session });
+      }
+
+      // Update delivery note status
+      deliveryNote.status = 'cancelled';
+      deliveryNote.cancellationReason = cancellationReason;
+      deliveryNote.cancelledBy = req.user.id;
+      deliveryNote.cancelledDate = new Date();
+      deliveryNote.stockDeducted = false;
+      await deliveryNote.save({ session });
+    });
+
+    await deliveryNote.populate('lines.product warehouse createdBy cancelledBy invoice');
 
     res.json({
       success: true,
@@ -554,9 +1070,35 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
   }
 };
 
-// @desc    Get delivery notes for a specific quotation
-// @route   GET /api/delivery-notes/quotation/:quotationId
+// @desc    Get delivery notes for a specific invoice (Module 7)
+// @route   GET /api/delivery-notes/invoice/:invoiceId
 // @access  Private
+exports.getInvoiceDeliveryNotes = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const deliveryNotes = await DeliveryNote.find({ 
+      invoice: req.params.invoiceId, 
+      company: companyId 
+    })
+      .populate('client', 'name code')
+      .populate('warehouse', 'name code')
+      .populate('lines.product', 'name sku')
+      .populate('createdBy', 'name email')
+      .populate('confirmedBy', 'name email')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: deliveryNotes.length,
+      data: deliveryNotes
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Legacy: Get delivery notes for a specific quotation
+// @route   GET /api/delivery-notes/quotation/:quotationId
 exports.getQuotationDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
@@ -809,9 +1351,88 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
   }
 };
 
-// @desc    Update item delivery quantity
-// @route   PUT /api/delivery-notes/:id/items/:itemId
+// @desc    Update item delivery quantity (for lines array - Module 7)
+// @route   PUT /api/delivery-notes/:id/lines/:lineId
 // @access  Private
+exports.updateLineDeliveryQty = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { qtyToDeliver, batchId, serialNumbers, notes } = req.body;
+
+    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+
+    if (!deliveryNote) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery note not found'
+      });
+    }
+
+    if (deliveryNote.status !== 'draft') {
+      return res.status(409).json({
+        success: false,
+        code: ERR_DELIVERY_CONFIRMED,
+        message: 'Cannot update lines on confirmed delivery note'
+      });
+    }
+
+    const lineIndex = deliveryNote.lines.findIndex(
+      line => line._id.toString() === req.params.lineId
+    );
+
+    if (lineIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: 'Line not found'
+      });
+    }
+
+    // Validate against invoice remaining qty
+    const invoice = await Invoice.findById(deliveryNote.invoice);
+    if (invoice) {
+      const invoiceLine = invoice.lines.id(deliveryNote.lines[lineIndex].invoiceLineId);
+      if (invoiceLine) {
+        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
+        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        if (qtyToDeliver > remainingQty) {
+          return res.status(422).json({
+            success: false,
+            code: ERR_EXCEEDS_INVOICE_QTY,
+            message: 'qty_to_deliver exceeds remaining invoice qty'
+          });
+        }
+      }
+    }
+
+    if (qtyToDeliver !== undefined) {
+      deliveryNote.lines[lineIndex].qtyToDeliver = qtyToDeliver;
+      deliveryNote.lines[lineIndex].pendingQty = qtyToDeliver;
+    }
+    if (batchId) {
+      deliveryNote.lines[lineIndex].batchId = batchId;
+    }
+    if (serialNumbers) {
+      deliveryNote.lines[lineIndex].serialNumbers = serialNumbers;
+    }
+    if (notes) {
+      deliveryNote.lines[lineIndex].notes = notes;
+    }
+
+    await deliveryNote.save();
+
+    await deliveryNote.populate('lines.product warehouse createdBy invoice');
+
+    res.json({
+      success: true,
+      data: deliveryNote
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Legacy: Update item delivery quantity (for items array - backwards compatibility)
+// @route   PUT /api/delivery-notes/:id/items/:itemId
 exports.updateItemDeliveryQty = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;

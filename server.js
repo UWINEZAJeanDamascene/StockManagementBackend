@@ -30,6 +30,10 @@ require('./models/Testimonial');
 require('./models/DeliveryNote');
 require('./models/PettyCash');
 require('./models/BankAccount');
+require('./models/StockTransfer');
+require('./models/StockTransferLine');
+require('./models/StockBatch');
+require('./models/StockSerialNumber');
 
 const app = express();
 
@@ -110,7 +114,7 @@ app.use('/api/clients', require('./routes/clientRoutes'));
 app.use('/api/stock', require('./routes/stockRoutes'));
 app.use('/api/stock/advanced', require('./routes/advancedStockRoutes'));
 app.use('/api/quotations', require('./routes/quotationRoutes'));
-app.use('/api/invoices', require('./routes/invoiceRoutes'));
+app.use('/api/sales-invoices', require('./routes/invoiceRoutes'));
 app.use('/api/purchases', require('./routes/purchaseRoutes'));
 app.use('/api/pos', require('./routes/posRoutes'));
 app.use('/api/reports', require('./routes/reportRoutes'));
@@ -180,6 +184,26 @@ app.use('/api/chat', require('./routes/chatRoutes'));
 
 // Journal Entries & Accounting
 app.use('/api/journal-entries', require('./routes/journalRoutes'));
+// Accounting health and core checks
+app.use('/api/accounting', require('./routes/accountingRoutes'));
+// Account mapping CRUD (company-scoped)
+app.use('/api/account-mappings', require('./routes/accountMappingRoutes'));
+// Reconciliation endpoints (compare GL trial balance vs AccountBalance snapshot)
+app.use('/api/reconciliation', require('./routes/reconciliationRoutes'));
+// GL-driven financial statements (P&L, Balance Sheet) derived from ledger snapshot
+app.use('/api/gl-financials', require('./routes/glFinancialRoutes'));
+
+// Stock transfers
+app.use('/api/stock-transfers', require('./routes/stockTransferRoutes'));
+
+// Stock Audits
+app.use('/api/stock-audits', require('./routes/stockAuditRoutes'));
+
+// Stock Batches (Module 4)
+app.use('/api/batches', require('./routes/stockBatchRoutes'));
+
+// Stock Serial Numbers (Module 4)
+app.use('/api/serial-numbers', require('./routes/stockSerialNumberRoutes'));
 
 // Health check
 app.get('/health', (req, res) => {

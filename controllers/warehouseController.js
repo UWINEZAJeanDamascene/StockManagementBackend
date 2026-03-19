@@ -150,6 +150,18 @@ exports.updateWarehouse = async (req, res, next) => {
       });
     }
 
+    // Prevent deactivating a warehouse that still holds stock
+    if (req.body.hasOwnProperty('isActive') && req.body.isActive === false && warehouse.isActive) {
+      const hasStock = await InventoryBatch.exists({ company: companyId, warehouse: warehouse._id, availableQuantity: { $gt: 0 } });
+      if (hasStock) {
+        return res.status(409).json({
+          success: false,
+          code: 'WAREHOUSE_HAS_STOCK',
+          message: 'Cannot deactivate warehouse while it holds stock'
+        });
+      }
+    }
+
     // If setting as default, unset other defaults
     if (req.body.isDefault && !warehouse.isDefault) {
       await Warehouse.updateMany(

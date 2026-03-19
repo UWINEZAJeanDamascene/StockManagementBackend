@@ -372,3 +372,309 @@ exports.deleteCreditNote = async (req, res, next) => {
     res.json({ success: true, message: 'Deleted' });
   } catch (err) { next(err); }
 };
+
+// =====================================================
+// MODULE 8 - Credit Notes Confirmation Logic
+// =====================================================
+
+// Module 8 Error Codes
+const ERR_CREDIT_NOT_FOUND = 'ERR_CREDIT_NOT_FOUND';
+const ERR_CREDIT_CONFIRMED = 'ERR_CREDIT_CONFIRMED';
+const ERR_CREDIT_CANCELLED = 'ERR_CREDIT_CANCELLED';
+const ERR_INVOICE_NOT_CONFIRMED = 'ERR_INVOICE_NOT_CONFIRMED';
+const ERR_EXCEEDS_INVOICE_QTY = 'ERR_EXCEEDS_INVOICE_QTY';
+const ERR_PRICE_MISMATCH = 'ERR_PRICE_MISMATCH';
+const ERR_SERIAL_NOT_DISPATCHED = 'ERR_SERIAL_NOT_DISPATCHED';
+const ERR_INVENTORY_UPDATE_FAILED = 'ERR_INVENTORY_UPDATE_FAILED';
+
+// Update credit note (draft only)
+exports.updateCreditNote = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const note = await CreditNote.findOne({ _id: req.params.id, company: companyId });
+    
+    if (!note) {
+      return res.status(404).json({ success: false, code: ERR_CREDIT_NOT_FOUND, message: 'Credit note not found' });
+    }
+    
+    // Only draft credit notes can be updated
+    if (note.status !== 'draft') {
+      return res.status(409).json({ success: false, code: ERR_CREDIT_CONFIRMED, message: 'Cannot update credit note with status: ' + note.status });
+    }
+    
+    const { reason, type, creditDate, notes, lines } = req.body;
+    
+    if (reason) note.reason = reason;
+    if (type) note.type = type;
+    if (creditDate) note.creditDate = creditDate;
+    if (notes !== undefined) note.notes = notes;
+    
+    // Update lines if provided
+    if (lines && Array.isArray(lines)) {
+      note.lines = lines;
+    }
+    
+    await note.save();
+    await note.populate('client lines.product warehouse createdBy invoice');
+    
+    res.json({ success: true, data: note });
+  } catch (err) { next(err); }
+};
+
+// Confirm credit note - triggers dual journal reversal + stock return
+exports.confirmCreditNote = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const creditNoteId = req.params.id;
+    
+    // Find credit note with populated data
+    let creditNote = await CreditNote.findOne({ _id: creditNoteId, company: companyId })
+      .populate('lines.product')
+      .populate('invoice')
+      .populate('client')
+      .populate('lines.returnToWarehouse');
+    
+    if (!creditNote) {
+      return res.status(404).json({ success: false, code: ERR_CREDIT_NOT_FOUND, message: 'Credit note not found' });
+    }
+    
+    // Validate status is draft
+    if (creditNote.status !== 'draft') {
+      return res.status(400).json({ success: false, code: ERR_CREDIT_CONFIRMED, message: 'Cannot confirm credit note with status: ' + creditNote.status });
+    }
+    
+    // ========== STEP 1: VALIDATION ==========
+    const invoice = await Invoice.findById(creditNote.invoice).populate('lines.product');
+    if (!invoice) {
+      return res.status(404).json({ success: false, code: ERR_CREDIT_NOT_FOUND, message: 'Invoice not found' });
+    }
+    
+    // Invoice must be confirmed, partially_paid, or fully_paid
+    const validInvoiceStatuses = ['confirmed', 'partial', 'partially_paid', 'paid', 'fully_paid'];
+    if (!validInvoiceStatuses.includes(invoice.status)) {
+      return res.status(400).json({ success: false, code: ERR_INVOICE_NOT_CONFIRMED, message: 'Invoice must be confirmed, partially paid, or fully paid' });
+    }
+    
+    // Use lines array (Module 8) or items (legacy)
+    const lineArray = creditNote.lines && creditNote.lines.length > 0 ? creditNote.lines : creditNote.items;
+    
+    for (const line of lineArray) {
+      // Find original invoice line
+      const invoiceLine = invoice.lines.id(line.invoiceLineId);
+      if (!invoiceLine) {
+        return res.status(400).json({ success: false, code: 'ERR_INVALID_INVOICE_LINE', message: 'Invoice line not found' });
+      }
+      
+      // Validate qty doesn't exceed remaining
+      const alreadyCredited = invoiceLine.qtyCredited || 0;
+      const remainingQty = invoiceLine.quantity - alreadyCredited;
+      if (line.quantity > remainingQty) {
+        return res.status(422).json({ success: false, code: ERR_EXCEEDS_INVOICE_QTY, message: 'Credit qty (' + line.quantity + ') exceeds remaining invoice qty (' + remainingQty + ')' });
+      }
+      
+      // Validate unit price matches original
+      if (line.unitPrice !== invoiceLine.unitPrice) {
+        return res.status(400).json({ success: false, code: ERR_PRICE_MISMATCH, message: 'Unit price must match original invoice line' });
+      }
+      
+      // Validate serial numbers if provided
+      if (line.serialNumbers && line.serialNumbers.length > 0) {
+        const StockSerialNumber = require('../models/StockSerialNumber');
+        for (const serialId of line.serialNumbers) {
+          const serial = await StockSerialNumber.findOne({ _id: serialId, company: companyId });
+          if (!serial || serial.status !== 'dispatched') {
+            return res.status(400).json({ success: false, code: ERR_SERIAL_NOT_DISPATCHED, message: 'Serial number must be dispatched' });
+          }
+        }
+      }
+    }
+    
+    // ========== STEP 2-5: Execute in transaction ==========
+    const { runInTransaction } = require('../services/transactionService');
+    const inventoryService = require('../services/inventoryService');
+    const JournalService = require('../services/journalService');
+    const Product = require('../models/Product');
+    const StockMovement = require('../models/StockMovement');
+    const StockBatch = require('../models/StockBatch');
+    const StockSerialNumber = require('../models/StockSerialNumber');
+    const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+    
+    await runInTransaction(async (session) => {
+      // Calculate totals for journal entries
+      let totalSubtotal = 0;
+      let totalTax = 0;
+      let totalCogs = 0;
+      
+      const isGoodsReturn = creditNote.type === 'goods_return';
+      
+      // Process each line
+      for (const line of lineArray) {
+        const product = line.product;
+        if (!product) continue;
+        
+        const lineSubtotal = (line.quantity || 0) * (line.unitPrice || 0);
+        const lineTax = lineSubtotal * ((line.taxRate || 0) / 100);
+        const lineCogs = (line.unitCost || 0) * (line.quantity || 0);
+        
+        totalSubtotal += lineSubtotal;
+        totalTax += lineTax;
+        totalCogs += lineCogs;
+        
+        // ========== STEP 4: Return stock to warehouse (goods return only) ==========
+        if (isGoodsReturn && product.isStockable) {
+          const warehouse = line.returnToWarehouse;
+          
+          // Add stock using inventory service
+          await inventoryService.receive(
+            companyId,
+            product._id,
+            line.quantity,
+            { 
+              warehouse: warehouse ? warehouse._id : null, 
+              unitCost: line.unitCost || 0,
+              reason: 'credit_note_return',
+              session 
+            }
+          );
+          
+          // Update batch if batch-tracked
+          if (line.batchId) {
+            const batch = await StockBatch.findById(line.batchId).session(session);
+            if (batch) {
+              batch.qtyOnHand = (batch.qtyOnHand || 0) + line.quantity;
+              await batch.save({ session });
+            }
+          }
+          
+          // Update serial numbers if serial-tracked
+          if (line.serialNumbers && line.serialNumbers.length > 0) {
+            await StockSerialNumber.updateMany(
+              { _id: { $in: line.serialNumbers } },
+              { status: 'in_stock', returnedVia: creditNote._id, returnedAt: new Date() },
+              { session }
+            );
+          }
+          
+          // Create stock movement
+          const previousStock = product.currentStock || 0;
+          const newStock = previousStock + line.quantity;
+          
+          await StockMovement.create([{
+            company: companyId,
+            product: product._id,
+            warehouse: warehouse ? warehouse._id : null,
+            type: 'in',
+            reason: 'credit_note_return',
+            quantity: line.quantity,
+            previousStock,
+            newStock,
+            unitCost: line.unitCost || 0,
+            totalCost: lineCogs,
+            sourceType: 'credit_note',
+            sourceId: creditNote._id,
+            referenceNumber: creditNote.referenceNo || creditNote.creditNoteNumber,
+            notes: 'CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber) + ' - Return',
+            performedBy: req.user.id,
+            movementDate: new Date()
+          }], { session });
+          
+          // Update product stock
+          await Product.findByIdAndUpdate(product._id, { currentStock: newStock }, { session });
+        }
+        
+        // ========== Track qty credited on invoice line ==========
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        if (invoiceLine) {
+          invoiceLine.qtyCredited = (invoiceLine.qtyCredited || 0) + line.quantity;
+        }
+      }
+      
+      // Save invoice with updated qtyCredited
+      await invoice.save({ session });
+      
+      // ========== STEP 2: Post Revenue Reversal Journal Entry (Entry A) ==========
+      const totalAmount = totalSubtotal + totalTax;
+      const narration = 'Credit Note - ' + (creditNote.client?.name || 'Client') + ' - CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber) + ' - Ref INV#' + (invoice.invoiceNumber || invoice._id);
+      
+      // Get revenue account from first product
+      let revenueAccount = DEFAULT_ACCOUNTS.salesRevenue;
+      if (lineArray[0] && lineArray[0].product) {
+        const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
+        if (firstProduct && firstProduct.revenueAccount) {
+          revenueAccount = firstProduct.revenueAccount;
+        }
+      }
+      
+      const revenueEntry = await JournalService.createEntry(companyId, req.user.id, {
+        date: new Date(),
+        description: narration,
+        sourceType: 'credit_note',
+        sourceId: creditNote._id,
+        sourceReference: creditNote.referenceNo || creditNote.creditNoteNumber,
+        lines: [
+          { accountCode: revenueAccount, accountName: 'Sales Revenue', debit: totalSubtotal, credit: 0, description: narration },
+          { accountCode: DEFAULT_ACCOUNTS.vatOutput, accountName: 'VAT Output', debit: totalTax, credit: 0, description: narration },
+          { accountCode: DEFAULT_ACCOUNTS.accountsReceivable, accountName: 'Accounts Receivable', debit: 0, credit: totalAmount, description: narration }
+        ]
+      }, { session });
+      
+      creditNote.revenueReversalEntry = revenueEntry._id;
+      
+      // ========== STEP 3: Post COGS Reversal Journal Entry (Entry B) - goods return only ==========
+      if (isGoodsReturn && totalCogs > 0) {
+        let inventoryAccount = DEFAULT_ACCOUNTS.inventory;
+        let cogsAccount = DEFAULT_ACCOUNTS.cogs;
+        
+        if (lineArray[0] && lineArray[0].product) {
+          const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
+          if (firstProduct) {
+            if (firstProduct.inventoryAccount) inventoryAccount = firstProduct.inventoryAccount;
+            if (firstProduct.cogsAccount) cogsAccount = firstProduct.cogsAccount;
+          }
+        }
+        
+        const cogsNarration = 'COGS Reversal - ' + (creditNote.client?.name || 'Client') + ' - CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber);
+        
+        const cogsEntry = await JournalService.createEntry(companyId, req.user.id, {
+          date: new Date(),
+          description: cogsNarration,
+          sourceType: 'credit_note_cogs',
+          sourceId: creditNote._id,
+          sourceReference: 'CN-COGS-' + (creditNote.referenceNo || creditNote.creditNoteNumber),
+          lines: [
+            { accountCode: inventoryAccount, accountName: 'Inventory', debit: totalCogs, credit: 0, description: cogsNarration },
+            { accountCode: cogsAccount, accountName: 'Cost of Goods Sold', debit: 0, credit: totalCogs, description: cogsNarration }
+          ]
+        }, { session });
+        
+        creditNote.cogsReversalEntry = cogsEntry._id;
+      }
+      
+      // ========== STEP 5: Update AR balance ==========
+      invoice.amountOutstanding = (invoice.amountOutstanding || invoice.balance || 0) - totalAmount;
+      if (invoice.amountOutstanding <= 0) {
+        invoice.amountOutstanding = 0;
+        invoice.status = 'fully_paid';
+        if (!invoice.paidDate) {
+          invoice.paidDate = new Date();
+        }
+      }
+      await invoice.save({ session });
+      
+      // Update credit note status
+      creditNote.status = 'confirmed';
+      creditNote.confirmedBy = req.user.id;
+      creditNote.confirmedAt = new Date();
+      creditNote.stockReversed = isGoodsReturn;
+      
+      await creditNote.save({ session });
+    });
+    
+    await creditNote.populate('lines.product warehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry');
+    
+    res.json({ success: true, message: 'Credit note confirmed successfully', data: creditNote });
+  } catch (err) {
+    console.error('Error confirming credit note:', err);
+    next(err);
+  }
+};

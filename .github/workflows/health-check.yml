@@ -1,0 +1,35 @@
+name: CI - Tests + Health Check
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test --silent
+
+  health-call:
+    needs: tests
+    runs-on: ubuntu-latest
+    if: ${{ env.HEALTH_ENDPOINT != '' }}
+    steps:
+      - name: Call health endpoint
+        run: |
+          echo "Calling health endpoint: $HEALTH_ENDPOINT"
+          status=$(curl -sS -X GET "$HEALTH_ENDPOINT" -H "Accept: application/json" | jq -r '.healthy')
+          if [ "$status" != "true" ]; then
+            echo "Health check failed: $HEALTH_ENDPOINT returned healthy=$status"
+            exit 1
+          fi

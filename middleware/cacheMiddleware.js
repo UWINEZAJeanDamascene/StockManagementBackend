@@ -196,7 +196,7 @@ const cacheControl = (options = {}) => {
   const {
     maxAge = 0,
     mustRevalidate = true,
-    private = false,
+    isPrivate = false,
   } = options;
 
   return (req, res, next) => {
@@ -215,7 +215,7 @@ const cacheControl = (options = {}) => {
       directives.push('no-cache');
     }
 
-    if (private) {
+    if (isPrivate) {
       directives.push('private');
     } else {
       directives.push('public');

@@ -4,6 +4,7 @@ const Supplier = require('../models/Supplier');
 const Warehouse = require('../models/Warehouse');
 const InventoryBatch = require('../models/InventoryBatch');
 const JournalService = require('../services/journalService');
+const { runInTransaction } = require('../services/transactionService');
 
 // @desc    Get all stock movements
 // @route   GET /api/stock/movements
@@ -67,6 +68,7 @@ exports.getStockMovements = async (req, res, next) => {
       data: movements
     });
   } catch (error) {
+    console.error('adjustStock error:', error);
     next(error);
   }
 };
@@ -116,138 +118,133 @@ exports.receiveStock = async (req, res, next) => {
       notes
     } = req.body;
 
-    // Get product
-    const product = await Product.findOne({ _id: productId, company: companyId });
+    // Use central transaction helper for receive
+    const result = await runInTransaction(async (trx) => {
+      const useSession = !!trx;
+      const opts = useSession ? { session: trx } : {};
 
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-
-    // Get or create default warehouse if not specified
-    let warehouse = null;
-    if (warehouseId) {
-      warehouse = await Warehouse.findOne({ _id: warehouseId, company: companyId });
-      if (!warehouse) {
-        return res.status(404).json({
-          success: false,
-          message: 'Warehouse not found'
-        });
+      // Get product
+      const productQuery = Product.findOne({ _id: productId, company: companyId });
+      const product = useSession ? await productQuery.session(trx) : await productQuery;
+      if (!product) {
+        throw Object.assign(new Error('Product not found'), { status: 404 });
       }
-    } else {
-      // Try to get default warehouse
-      warehouse = await Warehouse.findOne({ company: companyId, isDefault: true });
-      // If no default, get first available
-      if (!warehouse) {
-        warehouse = await Warehouse.findOne({ company: companyId, isActive: true });
-      }
-    }
 
-    // If product tracks batches, create or update batch
-    let batch = null;
-    if (product.trackBatch || batchNumber || lotNumber) {
-      // Try to find existing batch
-      const batchQuery = {
-        company: companyId,
-        product: productId,
-        warehouse: warehouse?._id,
-        status: { $nin: ['exhausted', 'expired'] }
-      };
-      
-      if (batchNumber) batchQuery.batchNumber = batchNumber;
-      if (lotNumber) batchQuery.lotNumber = lotNumber;
-      
-      batch = await InventoryBatch.findOne(batchQuery);
-      
-      if (batch) {
-        // Add to existing batch
-        batch.quantity += quantity;
-        batch.availableQuantity += quantity;
-        batch.unitCost = unitCost || batch.unitCost;
-        batch.totalCost = batch.quantity * batch.unitCost;
-        batch.updateStatus();
-        await batch.save();
+      // Get or create default warehouse if not specified
+      let warehouse = null;
+      if (warehouseId) {
+        const wq = Warehouse.findOne({ _id: warehouseId, company: companyId });
+        warehouse = useSession ? await wq.session(trx) : await wq;
+        if (!warehouse) {
+          throw Object.assign(new Error('Warehouse not found'), { status: 404 });
+        }
       } else {
-        // Create new batch
-        batch = await InventoryBatch.create({
+        const wq = Warehouse.findOne({ company: companyId, isDefault: true });
+        warehouse = useSession ? await wq.session(trx) : await wq;
+        if (!warehouse) {
+          const wq2 = Warehouse.findOne({ company: companyId, isActive: true });
+          warehouse = useSession ? await wq2.session(trx) : await wq2;
+        }
+      }
+
+      // If product tracks batches, create or update batch
+      let batch = null;
+      if (product.trackBatch || batchNumber || lotNumber) {
+        const batchQuery = {
           company: companyId,
           product: productId,
           warehouse: warehouse?._id,
-          quantity,
-          availableQuantity: quantity,
-          batchNumber,
-          lotNumber,
-          expiryDate,
-          unitCost: unitCost || 0,
-          totalCost: quantity * (unitCost || 0),
-          supplier: supplierId,
-          status: 'active',
-          createdBy: req.user.id
-        });
+          status: { $nin: ['exhausted', 'expired'] }
+        };
+        if (batchNumber) batchQuery.batchNumber = batchNumber;
+        if (lotNumber) batchQuery.lotNumber = lotNumber;
+
+        const bq = InventoryBatch.findOne(batchQuery);
+        batch = useSession ? await bq.session(trx) : await bq;
+
+        if (batch) {
+          batch.quantity += quantity;
+          batch.availableQuantity += quantity;
+          batch.unitCost = unitCost || batch.unitCost;
+          batch.totalCost = batch.quantity * batch.unitCost;
+          batch.updateStatus();
+          await batch.save(opts);
+        } else {
+          batch = await InventoryBatch.create({
+            company: companyId,
+            product: productId,
+            warehouse: warehouse?._id,
+            quantity,
+            availableQuantity: quantity,
+            batchNumber,
+            lotNumber,
+            expiryDate,
+            unitCost: unitCost || 0,
+            totalCost: quantity * (unitCost || 0),
+            supplier: supplierId,
+            status: 'active',
+            createdBy: req.user.id
+          });
+          if (useSession) {
+            // If using session and create returns non-session doc, reload with session
+            batch = await InventoryBatch.findById(batch._id).session(trx);
+          }
+        }
       }
-    }
 
-    const previousStock = product.currentStock;
-    const newStock = previousStock + quantity;
+      const previousStock = Number(product.currentStock || 0);
+      const newStock = previousStock + Number(quantity);
 
-    // Create stock movement
-    const movement = await StockMovement.create({
-      company: companyId,
-      product: productId,
-      type: 'in',
-      reason: 'purchase',
-      quantity,
-      previousStock,
-      newStock,
-      unitCost,
-      totalCost: quantity * unitCost,
-      supplier: supplierId,
-      batchNumber,
-      lotNumber,
-      expiryDate,
-      referenceType: 'purchase_order',
-      warehouse: warehouse?._id,
-      notes,
-      performedBy: req.user.id,
-      movementDate: new Date()
+      // Create stock movement
+      const movement = await StockMovement.create({
+        company: companyId,
+        product: productId,
+        type: 'in',
+        reason: 'purchase',
+        quantity,
+        previousStock,
+        newStock,
+        unitCost,
+        totalCost: quantity * unitCost,
+        supplier: supplierId,
+        batchNumber,
+        lotNumber,
+        expiryDate,
+        referenceType: 'purchase_order',
+        warehouse: warehouse?._id,
+        notes,
+        performedBy: req.user.id,
+        movementDate: new Date()
+      });
+
+      // Update product stock and average cost (coerce numeric values)
+      const totalValue = (Number(product.currentStock || 0) * Number(product.averageCost || 0)) + (Number(quantity) * Number(unitCost));
+      product.currentStock = newStock;
+      product.averageCost = totalValue / (Number(newStock) || 1);
+      product.lastSupplyDate = new Date();
+      if (supplierId) product.supplier = supplierId;
+      await product.save(opts);
+
+      // Update supplier if provided
+      if (supplierId) {
+        const sq = Supplier.findOne({ _id: supplierId, company: companyId });
+        const supplier = useSession ? await sq.session(trx) : await sq;
+        if (supplier) {
+          const productObjId = product._id;
+          const isProductAlreadyLinked = supplier.productsSupplied.some((p) => p.toString() === productObjId.toString());
+          if (!isProductAlreadyLinked) supplier.productsSupplied.push(productObjId);
+          supplier.totalPurchases = (supplier.totalPurchases || 0) + (quantity * unitCost);
+          supplier.lastPurchaseDate = new Date();
+          await supplier.save(opts);
+        }
+      }
+
+      return { movement, warehouse, batch };
     });
 
-    // Update product stock and average cost
-    const totalValue = (product.currentStock * product.averageCost) + (quantity * unitCost);
-    product.currentStock = newStock;
-    product.averageCost = totalValue / newStock;
-    product.lastSupplyDate = new Date();
-    
-    // Link product to supplier if supplier is provided
-    if (supplierId) {
-      product.supplier = supplierId;
-    }
-
-    await product.save();
-
-    // Update supplier if provided
-    if (supplierId) {
-      const supplier = await Supplier.findOne({ _id: supplierId, company: companyId });
-      if (supplier) {
-        // Add product to supplier's productsSupplied if not already present
-        const productObjId = product._id;
-        const isProductAlreadyLinked = supplier.productsSupplied.some(
-          (p) => p.toString() === productObjId.toString()
-        );
-        
-        if (!isProductAlreadyLinked) {
-          supplier.productsSupplied.push(productObjId);
-        }
-        
-        // Update total purchases and last purchase date
-        supplier.totalPurchases = (supplier.totalPurchases || 0) + (quantity * unitCost);
-        supplier.lastPurchaseDate = new Date();
-        
-        await supplier.save();
-      }
-    }
+    const movement = result.movement;
+    const warehouse = result.warehouse;
+    const batch = result.batch;
 
     res.status(201).json({
       success: true,
@@ -277,114 +274,114 @@ exports.adjustStock = async (req, res, next) => {
       notes
     } = req.body;
 
-    // Validate reason
-    const validReasons = ['damage', 'loss', 'theft', 'expired', 'correction', 'transfer'];
-    if (!validReasons.includes(reason)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid adjustment reason'
-      });
-    }
+    const result = await runInTransaction(async (trx) => {
+      const useSession = !!trx;
+      const opts = useSession ? { session: trx } : {};
 
-    // Get product
-    const product = await Product.findOne({ _id: productId, company: companyId });
-
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
-    }
-
-    const previousStock = product.currentStock;
-    let newStock;
-
-    if (type === 'in') {
-      newStock = previousStock + quantity;
-    } else if (type === 'out') {
-      if (quantity > previousStock) {
-        return res.status(400).json({
-          success: false,
-          message: 'Adjustment quantity exceeds current stock'
-        });
+      // Validate reason
+      const validReasons = ['damage', 'loss', 'theft', 'expired', 'correction', 'transfer'];
+      if (!validReasons.includes(reason)) {
+        throw Object.assign(new Error('Invalid adjustment reason'), { status: 400 });
       }
-      newStock = previousStock - quantity;
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid adjustment type'
-      });
-    }
 
-    // Create stock movement
-    const movement = await StockMovement.create({
-      company: companyId,
-      product: productId,
-      type: 'adjustment',
-      reason,
-      quantity,
-      previousStock,
-      newStock,
-      referenceType: 'adjustment',
-      notes,
-      performedBy: req.user.id,
-      movementDate: new Date()
-    });
+      // Get product
+      const pq = Product.findOne({ _id: productId, company: companyId });
+      const product = useSession ? await pq.session(trx) : await pq;
+      if (!product) throw Object.assign(new Error('Product not found'), { status: 404 });
 
-    // Update product stock
-    product.currentStock = newStock;
-    await product.save();
+      const previousStock = Number(product.currentStock || 0);
+      let newStock;
 
-    // Create journal entry for stock adjustment
-    try {
-      const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-      const adjustmentValue = quantity * (product.averageCost || 0);
-      
-      const lines = [];
-      
       if (type === 'in') {
-        // Stock increase: Debit Inventory, Credit Stock Adjustment (or Cash if purchased)
-        lines.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.inventory,
-          adjustmentValue,
-          `Stock Adjustment IN - ${product.name} - ${reason}`
-        ));
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.stockAdjustment,
-          adjustmentValue,
-          `Stock Adjustment IN - ${product.name} - ${reason}`
-        ));
+        newStock = previousStock + Number(quantity);
+      } else if (type === 'out') {
+        if (Number(quantity) > previousStock) {
+          throw Object.assign(new Error('Adjustment quantity exceeds current stock'), { status: 400 });
+        }
+        newStock = previousStock - Number(quantity);
       } else {
-        // Stock decrease: Debit Stock Adjustment (expense/loss), Credit Inventory
-        lines.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.stockAdjustment,
-          adjustmentValue,
-          `Stock Adjustment OUT - ${product.name} - ${reason}`
-        ));
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.inventory,
-          adjustmentValue,
-          `Stock Adjustment OUT - ${product.name} - ${reason}`
-        ));
+        throw Object.assign(new Error('Invalid adjustment type'), { status: 400 });
       }
-      
-      await JournalService.createEntry(companyId, req.user.id, {
-        date: new Date(),
-        description: `Stock Adjustment ${type === 'in' ? 'IN' : 'OUT'} - ${product.name} - ${reason}`,
-        sourceType: 'stock_adjustment',
-        sourceId: movement._id,
-        lines,
-        isAutoGenerated: true
+
+      // Create stock movement
+      const movement = await StockMovement.create({
+        company: companyId,
+        product: productId,
+        type: 'adjustment',
+        reason,
+        quantity,
+        previousStock,
+        newStock,
+        referenceType: 'adjustment',
+        notes,
+        performedBy: req.user.id,
+        movementDate: new Date()
       });
-    } catch (journalError) {
-      console.error('Error creating journal entry for stock adjustment:', journalError);
-      // Don't fail the adjustment if journal entry fails
-    }
+
+      // Update product stock
+      product.currentStock = newStock;
+      await product.save(opts);
+
+      // Create journal entry for stock adjustment
+      try {
+        const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+        const adjustmentValue = quantity * (product.averageCost || 0);
+
+        const lines = [];
+        const context = {};
+        if (req.body.warehouse) context.warehouseId = req.body.warehouse;
+        if (product && product._id) context.productId = product._id;
+        let inventoryAcct = DEFAULT_ACCOUNTS.inventory;
+        try {
+          inventoryAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, context);
+        } catch (acctErr) {
+          console.error('Failed to resolve inventory account for stock adjustment:', acctErr);
+          inventoryAcct = DEFAULT_ACCOUNTS.inventory;
+        }
+
+        if (type === 'in') {
+          lines.push(JournalService.createDebitLine(
+            inventoryAcct,
+            adjustmentValue,
+            `Stock Adjustment IN - ${product.name} - ${reason}`
+          ));
+          lines.push(JournalService.createCreditLine(
+            DEFAULT_ACCOUNTS.stockAdjustment,
+            adjustmentValue,
+            `Stock Adjustment IN - ${product.name} - ${reason}`
+          ));
+        } else {
+          lines.push(JournalService.createDebitLine(
+            DEFAULT_ACCOUNTS.stockAdjustment,
+            adjustmentValue,
+            `Stock Adjustment OUT - ${product.name} - ${reason}`
+          ));
+          lines.push(JournalService.createCreditLine(
+            inventoryAcct,
+            adjustmentValue,
+            `Stock Adjustment OUT - ${product.name} - ${reason}`
+          ));
+        }
+
+        await JournalService.createEntry(companyId, req.user.id, {
+          date: new Date(),
+          description: `Stock Adjustment ${type === 'in' ? 'IN' : 'OUT'} - ${product.name} - ${reason}`,
+          sourceType: 'stock_adjustment',
+          sourceId: movement._id,
+          lines,
+          isAutoGenerated: true
+        }, opts);
+      } catch (journalError) {
+        console.error('Error creating journal entry for stock adjustment:', journalError);
+      }
+
+      return movement;
+    });
 
     res.status(201).json({
       success: true,
       message: 'Stock adjusted successfully',
-      data: movement
+      data: result
     });
   } catch (error) {
     next(error);
@@ -479,22 +476,8 @@ exports.getStockSummary = async (req, res, next) => {
 exports.deleteStockMovement = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const movement = await StockMovement.findOne({ _id: req.params.id, company: companyId });
-
-    if (!movement) {
-      return res.status(404).json({ success: false, message: 'Stock movement not found' });
-    }
-
-    // Revert product stock if possible
-    const product = await Product.findOne({ _id: movement.product, company: companyId });
-    if (product) {
-      product.currentStock = movement.previousStock;
-      await product.save();
-    }
-
-    await movement.deleteOne();
-
-    res.json({ success: true, message: 'Stock movement deleted and product stock reverted', data: movement });
+    // Stock movements are immutable. Deletions are not allowed; corrections must be made via opposite movements.
+    return res.status(405).json({ success: false, message: 'Stock movements are immutable and cannot be deleted', code: 'MOVEMENT_IMMUTABLE' });
   } catch (error) {
     next(error);
   }
@@ -506,26 +489,8 @@ exports.deleteStockMovement = async (req, res, next) => {
 exports.updateStockMovement = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const movement = await StockMovement.findOne({ _id: req.params.id, company: companyId });
-
-    if (!movement) {
-      return res.status(404).json({ success: false, message: 'Stock movement not found' });
-    }
-
-    // Only allow editing of safe metadata fields
-    const allowed = [
-      'notes', 'referenceNumber', 'referenceType', 'batchNumber', 'lotNumber', 'expiryDate', 'unitCost', 'totalCost', 'supplier', 'movementDate'
-    ];
-
-    allowed.forEach(field => {
-      if (req.body[field] !== undefined) {
-        movement[field] = req.body[field];
-      }
-    });
-
-    await movement.save();
-
-    res.json({ success: true, data: movement });
+    // Stock movements are immutable. Updates are not allowed; create compensating opposite movements instead.
+    return res.status(405).json({ success: false, message: 'Stock movements are immutable and cannot be modified', code: 'MOVEMENT_IMMUTABLE' });
   } catch (error) {
     next(error);
   }

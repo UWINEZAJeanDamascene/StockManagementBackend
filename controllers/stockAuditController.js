@@ -1,31 +1,161 @@
-const StockAudit = require('../models/StockAudit');
-const InventoryBatch = require('../models/InventoryBatch');
-const SerialNumber = require('../models/SerialNumber');
+const mongoose = require('mongoose');
+const { StockAudit, StockAuditLine } = require('../models/StockAudit');
 const Product = require('../models/Product');
-const Category = require('../models/Category');
 const Warehouse = require('../models/Warehouse');
+const InventoryBatch = require('../models/InventoryBatch');
 const StockMovement = require('../models/StockMovement');
+const JournalService = require('../services/journalService');
+const { runInTransaction } = require('../services/transactionService');
+const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+
+// @desc    Create and open a new stock audit (status → counting)
+// @route   POST /api/stock-audits
+// @access  Private
+exports.createStockAudit = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { warehouse, auditDate, type, category, notes, products } = req.body;
+
+    // Validate warehouse exists
+    const warehouseDoc = await Warehouse.findOne({ _id: warehouse, company: companyId });
+    if (!warehouseDoc) {
+      return res.status(404).json({
+        success: false,
+        message: 'Warehouse not found'
+      });
+    }
+
+    // Business Rule: One audit per warehouse at a time (counting status)
+    const existingAudit = await StockAudit.findOne({
+      company: companyId,
+      warehouse: warehouse,
+      status: 'counting'
+    });
+    if (existingAudit) {
+      return res.status(409).json({
+        success: false,
+        code: 'AUDIT_IN_PROGRESS',
+        message: 'An audit is already in progress for this warehouse',
+        existingAuditId: existingAudit._id
+      });
+    }
+
+    // Get products to audit - if not provided, get all products in warehouse
+    let productsToAudit = [];
+    if (products && products.length > 0) {
+      productsToAudit = await Product.find({
+        _id: { $in: products },
+        company: companyId
+      });
+    } else {
+      // Get all products that have stock in this warehouse
+      const batches = await InventoryBatch.find({
+        company: companyId,
+        warehouse: warehouse,
+        status: { $nin: ['exhausted'] },
+        availableQuantity: { $gt: 0 }
+      }).populate('product');
+      
+      // Get unique products
+      const productIds = [...new Set(batches.map(b => b.product._id.toString()))];
+      productsToAudit = await Product.find({ _id: { $in: productIds.map(id => new mongoose.Types.ObjectId(id)) }, company: companyId });
+    }
+
+    // Build audit lines with system quantities (snapshot)
+    const auditLines = [];
+    for (const product of productsToAudit) {
+      // Get system quantity and unit cost
+      let qtySystem = 0;
+      let unitCost = 0;
+
+      // Check inventory batches first
+      const batches = await InventoryBatch.find({
+        company: companyId,
+        product: product._id,
+        warehouse: warehouse,
+        status: { $nin: ['exhausted'] }
+      });
+
+      if (batches.length > 0) {
+        // Calculate total quantity
+        qtySystem = batches.reduce((sum, b) => sum + (b.availableQuantity || 0), 0);
+        // Calculate weighted average cost
+        const totalValue = batches.reduce((sum, b) => sum + ((b.availableQuantity || 0) * parseFloat(b.unitCost || 0)), 0);
+        unitCost = qtySystem > 0 ? (totalValue / qtySystem) : 0;
+      } else {
+        // Fall back to product currentStock
+        qtySystem = product.currentStock || 0;
+        unitCost = product.averageCost || 0;
+      }
+
+      auditLines.push({
+        product: product._id,
+        qtySystem: qtySystem.toString(),
+        qtyCounted: null, // NULL initially - warehouse team fills this
+        qtyVariance: '0',
+        unitCost: unitCost.toFixed(6),
+        varianceValue: '0',
+        journalEntry: null,
+        notes: null
+      });
+    }
+
+    // Create audit
+    const audit = await StockAudit.create({
+      company: companyId,
+      warehouse: warehouse,
+      auditDate: auditDate || new Date(),
+      status: 'counting', // Auto-open to counting
+      type: type || 'full',
+      category: category || null,
+      notes: notes || null,
+      items: auditLines,
+      totalItems: auditLines.length,
+      itemsCounted: 0,
+      itemsWithVariance: 0,
+      totalVarianceValue: '0',
+      createdBy: req.user.id
+    });
+
+    await audit.populate([
+      { path: 'warehouse', select: 'name code' },
+      { path: 'items.product', select: 'name sku' },
+      { path: 'createdBy', select: 'name' }
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: 'Stock audit created and opened',
+      data: audit
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // @desc    Get all stock audits
-// @route   GET /api/stock/audits
+// @route   GET /api/stock-audits
 // @access  Private
 exports.getStockAudits = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { page = 1, limit = 20, status, type, warehouseId } = req.query;
+    const { warehouse, status, date_from, date_to, page = 1, limit = 20 } = req.query;
 
     const query = { company: companyId };
 
+    if (warehouse) query.warehouse = warehouse;
     if (status) query.status = status;
-    if (type) query.type = type;
-    if (warehouseId) query.warehouse = warehouseId;
+    if (date_from || date_to) {
+      query.auditDate = {};
+      if (date_from) query.auditDate.$gte = new Date(date_from);
+      if (date_to) query.auditDate.$lte = new Date(date_to);
+    }
 
     const total = await StockAudit.countDocuments(query);
     const audits = await StockAudit.find(query)
       .populate('warehouse', 'name code')
-      .populate('category', 'name')
       .populate('createdBy', 'name')
-      .populate('approvedBy', 'name')
+      .populate('postedBy', 'name')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -44,18 +174,21 @@ exports.getStockAudits = async (req, res, next) => {
 };
 
 // @desc    Get single stock audit
-// @route   GET /api/stock/audits/:id
+// @route   GET /api/stock-audits/:id
 // @access  Private
 exports.getStockAudit = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const audit = await StockAudit.findOne({ _id: req.params.id, company: companyId })
+
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    })
       .populate('warehouse', 'name code')
-      .populate('category', 'name')
-      .populate('items.product', 'name sku unit')
-      .populate('items.countedBy', 'name')
+      .populate('items.product', 'name sku')
       .populate('createdBy', 'name')
-      .populate('approvedBy', 'name');
+      .populate('postedBy', 'name')
+      .populate('items.journalEntry');
 
     if (!audit) {
       return res.status(404).json({
@@ -73,103 +206,62 @@ exports.getStockAudit = async (req, res, next) => {
   }
 };
 
-// @desc    Create stock audit
-// @route   POST /api/stock/audits
-// @access  Private (admin, stock_manager)
-exports.createStockAudit = async (req, res, next) => {
+// @desc    Bulk update qty_counted values on audit lines
+// @route   PUT /api/stock-audits/:id/lines
+// @access  Private
+exports.bulkUpdateLines = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const {
-      warehouse: warehouseId,
-      category: categoryId,
-      type,
-      startDate,
-      dueDate,
-      notes
-    } = req.body;
+    const { lines } = req.body; // Array of { productId, qtyCounted }
 
-    // Validate warehouse if provided
-    if (warehouseId) {
-      const warehouse = await Warehouse.findOne({ _id: warehouseId, company: companyId });
-      if (!warehouse) {
-        return res.status(404).json({ success: false, message: 'Warehouse not found' });
-      }
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+
+    if (!audit) {
+      return res.status(404).json({ success: false, message: 'Stock audit not found' });
     }
 
-    // Validate category if provided
-    if (categoryId) {
-      const category = await Category.findOne({ _id: categoryId, company: companyId });
-      if (!category) {
-        return res.status(404).json({ success: false, message: 'Category not found' });
-      }
-    }
-
-    // Get products to audit
-    const productQuery = { company: companyId, isArchived: false };
-    if (categoryId) productQuery.category = categoryId;
-
-    const products = await Product.find(productQuery).select('_id name sku currentStock');
-    
-    // Get current stock for each product in the warehouse
-    const auditItems = [];
-    
-    for (const product of products) {
-      let systemQuantity = 0;
-      
-      if (warehouseId) {
-        // Get stock from specific warehouse
-        const batches = await InventoryBatch.find({
-          company: companyId,
-          product: product._id,
-          warehouse: warehouseId,
-          status: { $nin: ['exhausted'] }
-        });
-        systemQuantity = batches.reduce((sum, b) => sum + b.availableQuantity, 0);
-      } else {
-        // Get total stock across all warehouses
-        systemQuantity = product.currentStock || 0;
-      }
-
-      auditItems.push({
-        product: product._id,
-        systemQuantity,
-        countedQuantity: 0, // To be filled during audit
-        variance: 0,
-        status: 'pending'
+    if (audit.status !== 'counting') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only update lines in counting status'
       });
     }
 
-    // Ensure auditNumber is present before creation (some mongoose setups may validate before pre-save hooks)
-    const count = await StockAudit.countDocuments({ company: companyId });
-    const auditNumber = `AUD-${String(count + 1).padStart(6, '0')}`;
+    // Update lines
+    for (const update of lines) {
+      const line = audit.items.find(
+        item => item.product.toString() === update.productId
+      );
+      if (line) {
+        line.qtyCounted = update.qtyCounted.toString();
+        
+        // Recalculate variance
+        const qtySystem = parseFloat(line.qtySystem) || 0;
+        const qtyCounted = parseFloat(update.qtyCounted) || 0;
+        const variance = qtyCounted - qtySystem;
+        line.qtyVariance = variance.toString();
+        
+        // Calculate variance value
+        const unitCost = parseFloat(line.unitCost) || 0;
+        line.varianceValue = (Math.abs(variance) * unitCost).toFixed(2);
+      }
+    }
 
-    const audit = await StockAudit.create({
-      company: companyId,
-      auditNumber,
-      warehouse: warehouseId,
-      category: categoryId,
-      type: type || 'cycle_count',
-      startDate: startDate || new Date(),
-      dueDate,
-      notes,
-      items: auditItems,
-      status: 'draft',
-      createdBy: req.user.id
-    });
-
-    // Calculate and persist summary statistics so listing endpoints show totals immediately
+    // Recalculate summary
     audit.calculateSummary();
     await audit.save();
 
     await audit.populate([
       { path: 'warehouse', select: 'name code' },
-      { path: 'category', select: 'name' },
       { path: 'items.product', select: 'name sku' }
     ]);
 
-    res.status(201).json({
+    res.json({
       success: true,
-      message: `Stock audit created with ${auditItems.length} products`,
+      message: 'Audit lines updated',
       data: audit
     });
   } catch (error) {
@@ -177,163 +269,253 @@ exports.createStockAudit = async (req, res, next) => {
   }
 };
 
-// @desc    Update audit item (record count)
-// @route   PUT /api/stock/audits/:id/items/:itemId
+// @desc    Update single audit line qty_counted
+// @route   PUT /api/stock-audits/:id/lines/:lineId
 // @access  Private
-exports.updateAuditItem = async (req, res, next) => {
+exports.updateLine = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { countedQuantity, notes } = req.body;
+    const { qtyCounted, notes } = req.body;
 
-    const audit = await StockAudit.findOne({ _id: req.params.id, company: companyId });
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
 
     if (!audit) {
       return res.status(404).json({ success: false, message: 'Stock audit not found' });
     }
 
-    if (audit.status === 'completed' || audit.status === 'cancelled') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Cannot modify completed or cancelled audit' 
+    if (audit.status !== 'counting') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only update lines in counting status'
       });
     }
 
-    const item = audit.items.id(req.params.itemId);
-
-    if (!item) {
-      return res.status(404).json({ success: false, message: 'Audit item not found' });
+    // Find the line
+    const line = audit.items.id(req.params.lineId);
+    if (!line) {
+      return res.status(404).json({ success: false, message: 'Audit line not found' });
     }
 
-    item.countedQuantity = countedQuantity;
-    item.variance = countedQuantity - item.systemQuantity;
-    item.countedBy = req.user.id;
-    item.countedDate = new Date();
-    item.notes = notes;
-    item.status = 'verified';
-
-    // Update audit status to in_progress
-    if (audit.status === 'draft') {
-      audit.status = 'in_progress';
+    // Update
+    if (qtyCounted !== undefined) {
+      line.qtyCounted = qtyCounted.toString();
+      
+      // Recalculate variance
+      const qtySystem = parseFloat(line.qtySystem) || 0;
+      const qtyCountedNum = parseFloat(qtyCounted) || 0;
+      const variance = qtyCountedNum - qtySystem;
+      line.qtyVariance = variance.toString();
+      
+      // Calculate variance value
+      const unitCost = parseFloat(line.unitCost) || 0;
+      line.varianceValue = (Math.abs(variance) * unitCost).toFixed(2);
+    }
+    
+    if (notes !== undefined) {
+      line.notes = notes;
     }
 
+    // Recalculate summary
     audit.calculateSummary();
     await audit.save();
 
     res.json({
       success: true,
-      message: 'Audit item updated',
-      data: audit
+      message: 'Audit line updated',
+      data: line
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Complete stock audit and adjust stock
-// @route   POST /api/stock/audits/:id/complete
-// @access  Private (admin)
-exports.completeStockAudit = async (req, res, next) => {
+// @desc    Post stock audit - executes all journal + stock logic
+// @route   POST /api/stock-audits/:id/post
+// @access  Private
+exports.postStockAudit = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { adjustStock = true, approvedNotes } = req.body;
 
-    const audit = await StockAudit.findOne({ _id: req.params.id, company: companyId });
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    }).populate('items.product');
 
     if (!audit) {
       return res.status(404).json({ success: false, message: 'Stock audit not found' });
     }
 
-    if (audit.status === 'completed' || audit.status === 'cancelled') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Audit already completed or cancelled' 
-      });
-    }
-
-    // Check if all items are counted
-    const pendingItems = audit.items.filter(item => item.status === 'pending');
-    if (pendingItems.length > 0 && adjustStock) {
+    // Validation: Status must be counting
+    if (audit.status !== 'counting') {
       return res.status(400).json({
         success: false,
-        message: `Please count all ${pendingItems.length} remaining items before completing`,
-        pendingCount: pendingItems.length
+        message: 'Audit must be in counting status to post'
       });
     }
 
-    // Adjust stock if requested
-    if (adjustStock) {
-      for (const item of audit.items) {
-        if (item.variance === 0) continue;
+    // Validation: All lines must have qty_counted
+    const linesWithoutCount = audit.items.filter(item => !item.qtyCounted);
+    if (linesWithoutCount.length > 0) {
+      return res.status(422).json({
+        success: false,
+        message: 'All audit lines must have qty_counted filled in',
+        missingCount: linesWithoutCount.length
+      });
+    }
 
-        const product = await Product.findOne({ _id: item.product, company: companyId });
-        if (!product) continue;
+    // Get warehouse for inventory account
+    const warehouse = await Warehouse.findById(audit.warehouse);
+    const defaultInv = warehouse?.inventoryAccount || DEFAULT_ACCOUNTS.inventory;
 
-        const previousStock = product.currentStock;
-        product.currentStock = item.countedQuantity;
+    // Process all lines inside transaction
+    await runInTransaction(async (trx) => {
+      for (const line of audit.items) {
+        const variance = parseFloat(line.qtyVariance) || 0;
         
-        // Calculate new average cost based on existing batches
-        const batches = await InventoryBatch.find({
-          company: companyId,
-          product: item.product,
-          status: { $nin: ['exhausted'] }
-        });
-        
-        if (batches.length > 0) {
-          const totalValue = batches.reduce((sum, b) => sum + (b.availableQuantity * b.unitCost), 0);
-          product.averageCost = totalValue / item.countedQuantity;
+        // Skip lines with zero variance
+        if (variance === 0) {
+          continue;
         }
-        
-        await product.save();
 
-        // Create stock movement for adjustment
-        await StockMovement.create({
+        const varianceValue = parseFloat(line.varianceValue) || 0;
+        const product = line.product;
+        
+        // Get product's inventory account
+        const productDoc = await Product.findById(product._id).session(trx || undefined);
+        const invAccount = productDoc?.inventoryAccount || defaultInv;
+
+        // Step 2: Create stock movement
+        const movementReason = variance > 0 ? 'audit_surplus' : 'audit_shortage';
+        const prevStock = Number(productDoc?.currentStock) || 0;
+        const newStock = Number(prevStock) + Number(variance);
+
+        await StockMovement.create([{
           company: companyId,
-          product: item.product,
-          type: item.variance > 0 ? 'in' : 'out',
-          reason: 'correction',
-          quantity: Math.abs(item.variance),
-          previousStock,
-          newStock: item.countedQuantity,
-          referenceType: 'adjustment',
-          notes: `Audit #${audit.auditNumber}: Counted: ${item.countedQuantity}, System: ${item.systemQuantity}, Variance: ${item.variance}`,
+          product: product._id,
+          type: variance > 0 ? 'in' : 'out',
+          reason: movementReason,
+          quantity: mongoose.Types.Decimal128.fromString(Math.abs(variance).toString()),
+          previousStock: mongoose.Types.Decimal128.fromString(prevStock.toString()),
+          newStock: mongoose.Types.Decimal128.fromString(newStock.toString()),
+          unitCost: mongoose.Types.Decimal128.fromString((parseFloat(line.unitCost) || 0).toString()),
+          totalCost: mongoose.Types.Decimal128.fromString(Math.abs(varianceValue).toString()),
+          warehouse: audit.warehouse,
+          referenceType: 'stock_audit',
+          referenceNumber: audit.referenceNo,
+          referenceDocument: audit._id,
+          referenceModel: 'StockAudit',
+          notes: `Stock Audit ${audit.referenceNo} - ${variance > 0 ? 'Surplus' : 'Shortage'}: ${variance} units`,
           performedBy: req.user.id,
           movementDate: new Date()
-        });
+        }], trx ? { session: trx } : undefined);
 
-        // Update batch quantities if warehouse specified
-        if (audit.warehouse) {
-          const batches = await InventoryBatch.find({
-            company: companyId,
-            product: item.product,
-            warehouse: audit.warehouse,
-            status: { $nin: ['exhausted'] }
-          });
+        // Step 3: Update product stock
+        if (productDoc) {
+          productDoc.currentStock = Math.max(0, newStock);
+          await productDoc.save(trx ? { session: trx } : undefined);
+        }
 
-          // Adjust first batch (simplified - in production, would need more sophisticated logic)
-          if (batches.length > 0) {
-            batches[0].availableQuantity = item.countedQuantity;
-            batches[0].quantity = item.countedQuantity;
-            batches[0].updateStatus();
-            await batches[0].save();
+        // Step 4: Handle FIFO lots
+        if (productDoc?.trackBatch) {
+          if (variance > 0) {
+            // Positive variance: create new lot
+            await InventoryBatch.create([{
+              company: companyId,
+              product: product._id,
+              warehouse: audit.warehouse,
+              batchNumber: `AUD-${audit.referenceNo}`,
+              quantity: variance,
+              availableQuantity: variance,
+              unitCost: parseFloat(line.unitCost) || 0,
+              totalCost: varianceValue,
+              status: 'active',
+              receivedAt: new Date(),
+              createdBy: req.user.id
+            }], trx ? { session: trx } : undefined);
+          } else {
+            // Negative variance: consume lots FIFO
+            const lots = await InventoryBatch.find({
+              company: companyId,
+              product: product._id,
+              warehouse: audit.warehouse,
+              status: { $nin: ['exhausted'] },
+              availableQuantity: { $gt: 0 }
+            }).sort({ receivedAt: 1 }).session(trx || undefined);
+
+            let remainingQty = Math.abs(variance);
+            for (const lot of lots) {
+              if (remainingQty <= 0) break;
+              const deductQty = Math.min(lot.availableQuantity, remainingQty);
+              lot.availableQuantity -= deductQty;
+              lot.updateStatus();
+              await lot.save(trx ? { session: trx } : undefined);
+              remainingQty -= deductQty;
+            }
           }
         }
 
-        // Update item status
-        item.status = 'adjusted';
-      }
-    }
+        // Step 5: Create journal entry per line
+        const narration = `Stock Audit - ${product.name} - AUD#${audit.referenceNo} - Variance: ${variance > 0 ? '+' : ''}${variance} units`;
+        
+        let journalEntry = null;
+        if (variance > 0) {
+          // Surplus: DR inventory, CR 5200
+          const je = await JournalService.createEntry(companyId, req.user.id, {
+            date: audit.auditDate || new Date(),
+            description: narration,
+            sourceType: 'stock_audit',
+            sourceId: audit._id,
+            sourceReference: audit.referenceNo,
+            lines: [
+              JournalService.createDebitLine(invAccount, varianceValue, `Inventory - ${product.name}`),
+              JournalService.createCreditLine(DEFAULT_ACCOUNTS.stockAdjustment, varianceValue, narration)
+            ],
+            isAutoGenerated: true
+          }, trx ? { session: trx } : undefined);
+          journalEntry = je?._id;
+        } else {
+          // Shortage: DR 5200, CR inventory
+          const je = await JournalService.createEntry(companyId, req.user.id, {
+            date: audit.auditDate || new Date(),
+            description: narration,
+            sourceType: 'stock_audit',
+            sourceId: audit._id,
+            sourceReference: audit.referenceNo,
+            lines: [
+              JournalService.createDebitLine(DEFAULT_ACCOUNTS.stockAdjustment, varianceValue, narration),
+              JournalService.createCreditLine(invAccount, varianceValue, `Inventory - ${product.name}`)
+            ],
+            isAutoGenerated: true
+          }, trx ? { session: trx } : undefined);
+          journalEntry = je?._id;
+        }
 
-    audit.status = 'completed';
-    audit.completedDate = new Date();
-    audit.approvedBy = req.user.id;
-    audit.approvedDate = new Date();
-    audit.notes = `${audit.notes || ''}\nCompletion notes: ${approvedNotes || 'None'}`;
-    audit.calculateSummary();
-    await audit.save();
+        // Update line with journal entry reference
+        line.journalEntry = journalEntry;
+      }
+
+      // Update audit totals and status
+      audit.calculateSummary();
+      audit.status = 'posted';
+      audit.postedBy = req.user.id;
+      audit.postedAt = new Date();
+      audit.journalEntry = null; // No aggregated JE - each line has its own
+
+      await audit.save(trx ? { session: trx } : undefined);
+    });
+
+    await audit.populate([
+      { path: 'warehouse', select: 'name code' },
+      { path: 'items.product', select: 'name sku' },
+      { path: 'postedBy', select: 'name' }
+    ]);
 
     res.json({
       success: true,
-      message: 'Stock audit completed and stock adjusted',
+      message: 'Stock audit posted successfully',
       data: audit
     });
   } catch (error) {
@@ -342,29 +524,38 @@ exports.completeStockAudit = async (req, res, next) => {
 };
 
 // @desc    Cancel stock audit
-// @route   POST /api/stock/audits/:id/cancel
-// @access  Private (admin)
+// @route   POST /api/stock-audits/:id/cancel
+// @access  Private
 exports.cancelStockAudit = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { reason } = req.body;
 
-    const audit = await StockAudit.findOne({ _id: req.params.id, company: companyId });
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
 
     if (!audit) {
       return res.status(404).json({ success: false, message: 'Stock audit not found' });
     }
 
-    if (audit.status === 'completed') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Cannot cancel completed audit' 
+    // Business Rule: Can only cancel counting audits
+    if (audit.status !== 'counting') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only cancel audits in counting status'
       });
     }
 
     audit.status = 'cancelled';
     audit.notes = `${audit.notes || ''}\nCancellation reason: ${reason || 'Not specified'}`;
     await audit.save();
+
+    await audit.populate([
+      { path: 'warehouse', select: 'name code' },
+      { path: 'items.product', select: 'name sku' }
+    ]);
 
     res.json({
       success: true,
@@ -376,55 +567,80 @@ exports.cancelStockAudit = async (req, res, next) => {
   }
 };
 
-// @desc    Get audit variance summary
-// @route   GET /api/stock/audits/:id/variance
+// @desc    Update stock audit
+// @route   PUT /api/stock-audits/:id
 // @access  Private
-exports.getAuditVariance = async (req, res, next) => {
+exports.updateStockAudit = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { notes, type } = req.body;
 
-    const audit = await StockAudit.findOne({ _id: req.params.id, company: companyId })
-      .populate('items.product', 'name sku averageCost');
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
 
     if (!audit) {
       return res.status(404).json({ success: false, message: 'Stock audit not found' });
     }
 
-    // Calculate variance summary
-    const positiveVariance = audit.items.filter(i => i.variance > 0);
-    const negativeVariance = audit.items.filter(i => i.variance < 0);
-    const noVariance = audit.items.filter(i => i.variance === 0);
-
-    const varianceSummary = {
-      totalItems: audit.items.length,
-      positiveVarianceCount: positiveVariance.length,
-      negativeVarianceCount: negativeVariance.length,
-      noVarianceCount: noVariance.length,
-      totalPositiveValue: 0,
-      totalNegativeValue: 0,
-      items: audit.items.map(item => ({
-        product: item.product,
-        systemQuantity: item.systemQuantity,
-        countedQuantity: item.countedQuantity,
-        variance: item.variance,
-        estimatedValue: item.variance * (item.product?.averageCost || 0)
-      }))
-    };
-
-    // Calculate values
-    for (const item of positiveVariance) {
-      const cost = item.product?.averageCost || 0;
-      varianceSummary.totalPositiveValue += item.variance * cost;
+    // Can only update draft or counting audits
+    if (!['draft', 'counting'].includes(audit.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only update audits in draft or counting status'
+      });
     }
 
-    for (const item of negativeVariance) {
-      const cost = item.product?.averageCost || 0;
-      varianceSummary.totalNegativeValue += Math.abs(item.variance) * cost;
-    }
+    if (notes !== undefined) audit.notes = notes;
+    if (type !== undefined) audit.type = type;
+
+    await audit.save();
+
+    await audit.populate([
+      { path: 'warehouse', select: 'name code' },
+      { path: 'items.product', select: 'name sku' }
+    ]);
 
     res.json({
       success: true,
-      data: varianceSummary
+      message: 'Stock audit updated',
+      data: audit
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Delete stock audit
+// @route   DELETE /api/stock-audits/:id
+// @access  Private
+exports.deleteStockAudit = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+
+    const audit = await StockAudit.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+
+    if (!audit) {
+      return res.status(404).json({ success: false, message: 'Stock audit not found' });
+    }
+
+    // Can only delete draft audits
+    if (audit.status !== 'draft') {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only delete audits in draft status'
+      });
+    }
+
+    await audit.deleteOne();
+
+    res.json({
+      success: true,
+      message: 'Stock audit deleted'
     });
   } catch (error) {
     next(error);

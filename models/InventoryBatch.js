@@ -31,27 +31,29 @@ const inventoryBatchSchema = new mongoose.Schema({
     type: Date
   },
   quantity: {
-    type: Number,
+    type: mongoose.Schema.Types.Decimal128,
     required: [true, 'Please provide quantity'],
-    min: [0, 'Quantity cannot be negative']
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
   availableQuantity: {
-    type: Number,
+    type: mongoose.Schema.Types.Decimal128,
     required: [true, 'Please provide available quantity'],
-    min: [0, 'Available quantity cannot be negative']
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
   reservedQuantity: {
-    type: Number,
-    default: 0,
-    min: [0, 'Reserved quantity cannot be negative']
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.0000'),
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
   unitCost: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.000000'),
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
   totalCost: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.00'),
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
   supplier: {
     type: mongoose.Schema.Types.ObjectId,
@@ -114,27 +116,61 @@ inventoryBatchSchema.virtual('isNearingExpiry').get(function() {
 
 // Update status based on quantities
 inventoryBatchSchema.methods.updateStatus = function() {
-  if (this.availableQuantity === 0 && this.reservedQuantity === 0) {
-    this.status = 'exhausted';
-  } else if (this.availableQuantity < this.quantity) {
-    this.status = 'partially_used';
-  } else if (this.isExpired) {
-    this.status = 'expired';
-  } else {
-    this.status = 'active';
+  try {
+    const avail = this.availableQuantity && this.availableQuantity.toString ? parseFloat(this.availableQuantity.toString()) : Number(this.availableQuantity || 0);
+    const qty = this.quantity && this.quantity.toString ? parseFloat(this.quantity.toString()) : Number(this.quantity || 0);
+    if (avail === 0 && (this.reservedQuantity == null || parseFloat(this.reservedQuantity.toString() || '0') === 0)) {
+      this.status = 'exhausted';
+    } else if (avail < qty) {
+      this.status = 'partially_used';
+    } else if (this.isExpired) {
+      this.status = 'expired';
+    } else {
+      this.status = 'active';
+    }
+  } catch (e) {
+    this.status = this.status || 'active';
   }
   return this;
 };
 
 // Pre-save middleware to calculate totals
 inventoryBatchSchema.pre('save', function(next) {
-  this.totalCost = this.quantity * (this.unitCost || 0);
-  this.updateStatus();
-  next();
+  try {
+    const q = this.quantity && this.quantity.toString ? parseFloat(this.quantity.toString()) : Number(this.quantity || 0);
+    const uc = this.unitCost && this.unitCost.toString ? parseFloat(this.unitCost.toString()) : Number(this.unitCost || 0);
+    const total = q * uc;
+    this.totalCost = mongoose.Types.Decimal128.fromString((isFinite(total) ? total.toFixed(2) : '0.00'));
+    this.updateStatus();
+    next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Set toJSON and toObject to include virtuals
-inventoryBatchSchema.set('toJSON', { virtuals: true });
+// Serialize Decimal128 fields as strings for API
+inventoryBatchSchema.set('toJSON', {
+  virtuals: true,
+  transform: (doc, ret) => {
+    const toQty = (v) => v == null ? '0.0000' : parseFloat(v.toString()).toFixed(4);
+    const toMoney = (v) => v == null ? '0.00' : parseFloat(v.toString()).toFixed(2);
+    if (ret.quantity !== undefined) ret.quantity = toQty(ret.quantity);
+    if (ret.availableQuantity !== undefined) ret.availableQuantity = toQty(ret.availableQuantity);
+    if (ret.reservedQuantity !== undefined) ret.reservedQuantity = toQty(ret.reservedQuantity);
+    if (ret.unitCost !== undefined) ret.unitCost = toMoney(ret.unitCost);
+    if (ret.totalCost !== undefined) ret.totalCost = toMoney(ret.totalCost);
+    return ret;
+  }
+});
 inventoryBatchSchema.set('toObject', { virtuals: true });
+
+// Apply audit plugin
+const auditPlugin = require('./plugins/auditSoftDeletePlugin');
+inventoryBatchSchema.plugin(auditPlugin);
+
+// Convert Decimal128 results to JS numbers for compatibility with tests and lean queries
+const decimalTransform = require('./plugins/decimalTransformPlugin');
+inventoryBatchSchema.plugin(decimalTransform);
 
 module.exports = mongoose.model('InventoryBatch', inventoryBatchSchema);

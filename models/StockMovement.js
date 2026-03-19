@@ -21,30 +21,30 @@ const stockMovementSchema = new mongoose.Schema({
     type: String,
     enum: [
       'purchase', 'sale', 'return', 'damage', 'loss', 
-      'theft', 'expired', 'transfer_in', 'transfer_out', 'correction', 'initial_stock'
+      'theft', 'expired', 'transfer_in', 'transfer_out', 'correction', 'initial_stock',
+      'audit_surplus', 'audit_shortage', 'dispatch', 'dispatch_reversal'
     ],
     required: true
   },
   quantity: {
-    type: Number,
-    required: [true, 'Please provide a quantity'],
-    min: [0.01, 'Quantity must be greater than 0']
+    type: mongoose.Schema.Types.Decimal128,
+    required: [true, 'Please provide a quantity']
   },
   previousStock: {
-    type: Number,
+    type: mongoose.Schema.Types.Decimal128,
     required: true
   },
   newStock: {
-    type: Number,
+    type: mongoose.Schema.Types.Decimal128,
     required: true
   },
   unitCost: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.000000')
   },
   totalCost: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.00')
   },
   supplier: {
     type: mongoose.Schema.Types.ObjectId,
@@ -59,7 +59,7 @@ const stockMovementSchema = new mongoose.Schema({
   expiryDate: Date,
   referenceType: {
     type: String,
-    enum: ['purchase', 'purchase_order', 'invoice', 'adjustment', 'return', 'credit_note', 'other']
+    enum: ['purchase', 'purchase_order', 'invoice', 'adjustment', 'return', 'credit_note', 'other', 'delivery_note', 'stock_audit']
   },
   referenceNumber: String,
   referenceDocument: {
@@ -68,7 +68,7 @@ const stockMovementSchema = new mongoose.Schema({
   },
   referenceModel: {
     type: String,
-    enum: ['Purchase', 'Invoice', 'PurchaseOrder', 'StockAdjustment', 'CreditNote']
+    enum: ['Purchase', 'Invoice', 'PurchaseOrder', 'StockAdjustment', 'CreditNote', 'DeliveryNote', 'StockTransfer', 'StockAudit']
   },
   notes: String,
   performedBy: {
@@ -95,5 +95,28 @@ stockMovementSchema.index({ company: 1, type: 1 });
 stockMovementSchema.index({ company: 1, reason: 1 });
 stockMovementSchema.index({ company: 1, movementDate: 1 });
 stockMovementSchema.index({ product: 1, type: 1 });
+
+// Serialize Decimal128s as strings
+stockMovementSchema.set('toJSON', {
+  virtuals: true,
+  transform: (doc, ret) => {
+    const toQty = (v) => v == null ? '0.0000' : parseFloat(v.toString()).toFixed(4);
+    const toMoney = (v) => v == null ? '0.00' : parseFloat(v.toString()).toFixed(2);
+    if (ret.quantity !== undefined) ret.quantity = toQty(ret.quantity);
+    if (ret.previousStock !== undefined) ret.previousStock = toQty(ret.previousStock);
+    if (ret.newStock !== undefined) ret.newStock = toQty(ret.newStock);
+    if (ret.unitCost !== undefined) ret.unitCost = toMoney(ret.unitCost);
+    if (ret.totalCost !== undefined) ret.totalCost = toMoney(ret.totalCost);
+    return ret;
+  }
+});
+
+// Apply audit plugin
+const auditPlugin = require('./plugins/auditSoftDeletePlugin');
+stockMovementSchema.plugin(auditPlugin);
+
+// Convert Decimal128 results to JS numbers for compatibility with tests and lean queries
+const decimalTransform = require('./plugins/decimalTransformPlugin');
+stockMovementSchema.plugin(decimalTransform);
 
 module.exports = mongoose.model('StockMovement', stockMovementSchema);

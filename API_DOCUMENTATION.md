@@ -23,6 +23,34 @@ Authorization: Bearer <token>
 - `404` - Not Found
 - `500` - Server Error
 
+## Application Error Codes
+
+These are application-level error codes returned in the JSON body alongside an HTTP status. They help callers distinguish business-rule failures from generic HTTP errors.
+
+- `MOVEMENT_IMMUTABLE` — HTTP `405 Method Not Allowed`.
+  - Returned when an attempt is made to modify or delete a `StockMovement`. Stock movements are immutable; create compensating movements instead.
+
+- `INSUFFICIENT_STOCK` — HTTP `409 Conflict`.
+  - Returned when an operation would dispatch or consume more stock than the available on-hand quantity (on-hand minus reserved). Example: confirming a delivery where available stock < requested quantity.
+
+- `WAREHOUSE_HAS_STOCK` — HTTP `409 Conflict`.
+  - Returned when attempting to deactivate a `Warehouse` that still contains available stock (one or more `InventoryBatch` with `availableQuantity > 0`).
+
+- `CATEGORY_IN_USE` — HTTP `409 Conflict`.
+  - Returned when attempting to delete a `Category` that still has products assigned.
+
+Example error response body:
+
+```json
+{
+  "success": false,
+  "message": "Insufficient available stock to confirm delivery",
+  "code": "INSUFFICIENT_STOCK"
+}
+```
+
+Where applicable the API will also return a human-readable `message` and an appropriate HTTP status code.
+
 ## Quick Start Guide
 
 ### 1. Register/Login

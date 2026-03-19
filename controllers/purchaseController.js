@@ -7,6 +7,9 @@ const { notifyStockReceived, notifyLowStock, notifyOutOfStock } = require('../se
 const cacheService = require('../services/cacheService');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
 const JournalService = require('../services/journalService');
+const inventoryService = require('../services/inventoryService');
+const mongoose = require('mongoose');
+const { runInTransaction } = require('../services/transactionService');
 
 // @desc    Get all purchases
 // @route   GET /api/purchases
@@ -231,7 +234,7 @@ exports.deletePurchase = async (req, res, next) => {
       });
     }
 
-    // Only draft purchases can be deleted
+    // Only draft purchases can be deleted (soft-delete)
     if (purchase.status !== 'draft') {
       return res.status(400).json({
         success: false,
@@ -239,11 +242,22 @@ exports.deletePurchase = async (req, res, next) => {
       });
     }
 
-    await purchase.deleteOne();
+    // Soft-delete: mark as cancelled and inactive, record who cancelled
+    purchase.status = 'cancelled';
+    purchase.cancelledDate = new Date();
+    purchase.cancelledBy = req.user.id || req.user._id;
+    // maintain backward-compatible fields
+    purchase.cancellationReason = purchase.cancellationReason || 'deleted by user';
+    // if model supports isActive, set false, otherwise rely on status
+    try {
+      if (typeof purchase.isActive !== 'undefined') purchase.isActive = false;
+    } catch (e) {}
+
+    await purchase.save();
 
     res.json({
       success: true,
-      message: 'Purchase deleted successfully'
+      message: 'Purchase cancelled (soft-deleted)'
     });
   } catch (error) {
     next(error);
@@ -275,16 +289,24 @@ exports.receivePurchase = async (req, res, next) => {
     // Fetch supplier early (used in notifications) to avoid temporal-dead-zone errors
     const supplier = await Supplier.findOne({ _id: purchase.supplier, company: companyId });
 
-    // Add stock for each item
-    for (const item of purchase.items) {
-      const product = await Product.findOne({ _id: item.product._id, company: companyId });
-      
-      if (product) {
-        const previousStock = product.currentStock || 0;
-        const newStock = previousStock + item.quantity;
+    // Try to run receipt processing inside central transaction helper
+    await runInTransaction(async (trx) => {
+      const useSession = !!trx;
+      const opts = useSession ? { session: trx } : {};
+
+      for (const item of purchase.items) {
+        const productQuery = Product.findOne({ _id: item.product._id, company: companyId });
+        const product = useSession ? await productQuery.session(trx) : await productQuery;
+        if (!product) continue;
+
+        const previousStock = Number(product.currentStock || 0);
+        const newStock = previousStock + Number(item.quantity);
+
+        // Create inventory layer for received goods
+        await inventoryService.createLayer(companyId, product._id, item.quantity, item.unitCost, { sourceType: 'purchase', sourceId: purchase._id }, useSession ? { session: trx, userId: req.user.id } : { userId: req.user.id });
 
         // Create stock movement (ledger entry)
-        await StockMovement.create({
+        const sm = new StockMovement({
           company: companyId,
           product: product._id,
           type: 'in',
@@ -302,31 +324,21 @@ exports.receivePurchase = async (req, res, next) => {
           notes: `Purchase ${purchase.purchaseNumber} - ${product.name}`,
           performedBy: req.user.id
         });
+        await sm.save(opts);
 
-        // Update product stock and cost
+        // Update product stock and average cost (ensure numeric coercion)
         product.currentStock = newStock;
-        
-        // Update average cost if needed
-        if (product.averageCost === 0 || !product.averageCost) {
+        if (!product.averageCost) {
           product.averageCost = item.unitCost;
         } else {
-          // Calculate new average cost
-          const totalValue = (product.averageCost * previousStock) + (item.unitCost * item.quantity);
+          const totalValue = (Number(product.averageCost || 0) * previousStock) + (Number(item.unitCost) * Number(item.quantity));
           product.averageCost = totalValue / newStock;
         }
-        
-        await product.save();
+        await product.save(opts);
 
-        // Send stock received notification
+        // Notifications (best-effort)
         try {
-          await notifyStockReceived(
-            companyId,
-            product,
-            item.quantity,
-            supplier
-          );
-
-          // Check if stock is now low or out after adding
+          await notifyStockReceived(companyId, product, item.quantity, supplier);
           if (product.reorderPoint && newStock <= product.reorderPoint) {
             await notifyLowStock(companyId, product, newStock);
           }
@@ -337,15 +349,28 @@ exports.receivePurchase = async (req, res, next) => {
           console.error('Failed to send stock notification:', notifError);
         }
       }
-    }
 
-    // Update purchase status
-    purchase.status = 'received';
-    purchase.stockAdded = true;
-    purchase.receivedDate = new Date();
-    purchase.confirmedDate = new Date();
-    purchase.confirmedBy = req.user.id;
-    await purchase.save();
+      // Update purchase status inside transaction/fallback
+      purchase.status = 'received';
+      purchase.stockAdded = true;
+      purchase.receivedDate = new Date();
+      purchase.confirmedDate = new Date();
+      purchase.confirmedBy = req.user.id;
+      await purchase.save(useSession ? { session: trx } : {});
+
+      // Ensure journal entry exists (idempotent)
+      try {
+        await JournalService.createPurchaseEntry(companyId, req.user.id, {
+          _id: purchase._id,
+          purchaseNumber: purchase.purchaseNumber,
+          date: purchase.purchaseDate,
+          total: purchase.roundedAmount,
+          vatAmount: purchase.totalTax
+        }, useSession ? { session: trx } : undefined);
+      } catch (je) {
+        console.error('JournalService.createPurchaseEntry failed while receiving purchase:', je);
+      }
+    });
 
     // Note: Journal entry is created in createPurchase when purchase is created on credit
     // We don't create another one here to avoid duplication
@@ -448,8 +473,8 @@ exports.recordPayment = async (req, res, next) => {
         const product = await Product.findOne({ _id: item.product._id, company: companyId });
         
         if (product) {
-          const previousStock = product.currentStock || 0;
-          const newStock = previousStock + item.quantity;
+          const previousStock = Number(product.currentStock || 0);
+            const newStock = previousStock + Number(item.quantity);
 
           await StockMovement.create({
             company: companyId,

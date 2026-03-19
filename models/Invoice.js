@@ -1,18 +1,28 @@
 const mongoose = require('mongoose');
 const { generateUniqueNumber } = require('./utils/autoIncrement');
 
-const invoiceItemSchema = new mongoose.Schema({
+// Invoice line item schema - matches Module 6 sales_invoice_lines table
+const invoiceLineSchema = new mongoose.Schema({
+  // Line reference
+  lineId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: () => new mongoose.Types.ObjectId()
+  },
   product: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Product',
     required: true
   },
-  itemCode: String,
+  productName: String,
+  productCode: String,
   description: String,
-  quantity: {
+  
+  // Quantities and pricing - Module 6 naming
+  qty: {
     type: Number,
     required: true,
-    min: 0.01
+    min: 0.0001,
+    alias: 'quantity'
   },
   unit: String,
   unitPrice: {
@@ -20,15 +30,12 @@ const invoiceItemSchema = new mongoose.Schema({
     required: true,
     min: 0
   },
-  discount: {
+  discountPct: {
     type: Number,
     default: 0,
-    min: 0
-  },
-  taxCode: {
-    type: String,
-    enum: ['A', 'B', 'None'],
-    default: 'A'
+    min: 0,
+    max: 100,
+    alias: 'discount'
   },
   taxRate: {
     type: Number,
@@ -36,20 +43,58 @@ const invoiceItemSchema = new mongoose.Schema({
     min: 0,
     max: 100
   },
-  taxAmount: {
+  taxCode: {
+    type: String,
+    enum: ['A', 'B', 'None'],
+    default: 'A'
+  },
+  
+  // Line totals - Module 6 naming
+  lineSubtotal: {
     type: Number,
+    default: 0,
+    alias: 'subtotal'
+  },
+  lineTax: {
+    type: Number,
+    default: 0,
+    alias: 'taxAmount'
+  },
+  lineTotal: {
+    type: Number,
+    default: 0,
+    alias: 'totalWithTax'
+  },
+  
+  // COGS fields - populated at confirmation time
+  unitCost: {
+    type: mongoose.Schema.Types.Decimal128,
     default: 0
   },
-  subtotal: {
-    type: Number,
-    required: true
+  cogsAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0
   },
-  totalWithTax: {
-    type: Number,
-    required: true
+  
+  // Warehouse for stock reservation
+  warehouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Warehouse'
   }
+}, { 
+  toJSON: { virtuals: true },
+  toObject: { virtuals: true }
 });
 
+// Virtual for backwards compatibility
+invoiceLineSchema.virtual('quantity').get(function() {
+  return this.qty;
+});
+invoiceLineSchema.virtual('itemCode').get(function() {
+  return this.productCode;
+});
+
+// Payment schema
 const paymentSchema = new mongoose.Schema({
   amount: {
     type: Number,
@@ -73,6 +118,7 @@ const paymentSchema = new mongoose.Schema({
   }
 });
 
+// Main invoice schema - Module 6 enhanced
 const invoiceSchema = new mongoose.Schema({
   // Multi-tenancy: company reference
   company: {
@@ -80,65 +126,90 @@ const invoiceSchema = new mongoose.Schema({
     ref: 'Company',
     required: [true, 'Invoice must belong to a company']
   },
-  invoiceNumber: {
+  
+  // Reference number - Module 6 naming (INV-YYYY-NNNNN)
+  referenceNo: {
     type: String,
-    uppercase: true
+    uppercase: true,
+    alias: 'invoiceNumber'
   },
+  
+  // Client reference - Module 6 naming
   client: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Client',
     required: true
   },
+  
   // Customer details captured at invoice time
   customerTin: String,
   customerName: String,
   customerAddress: String,
   
+  // Quotation reference - Module 6 naming
   quotation: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Quotation'
+    ref: 'Quotation',
+    alias: 'quotation_id'
   },
   
-  // Invoice status
+  // Invoice status - Module 6 enum values
   status: {
     type: String,
-    enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled', 'bad_debt'],
+    enum: ['draft', 'confirmed', 'partially_paid', 'fully_paid', 'cancelled'],
     default: 'draft'
   },
   
-  // Currency and payment terms
-  currency: {
+  // Currency and exchange rate - Module 6 fields
+  currencyCode: {
     type: String,
-    default: 'FRW'
+    default: 'USD',
+    alias: 'currency'
   },
-  paymentTerms: {
-    type: String,
-    enum: ['cash', 'credit_7', 'credit_15', 'credit_30', 'credit_45', 'credit_60'],
-    default: 'cash'
+  exchangeRate: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 1
   },
   
-  items: [invoiceItemSchema],
+  // Invoice lines - Module 6 naming (items → lines)
+  lines: {
+    type: [invoiceLineSchema],
+    alias: 'items',
+    default: []
+  },
   
-  // Tax breakdown
-  totalAEx: {
-    type: Number,
-    default: 0 // Total without Tax A (0%)
+  // Tax breakdown - Module 6 naming
+  taxAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    alias: 'totalTax'
   },
-  totalB18: {
-    type: Number,
-    default: 0 // Total with 18% Tax B
+  
+  // Financial totals - Module 6 naming
+  subtotal: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0
   },
-  totalTaxA: {
-    type: Number,
-    default: 0 // Tax A amount (0%)
-  },
-  totalTaxB: {
-    type: Number,
-    default: 0 // Tax B amount (18%)
+  totalAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    alias: 'grandTotal'
   },
   
   // Legacy totals (for compatibility)
-  subtotal: {
+  totalAEx: {
+    type: Number,
+    default: 0
+  },
+  totalB18: {
+    type: Number,
+    default: 0
+  },
+  totalTaxA: {
+    type: Number,
+    default: 0
+  },
+  totalTaxB: {
     type: Number,
     default: 0
   },
@@ -146,20 +217,7 @@ const invoiceSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
-  totalTax: {
-    type: Number,
-    default: 0
-  },
-  grandTotal: {
-    type: Number,
-    default: 0
-  },
   roundedAmount: {
-    type: Number,
-    default: 0
-  },
-  // Backwards-compatible field names expected by some consumers
-  taxAmount: {
     type: Number,
     default: 0
   },
@@ -172,43 +230,68 @@ const invoiceSchema = new mongoose.Schema({
     default: 0
   },
   
-  // Payment tracking
+  // Payment tracking - Module 6 naming
   amountPaid: {
-    type: Number,
+    type: mongoose.Schema.Types.Decimal128,
     default: 0
   },
-  balance: {
-    type: Number,
-    default: 0
+  amountOutstanding: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    alias: 'balance'
   },
   payments: [paymentSchema],
   
-  // Dates
-  dueDate: Date,
+  // Dates - Module 6 naming
   invoiceDate: {
     type: Date,
-    default: Date.now
+    default: Date.now,
+    alias: 'date'
+  },
+  dueDate: {
+    type: Date,
+    required: true
   },
   terms: String,
   notes: String,
+  
+  // Journal entry references - Module 6 fields
+  revenueJournalEntry: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    alias: 'revenue_journal_entry_id'
+  },
+  cogsJournalEntry: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    alias: 'cogs_journal_entry_id'
+  },
   
   // Stock tracking
   stockDeducted: {
     type: Boolean,
     default: false
   },
+  stockReserved: {
+    type: Boolean,
+    default: false
+  },
   
-  // User tracking
+  // User tracking - Module 6 naming
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     required: true
   },
   paidDate: Date,
-  confirmedDate: Date,
+  confirmedDate: {
+    type: Date,
+    alias: 'confirmed_at'
+  },
   confirmedBy: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+    ref: 'User',
+    alias: 'confirmed_by'
   },
   cancelledDate: Date,
   cancelledBy: {
@@ -249,11 +332,73 @@ const invoiceSchema = new mongoose.Schema({
     appliedDate: { type: Date, default: Date.now }
   }]
 }, {
-  timestamps: true
+  timestamps: true,
+  toJSON: { 
+    virtuals: true,
+    transform: function(doc, ret) {
+      // Convert Decimal128 to Number for JSON
+      if (ret.subtotal) ret.subtotal = parseFloat(ret.subtotal);
+      if (ret.taxAmount) ret.taxAmount = parseFloat(ret.taxAmount);
+      if (ret.totalAmount) ret.totalAmount = parseFloat(ret.totalAmount);
+      if (ret.amountPaid) ret.amountPaid = parseFloat(ret.amountPaid);
+      if (ret.amountOutstanding) ret.amountOutstanding = parseFloat(ret.amountOutstanding);
+      if (ret.exchangeRate) ret.exchangeRate = parseFloat(ret.exchangeRate);
+      
+      // Convert line Decimal128 fields
+      if (ret.lines) {
+        ret.lines = ret.lines.map(line => {
+          if (line.unitCost) line.unitCost = parseFloat(line.unitCost);
+          if (line.cogsAmount) line.cogsAmount = parseFloat(line.cogsAmount);
+          return line;
+        });
+      }
+      
+      // Backwards compatibility aliases
+      ret.invoiceNumber = ret.referenceNo || ret.invoiceNumber;
+      ret.grandTotal = ret.totalAmount ? parseFloat(ret.totalAmount) : ret.grandTotal;
+      ret.balance = ret.amountOutstanding ? parseFloat(ret.amountOutstanding) : ret.balance;
+      ret.currency = ret.currencyCode || ret.currency;
+      ret.items = ret.lines || ret.items;
+      ret.date = ret.invoiceDate || ret.date;
+      
+      return ret;
+    }
+  },
+  toObject: { 
+    virtuals: true,
+    transform: function(doc, ret) {
+      // Convert Decimal128 to Number
+      if (ret.subtotal) ret.subtotal = parseFloat(ret.subtotal);
+      if (ret.taxAmount) ret.taxAmount = parseFloat(ret.taxAmount);
+      if (ret.totalAmount) ret.totalAmount = parseFloat(ret.totalAmount);
+      if (ret.amountPaid) ret.amountPaid = parseFloat(ret.amountPaid);
+      if (ret.amountOutstanding) ret.amountOutstanding = parseFloat(ret.amountOutstanding);
+      if (ret.exchangeRate) ret.exchangeRate = parseFloat(ret.exchangeRate);
+      
+      // Convert line Decimal128 fields
+      if (ret.lines) {
+        ret.lines = ret.lines.map(line => {
+          if (line.unitCost) line.unitCost = parseFloat(line.unitCost);
+          if (line.cogsAmount) line.cogsAmount = parseFloat(line.cogsAmount);
+          return line;
+        });
+      }
+      
+      // Backwards compatibility aliases
+      ret.invoiceNumber = ret.referenceNo || ret.invoiceNumber;
+      ret.grandTotal = ret.totalAmount ? parseFloat(ret.totalAmount) : ret.grandTotal;
+      ret.balance = ret.amountOutstanding ? parseFloat(ret.amountOutstanding) : ret.balance;
+      ret.currency = ret.currencyCode || ret.currency;
+      ret.items = ret.lines || ret.items;
+      ret.date = ret.invoiceDate || ret.date;
+      
+      return ret;
+    }
+  }
 });
 
 // Compound index for company + unique invoice number
-invoiceSchema.index({ company: 1, invoiceNumber: 1 }, { unique: true });
+invoiceSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
 invoiceSchema.index({ company: 1 });
 
 // Performance indexes for reports
@@ -263,43 +408,59 @@ invoiceSchema.index({ company: 1, invoiceDate: 1 });
 invoiceSchema.index({ 'payments.paidDate': 1 });
 invoiceSchema.index({ client: 1 });
 invoiceSchema.index({ createdBy: 1 });
+invoiceSchema.index({ quotation: 1 });
 
-// Auto-generate invoice number
+// Auto-generate invoice number - Module 6 format INV-YYYY-NNNNN
 invoiceSchema.pre('save', async function(next) {
-  if (this.isNew && !this.invoiceNumber) {
-    this.invoiceNumber = await generateUniqueNumber('INV', mongoose.model('Invoice'), this.company, 'invoiceNumber');
+  if (this.isNew && !this.referenceNo) {
+    this.referenceNo = await generateUniqueNumber('INV', mongoose.model('Invoice'), this.company, 'referenceNo');
   }
   next();
 });
 
-// Calculate totals before saving - with Tax A and Tax B support
+// Calculate totals before saving - Module 6 logic
 invoiceSchema.pre('save', function(next) {
-  if (this.items && this.items.length > 0) {
+  const lines = this.lines || this.items || [];
+  
+  if (lines.length > 0) {
     // Calculate tax breakdown
     let totalAEx = 0;
     let totalB18 = 0;
     let totalTaxA = 0;
     let totalTaxB = 0;
+    let subtotalVal = 0;
+    let totalDiscount = 0;
     
-    this.items.forEach(item => {
-      const itemSubtotal = item.quantity * item.unitPrice;
-      const itemDiscount = item.discount || 0;
-      const netAmount = itemSubtotal - itemDiscount;
+    lines.forEach(line => {
+      const qty = line.qty || line.quantity || 0;
+      const unitPrice = line.unitPrice || 0;
+      const discountPct = line.discountPct || line.discount || 0;
+      const taxRate = line.taxRate || 0;
       
-      if (item.taxCode === 'A') {
-        // Tax A - typically 0%
+      const lineSubtotal = qty * unitPrice;
+      const lineDiscount = lineSubtotal * (discountPct / 100);
+      const netAmount = lineSubtotal - lineDiscount;
+      const lineTax = netAmount * (taxRate / 100);
+      const lineTotal = netAmount + lineTax;
+      
+      // Update line calculations - Module 6 naming
+      line.lineSubtotal = lineSubtotal;
+      line.lineTax = lineTax;
+      line.lineTotal = lineTotal;
+      line.subtotal = lineSubtotal; // backwards compat
+      line.taxAmount = lineTax; // backwards compat
+      line.totalWithTax = lineTotal; // backwards compat
+      
+      subtotalVal += lineSubtotal;
+      totalDiscount += lineDiscount;
+      
+      if (line.taxCode === 'A') {
         totalAEx += netAmount;
-        totalTaxA += netAmount * (item.taxRate / 100);
-      } else if (item.taxCode === 'B') {
-        // Tax B - typically 18%
+        totalTaxA += lineTax;
+      } else if (line.taxCode === 'B') {
         totalB18 += netAmount;
-        totalTaxB += netAmount * (item.taxRate / 100);
+        totalTaxB += lineTax;
       }
-      
-      // Update item calculations
-      item.subtotal = itemSubtotal;
-      item.taxAmount = netAmount * (item.taxRate / 100);
-      item.totalWithTax = netAmount + item.taxAmount;
     });
     
     // Set tax breakdown
@@ -308,35 +469,66 @@ invoiceSchema.pre('save', function(next) {
     this.totalTaxA = totalTaxA;
     this.totalTaxB = totalTaxB;
     
+    // Calculate totals - Module 6 naming with Decimal128
+    const totalTaxVal = totalTaxA + totalTaxB;
+    const grandTotalVal = subtotalVal - totalDiscount + totalTaxVal;
+    
+    this.subtotal = mongoose.Types.Decimal128.fromString(subtotalVal.toString());
+    this.taxAmount = mongoose.Types.Decimal128.fromString(totalTaxVal.toString());
+    this.totalAmount = mongoose.Types.Decimal128.fromString(grandTotalVal.toString());
+    this.totalTax = totalTaxVal; // backwards compat
+    
     // Legacy calculations
-    this.subtotal = this.items ? this.items.reduce((sum, item) => sum + (item.subtotal || 0), 0) : 0;
-    this.totalDiscount = this.items ? this.items.reduce((sum, item) => sum + (item.discount || 0), 0) : 0;
-    this.totalTax = totalTaxA + totalTaxB;
-    this.grandTotal = this.subtotal - this.totalDiscount + this.totalTax;
+    this.subtotal = subtotalVal;
+    this.totalDiscount = totalDiscount;
+    this.totalTax = totalTaxVal;
+    this.grandTotal = grandTotalVal;
+    this.roundedAmount = Math.round(grandTotalVal * 100) / 100;
+    this.taxAmount = totalTaxVal;
+    this.discount = totalDiscount;
+    this.total = this.roundedAmount || grandTotalVal;
     
-    // Rounded amount
-    this.roundedAmount = Math.round(this.grandTotal * 100) / 100;
-    // Backwards-compatible aliases expected by other parts of the system
-    this.taxAmount = this.totalTax;
-    this.discount = this.totalDiscount;
-    // `total` should represent the invoice total amount. Prefer roundedAmount when available.
-    this.total = this.roundedAmount || this.grandTotal;
-    
-    // Always calculate balance - ensure it's never undefined
-    this.balance = (this.roundedAmount || 0) - (this.amountPaid || 0);
+    // Amount outstanding calculation - Module 6
+    const amountPaidVal = parseFloat(this.amountPaid) || 0;
+    this.amountOutstanding = mongoose.Types.Decimal128.fromString((grandTotalVal - amountPaidVal).toString());
+    this.balance = (grandTotalVal - amountPaidVal); // backwards compat
   }
   
-  // Update status based on payment
-  if (this.amountPaid >= this.roundedAmount && this.roundedAmount > 0) {
-    this.status = 'paid';
+  // Update status based on payment - Module 6 naming
+  const amountPaidVal = parseFloat(this.amountPaid) || 0;
+  const grandTotalVal = this.roundedAmount || parseFloat(this.totalAmount) || 0;
+  
+  if (grandTotalVal > 0 && amountPaidVal >= grandTotalVal) {
+    this.status = 'fully_paid';
     if (!this.paidDate) {
       this.paidDate = new Date();
     }
-  } else if (this.amountPaid > 0 && this.amountPaid < this.roundedAmount) {
-    this.status = 'partial';
+  } else if (amountPaidVal > 0 && amountPaidVal < grandTotalVal) {
+    this.status = 'partially_paid';
+  } else if (this.status === 'cancelled') {
+    // Keep cancelled status
+  } else if (amountPaidVal === 0 && grandTotalVal > 0) {
+    this.status = 'confirmed';
   }
   
   next();
+});
+
+// Virtual for backwards compatibility
+invoiceSchema.virtual('invoiceNumber').get(function() {
+  return this.referenceNo;
+});
+invoiceSchema.virtual('items').get(function() {
+  return this.lines || this.items;
+});
+invoiceSchema.virtual('grandTotal').get(function() {
+  return parseFloat(this.totalAmount) || this.grandTotal;
+});
+invoiceSchema.virtual('balance').get(function() {
+  return parseFloat(this.amountOutstanding) || this.balance;
+});
+invoiceSchema.virtual('currency').get(function() {
+  return this.currencyCode || this.currency;
 });
 
 module.exports = mongoose.model('Invoice', invoiceSchema);

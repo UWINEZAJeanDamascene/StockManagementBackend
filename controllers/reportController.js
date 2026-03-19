@@ -30,254 +30,18 @@ function _dbRateReport(cost, salvage, years) {
 // and partial periods show a proportional monthly amount.
 function calculateDepreciationForPeriod(assets, periodStart, periodEnd) {
   let total = 0;
-
+  if (!Array.isArray(assets) || assets.length === 0) return 0;
+  const monthsInPeriod = Math.max(1, Math.round((periodEnd - periodStart) / (1000 * 60 * 60 * 24 * 30)));
   assets.forEach(asset => {
-    if (!asset.purchaseDate || !asset.purchaseCost || !asset.usefulLifeYears) return;
-
-    const purchaseDate = new Date(asset.purchaseDate);
-    // Snap to 1st of purchase month — use UTC getters to avoid timezone day-shift
-    // when dates are stored as "YYYY-MM-01T00:00:00.000Z" (UTC midnight)
-    const depStart    = new Date(Date.UTC(purchaseDate.getUTCFullYear(), purchaseDate.getUTCMonth(), 1));
-    const totalMonths = asset.usefulLifeYears * 12;
-    // Depreciation ends at 1st of the month after useful life expires
-    const depEnd = new Date(Date.UTC(depStart.getUTCFullYear(), depStart.getUTCMonth() + totalMonths, 1));
-
-    const depreciable = (asset.purchaseCost || 0) - (asset.salvageValue || 0);
-    if (depreciable <= 0) return;
-
-    // Work in absolute month indices (year * 12 + month) — all UTC
-    const depStartAbs    = depStart.getUTCFullYear()    * 12 + depStart.getUTCMonth();
-    const depEndAbs      = depEnd.getUTCFullYear()      * 12 + depEnd.getUTCMonth();
-    const periodStartAbs = periodStart.getUTCFullYear() * 12 + periodStart.getUTCMonth();
-    const periodEndAbs   = periodEnd.getUTCFullYear()   * 12 + periodEnd.getUTCMonth();
-
-    const overlapStart = Math.max(depStartAbs, periodStartAbs);
-    const overlapEnd   = Math.min(depEndAbs, periodEndAbs + 1); // inclusive end month
-
-    if (overlapEnd <= overlapStart) return; // no overlap
-
-    // Sum monthly depreciation for each month in the overlap
-    for (let abs = overlapStart; abs < overlapEnd; abs++) {
-      const monthsIntoLife = abs - depStartAbs;
-      if (monthsIntoLife < 0 || monthsIntoLife >= totalMonths) continue;
-
-      const yearIdx = Math.floor(monthsIntoLife / 12); // 0-indexed year in asset's life
-
-      let monthlyDep = 0;
-      switch (asset.depreciationMethod || 'straight-line') {
-        case 'straight-line':
-          monthlyDep = depreciable / totalMonths;
-          break;
-        case 'sum-of-years': {
-          const syd = (asset.usefulLifeYears * (asset.usefulLifeYears + 1)) / 2;
-          const remainingLife = asset.usefulLifeYears - yearIdx;
-          monthlyDep = (depreciable * remainingLife) / syd / 12;
-          break;
-        }
-        case 'declining-balance': {
-          const rate = _dbRateReport(asset.purchaseCost, asset.salvageValue || 0, asset.usefulLifeYears);
-          let bv = asset.purchaseCost;
-          for (let y = 0; y < yearIdx; y++) {
-            const dep = Math.min(bv * rate, Math.max(0, bv - (asset.salvageValue || 0)));
-            bv -= dep;
-          }
-          const yearlyDep = Math.min(bv * rate, Math.max(0, bv - (asset.salvageValue || 0)));
-          monthlyDep = yearlyDep / 12;
-          break;
-        }
-        default:
-          monthlyDep = depreciable / totalMonths;
-      }
-      total += monthlyDep;
-    }
+    const cost = asset.purchaseCost || asset.cost || 0;
+    const salvage = asset.salvageValue || 0;
+    const years = Math.max(1, asset.usefulLifeYears || asset.lifeYears || 5);
+    const annualRate = _dbRateReport(cost, salvage, years);
+    const annualDep = (cost - salvage) * annualRate;
+    const prorated = (annualDep / 12) * monthsInPeriod;
+    total += prorated;
   });
-
   return total;
-}
-
-// Shared helper: calculates interest expense for a list of active loans within a reporting period.
-// Handles both simple interest (fixed monthly interest on outstanding balance) and
-// compound/EMI interest (amortizing schedule – interest portion of each EMI).
-function calculateLoanInterest(loans, periodStart, periodEnd) {
-  let interestExpense = 0;
-
-  loans.forEach(loan => {
-    const loanStart  = new Date(loan.startDate);
-    const loanEnd    = loan.endDate ? new Date(loan.endDate) : null;
-    const method     = loan.interestMethod || 'simple';
-    const annualRate = loan.interestRate   || 0;
-    const r          = annualRate / 100 / 12; // monthly rate
-
-    if (method === 'compound' && loan.durationMonths && r > 0) {
-      // ── COMPOUND / EMI ────────────────────────────────────────────────────
-      // Walk the full amortization schedule; sum interest only for months that
-      // fall inside the reporting period.
-      const n   = loan.durationMonths;
-      const P   = loan.originalAmount;
-      const emi = P * r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1);
-
-      let balance = P;
-      for (let m = 0; m < n; m++) {
-        const monthDate  = new Date(loanStart);
-        monthDate.setMonth(monthDate.getMonth() + m);
-
-        const interest    = balance * r;
-        const principal   = emi - interest;
-
-        const mY = monthDate.getFullYear(), mM = monthDate.getMonth();
-        const sY = periodStart.getFullYear(), sM = periodStart.getMonth();
-        const eY = periodEnd.getFullYear(),   eM = periodEnd.getMonth();
-
-        const afterStart = (mY > sY) || (mY === sY && mM >= sM);
-        const beforeEnd  = (mY < eY) || (mY === eY && mM <= eM);
-
-        if (afterStart && beforeEnd) interestExpense += interest;
-
-        balance -= principal;
-        if (balance < 0.01) break;
-      }
-    } else {
-      // ── SIMPLE INTEREST ───────────────────────────────────────────────────
-      // For simple interest the FULL interest for the entire loan duration is
-      // recognised immediately (front-loaded) — both in P&L and Balance Sheet.
-      // We still clamp to the reporting period to avoid including loans that
-      // haven't started yet or have already ended.
-      const effectiveStart = loanStart > periodStart ? loanStart : periodStart;
-      const effectiveEnd   = (loanEnd && loanEnd < periodEnd) ? loanEnd : periodEnd;
-
-      if (effectiveEnd < effectiveStart) return; // not active in this period
-
-      // Use the full contractual duration, not just the reporting-period slice.
-      // Fall back to the clamped window only when durationMonths is not recorded.
-      const totalDurationMonths = loan.durationMonths || Math.max(1,
-        ((effectiveEnd.getFullYear() - effectiveStart.getFullYear()) * 12 +
-          effectiveEnd.getMonth() - effectiveStart.getMonth()) + 1
-      );
-
-      // Simple interest: full interest for entire loan term, recognised immediately
-      const monthlyInterest = (loan.originalAmount * annualRate / 100) / 12;
-      interestExpense += monthlyInterest * totalDurationMonths;
-    }
-  });
-
-  return interestExpense;
-}
-
-// Shared helper: computes NET PROFIT (AFTER TAX) using the EXACT same logic as getProfitAndLossFull.
-// This ensures Balance Sheet → Equity → Current Period Profit always matches P&L → Net Profit (After Tax).
-// Any change to the P&L formula will automatically be reflected in the Balance Sheet.
-async function computeCurrentPeriodProfit(companyId, periodStart, periodEnd) {
-  // ── REVENUE ──────────────────────────────────────────────────────────────
-  const paidInvoices = await Invoice.find({
-    company: companyId,
-    status: 'paid',
-    paidDate: { $gte: periodStart, $lte: periodEnd }
-  }).populate('items.product', 'averageCost');
-
-  const salesRevenueExVAT = paidInvoices.reduce((sum, inv) => sum + (inv.subtotal || 0), 0);
-  const discountsGiven = paidInvoices.reduce((sum, inv) => sum + (inv.totalDiscount || 0), 0);
-
-  const creditNotes = await CreditNote.find({
-    company: companyId,
-    status: { $in: ['issued', 'applied', 'refunded', 'partially_refunded'] },
-    issueDate: { $gte: periodStart, $lte: periodEnd }
-  });
-  const salesReturns = creditNotes.reduce((sum, cn) => sum + (cn.subtotal || 0), 0);
-
-  const netRevenue = salesRevenueExVAT - salesReturns - discountsGiven;
-
-  // ── COGS ─────────────────────────────────────────────────────────────────
-  const purchases = await Purchase.find({
-    company: companyId,
-    status: { $in: ['received', 'paid'] },
-    purchaseDate: { $gte: periodStart, $lte: periodEnd }
-  });
-  const purchasesExVAT = purchases.reduce((sum, p) => sum + (p.subtotal || 0) - (p.totalDiscount || 0), 0);
-
-  const purchaseReturnsData = await PurchaseReturn.aggregate([
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['approved', 'refunded'] },
-        returnDate: { $gte: periodStart, $lte: periodEnd }
-      }
-    },
-    { $group: { _id: null, subtotal: { $sum: '$subtotal' } } }
-  ]);
-  const purchaseReturns = purchaseReturnsData[0]?.subtotal || 0;
-
-  const products = await Product.find({ company: companyId, isArchived: false });
-  const closingStockValue = products.reduce((sum, p) => sum + (p.currentStock * p.averageCost), 0);
-
-  // openingStockValue defaults to 0 (same as P&L Full when no previousPeriod provided)
-  const totalCOGS = purchasesExVAT - purchaseReturns - closingStockValue;
-
-  const grossProfit = netRevenue - totalCOGS;
-
-  // ── OPERATING EXPENSES (from Expense model – mirrors P&L Full exactly) ──
-  const expenseSummary = await Expense.aggregate([
-    {
-      $match: {
-        company: companyId,
-        status: { $ne: 'cancelled' }
-        // No date filter – matches P&L Full behaviour
-      }
-    },
-    { $group: { _id: '$type', total: { $sum: '$amount' } } }
-  ]);
-
-  const expenseData = {};
-  expenseSummary.forEach(item => { expenseData[item._id] = item.total; });
-
-  const salariesWages         = expenseData['salaries_wages'] || 0;
-  const rent                  = expenseData['rent'] || 0;
-  const utilities             = expenseData['utilities'] || 0;
-  const transportDelivery     = expenseData['transport_delivery'] || 0;
-  const marketingAdvertising  = expenseData['marketing_advertising'] || 0;
-  const otherExpenses         = expenseData['other_expense'] || 0;
-
-  // Depreciation — period-aware, starts from 1st of purchase month
-  const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
-  const depreciationExpense = calculateDepreciationForPeriod(fixedAssets, periodStart, periodEnd);
-
-  const totalOperatingExpenses =
-    salariesWages + rent + utilities + transportDelivery +
-    marketingAdvertising + depreciationExpense + otherExpenses;
-
-  const operatingProfit = grossProfit - totalOperatingExpenses;
-
-  // ── OTHER INCOME / EXPENSES ───────────────────────────────────────────────
-  const interestIncome        = expenseData['interest_income'] || 0;
-  const otherIncome           = expenseData['other_income'] || 0;
-  const otherExpenseFromModule = expenseData['other_expense_income'] || 0;
-
-  const activeLoans = await Loan.find({
-    company: companyId,
-    status: 'active',
-    startDate: { $lte: periodEnd },
-    $or: [{ endDate: { $exists: false } }, { endDate: null }, { endDate: { $gte: periodStart } }]
-  });
-  const interestExpense = calculateLoanInterest(activeLoans, periodStart, periodEnd);
-
-  const netOtherIncome = interestIncome + otherIncome - interestExpense - otherExpenseFromModule;
-
-  // ── PROFIT BEFORE TAX ─────────────────────────────────────────────────────
-  const profitBeforeTax = operatingProfit + netOtherIncome;
-
-  // ── CORPORATE INCOME TAX (30%) ────────────────────────────────────────────
-  const corporateIncomeTax = Math.max(0, profitBeforeTax * 0.30);
-
-  // ── NET PROFIT (AFTER TAX) ────────────────────────────────────────────────
-  const netProfit = profitBeforeTax - corporateIncomeTax;
-
-  return {
-    netProfit,
-    corporateIncomeTax,
-    profitBeforeTax,
-    netRevenue,
-    grossProfit,
-    invoicesConsidered: paidInvoices.length
-  };
 }
 // @desc    Get stock valuation report
 // @route   GET /api/reports/stock-valuation
@@ -1202,12 +966,98 @@ exports.getFinancialRatios = async (req, res, next) => {
     const periodStart = startDate ? new Date(startDate) : new Date(asOf.getFullYear(), 0, 1);
     const periodEnd = endDate ? new Date(endDate) : asOf;
 
-    // Get basic P&L figures using existing helper to ensure consistency
-    const pl = await computeCurrentPeriodProfit(companyId, periodStart, periodEnd);
-    const netProfit = pl.netProfit || 0;
-    const profitBeforeTax = pl.profitBeforeTax || 0;
-    const netRevenue = pl.netRevenue || 0;
-    const grossProfit = pl.grossProfit || 0;
+    // Compute KPIs. Prefer AccountBalance snapshot for the no-date case (live dashboard values).
+    const AccountBalance = require('../models/AccountBalance');
+    const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+
+    const balances = (!startDate && !endDate)
+      ? await AccountBalance.find({ company: companyId }).lean()
+      : null;
+
+    const findBal = (code) => {
+      if (balances) return balances.find(b => b.accountCode === code) || { debit: 0, credit: 0 };
+      return null;
+    };
+
+    // Helper to compute net value from balance doc (credit - debit when normal credit, else debit - credit)
+    const netFrom = (code, normal = 'debit') => {
+      const b = findBal(code);
+      if (!b) return null;
+      if (normal === 'debit') return (b.debit || 0) - (b.credit || 0);
+      return (b.credit || 0) - (b.debit || 0);
+    };
+
+    // If no snapshot available, fall back to aggregations
+    let currentRatio = null;
+    let quickRatio = null;
+    let grossMargin = null;
+    let inventoryTurnover = null;
+    let daysInventory = null;
+    let apTurnover = null;
+    let returnOnAssets = null;
+    let debtToEquity = null;
+    let netProfitMargin = null;
+
+    if (balances) {
+      // Current Assets: sum of current asset accounts (use typical codes)
+      const cash = netFrom(DEFAULT_ACCOUNTS.cashAtBank, 'debit') || 0;
+      const receivables = netFrom(DEFAULT_ACCOUNTS.accountsReceivable, 'debit') || 0;
+      const inventoryVal = netFrom(DEFAULT_ACCOUNTS.inventory, 'debit') || 0;
+      const prepaid = netFrom(DEFAULT_ACCOUNTS.prepaidExpenses, 'debit') || 0;
+
+      const currentAssets = cash + receivables + inventoryVal + prepaid;
+
+      const accountsPayable = netFrom(DEFAULT_ACCOUNTS.accountsPayable, 'credit') || 0;
+      const shortTermLoans = netFrom(DEFAULT_ACCOUNTS.shortTermLoans, 'credit') || 0;
+      const vatPayable = netFrom(DEFAULT_ACCOUNTS.vatPayable, 'credit') || 0;
+      const currentLiabilities = accountsPayable + shortTermLoans + vatPayable;
+
+      currentRatio = currentLiabilities ? currentAssets / currentLiabilities : null;
+      quickRatio = currentLiabilities ? (currentAssets - inventoryVal) / currentLiabilities : null;
+
+      // Gross margin: (Revenue - COGS) / Revenue
+      const salesRev = netFrom(DEFAULT_ACCOUNTS.salesRevenue, 'credit') || 0;
+      const salesReturns = netFrom(DEFAULT_ACCOUNTS.salesReturns, 'debit') || 0;
+      const netRevenueVal = salesRev - salesReturns;
+      const cogs = netFrom(DEFAULT_ACCOUNTS.costOfGoodsSold, 'debit') || 0;
+      grossMargin = netRevenueVal ? ((netRevenueVal - cogs) / netRevenueVal) * 100 : null;
+
+      // Inventory turnover and days
+      // For avg inventory approximate with current inventory value (could be improved with historical snapshot)
+      inventoryTurnover = inventoryVal ? (cogs / inventoryVal) : null;
+      daysInventory = inventoryTurnover ? (365 / inventoryTurnover) : null;
+
+      // AP turnover: purchases / avg AP. Use purchases aggregate if available as fallback.
+      const purchasesTotal = await Purchase.aggregate([{ $match: { company: companyId } }, { $group: { _id: null, total: { $sum: '$subtotal' } } }]);
+      const purchasesVal = purchasesTotal[0]?.total || 0;
+      apTurnover = accountsPayable ? (purchasesVal / accountsPayable) : null;
+
+      // Return on assets
+      const totalAssets = (await Product.aggregate([{ $match: { company: companyId } }, { $group: { _id: null, totalValue: { $sum: { $multiply: ['$currentStock', '$averageCost'] } } } }]))[0]?.totalValue || 0;
+      const netProfitVal = (netFrom(DEFAULT_ACCOUNTS.currentProfit, 'credit') || 0) + (netFrom(DEFAULT_ACCOUNTS.retainedEarnings, 'credit') || 0); // approximation
+      returnOnAssets = totalAssets ? (netProfitVal / totalAssets) : null;
+
+      // Debt to equity
+      const totalDebt = (netFrom(DEFAULT_ACCOUNTS.shortTermLoans, 'credit') || 0) + (netFrom(DEFAULT_ACCOUNTS.longTermLoans, 'credit') || 0);
+      const shareholdersEquity = (netFrom(DEFAULT_ACCOUNTS.shareCapital, 'credit') || 0) + (netFrom(DEFAULT_ACCOUNTS.retainedEarnings, 'credit') || 0) + (netFrom(DEFAULT_ACCOUNTS.currentProfit, 'credit') || 0);
+      debtToEquity = shareholdersEquity ? (totalDebt / shareholdersEquity) : null;
+
+      netProfitMargin = netRevenueVal ? ((netProfitVal) / netRevenueVal) * 100 : null;
+    } else {
+      // Fallback: compute via existing PL helper and aggregates
+      const pl = await computeCurrentPeriodProfit(companyId, periodStart, periodEnd);
+      const netRevenueVal = pl.netRevenue || 0;
+      const cogs = pl.totalCOGS || 0;
+      grossMargin = netRevenueVal ? ((netRevenueVal - cogs) / netRevenueVal) * 100 : null;
+      netProfitMargin = netRevenueVal ? ((pl.netProfit || 0) / netRevenueVal) * 100 : null;
+      // other ratios: compute using aggregates (simpler)
+      const totalAssets = (await Product.aggregate([{ $match: { company: companyId } }, { $group: { _id: null, totalValue: { $sum: { $multiply: ['$currentStock', '$averageCost'] } } } }]))[0]?.totalValue || 0;
+      returnOnAssets = totalAssets ? ((pl.netProfit || 0) / totalAssets) : null;
+      // current ratio fallback (basic): using invoice/payable aggregates
+      const accountsReceivable = (await Invoice.aggregate([{ $match: { company: companyId, status: 'paid' } }, { $group: { _id: null, total: { $sum: '$balance' } } }]))[0]?.total || 0;
+      const accountsPayable = (await Purchase.aggregate([{ $match: { company: companyId, balance: { $gt: 0 } } }, { $group: { _id: null, total: { $sum: '$balance' } } }]))[0]?.total || 0;
+      currentRatio = accountsPayable ? ((accountsReceivable + totalAssets) / accountsPayable) : null;
+    }
 
     // Get Balance Sheet aggregates (minimal set) to compute ratios
     // Use same logic as Balance Sheet for consistency
@@ -1457,7 +1307,7 @@ exports.getCashFlowStatement = async (req, res, next) => {
     const cacheKey = { companyId, startDate, endDate, period };
     
     const cached = await cacheService.fetchOrExecute(
-      'report_cashflow_v4',
+      'report_cashflow_v5',
       async () => {
         const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), 0, 1);
         const end = endDate ? new Date(endDate) : new Date();
@@ -1720,6 +1570,16 @@ exports.getCashFlowStatement = async (req, res, next) => {
           withdrawalsDifference: totalCashToBank - totalCashToSuppliers
         };
 
+        // Snapshot cash position from AccountBalance (cash accounts)
+        const AccountBalance = require('../models/AccountBalance');
+        const cashAccounts = [
+          require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS.cashAtBank,
+          require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS.cashInHand,
+          require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS.mtnMoMo
+        ];
+        const balances = await AccountBalance.find({ company: companyId, accountCode: { $in: cashAccounts } }).lean();
+        const cashPosition = balances.reduce((s, b) => s + ((b.debit || 0) - (b.credit || 0)), 0);
+
         const summary = {
           operating: {
             cashFromBank: totalCashFromBank,
@@ -1743,7 +1603,8 @@ exports.getCashFlowStatement = async (req, res, next) => {
             netCashFlow: netFinancingCashFlow
           },
           netChangeInCash: netOperatingCashFlow + netInvestingCashFlow + netFinancingCashFlow,
-          reconciliation
+          reconciliation,
+          cashPosition
         };
 
         return { period: { start, end }, periodType: period, months, summary };

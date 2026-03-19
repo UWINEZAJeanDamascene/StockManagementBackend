@@ -30,6 +30,11 @@ const warehouseSchema = new mongoose.Schema({
     phone: String,
     email: String
   },
+  // Optional warehouse-specific inventory account (account code)
+  inventoryAccount: {
+    type: String,
+    default: null
+  },
   isActive: {
     type: Boolean,
     default: true
@@ -58,6 +63,11 @@ const warehouseSchema = new mongoose.Schema({
 // Compound index for company + unique code
 warehouseSchema.index({ company: 1, code: 1 }, { unique: true });
 warehouseSchema.index({ company: 1 });
+// Partial unique index to ensure only one default warehouse per company
+warehouseSchema.index(
+  { company: 1, isDefault: 1 },
+  { unique: true, partialFilterExpression: { isDefault: true } }
+);
 
 // Auto-generate warehouse code
 warehouseSchema.pre('save', async function(next) {

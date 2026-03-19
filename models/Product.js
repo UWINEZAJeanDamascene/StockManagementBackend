@@ -71,30 +71,59 @@ const productSchema = new mongoose.Schema({
     ref: 'Supplier'
   },
   currentStock: {
-    type: Number,
-    default: 0,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.0000')
+  },
+  // Active flag: soft-delete control
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  // Whether inventory journals should be generated for this product
+  isStockable: {
+    type: Boolean,
+    default: true
   },
   lowStockThreshold: {
-    type: Number,
-    default: 10,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('10.0000')
   },
   averageCost: {
-    type: Number,
-    default: 0,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.00'),
+    get: v => (v == null ? '0.00' : (typeof v === 'string' ? v : (v.toString())) )
   },
   sellingPrice: {
-    type: Number,
-    default: 0,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.00'),
+    get: v => (v == null ? '0.00' : (typeof v === 'string' ? v : (v.toString())) )
   },
   lastSupplyDate: {
     type: Date
   },
   lastSaleDate: {
     type: Date
+  },
+  // Fallback cost price (not authoritative)
+  costPrice: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.00')
+  },
+  // Costing method
+  costingMethod: {
+    type: String,
+    enum: ['fifo', 'weighted'],
+    default: 'fifo'
+  },
+  // Accounting mappings (store account codes)
+  inventoryAccount: {
+    type: String
+  },
+  cogsAccount: {
+    type: String
+  },
+  revenueAccount: {
+    type: String
   },
   isArchived: {
     type: Boolean,
@@ -114,7 +143,13 @@ const productSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  // Advanced inventory tracking flags
+  // Advanced inventory tracking - tracking_type replaces trackBatch/trackSerialNumbers
+  trackingType: {
+    type: String,
+    enum: ['none', 'batch', 'serial'],
+    default: 'none'
+  },
+  // Legacy tracking flags (deprecated - use trackingType)
   trackBatch: {
     type: Boolean,
     default: false
@@ -125,12 +160,12 @@ const productSchema = new mongoose.Schema({
   },
   // Reorder settings
   reorderPoint: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.0000')
   },
   reorderQuantity: {
-    type: Number,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.0000')
   },
   // Multiple warehouse support - store default warehouse
   defaultWarehouse: {
@@ -149,10 +184,8 @@ const productSchema = new mongoose.Schema({
     default: 'A'
   },
   taxRate: {
-    type: Number,
-    default: 0,
-    min: 0,
-    max: 100
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.000000')
   },
   history: [productHistorySchema],
   createdBy: {
@@ -178,7 +211,13 @@ productSchema.index({ supplier: 1 });
 
 // Virtual for low stock alert
 productSchema.virtual('isLowStock').get(function() {
-  return this.currentStock <= this.lowStockThreshold;
+  try {
+    const cs = this.currentStock && this.currentStock.toString ? parseFloat(this.currentStock.toString()) : Number(this.currentStock || 0);
+    const th = this.lowStockThreshold && this.lowStockThreshold.toString ? parseFloat(this.lowStockThreshold.toString()) : Number(this.lowStockThreshold || 0);
+    return cs <= th;
+  } catch (e) {
+    return false;
+  }
 });
 
 // Add history entry before save
@@ -196,16 +235,51 @@ productSchema.pre('save', async function(next) {
       }
     }
     
-    this.history.push({
-      action: 'created',
-      changedBy: this.createdBy,
-      changes: this.toObject()
-    });
+    // Only record creation history when we have a creator reference.
+    if (this.createdBy) {
+      this.history.push({
+        action: 'created',
+        changedBy: this.createdBy,
+        changes: this.toObject()
+      });
+    }
   }
   next();
 });
 
-productSchema.set('toJSON', { virtuals: true });
+// Ensure Decimal128 fields serialize as string amounts in JSON
+// Ensure Decimal128 fields serialize as strings
+productSchema.set('toJSON', {
+  virtuals: true,
+  transform: (doc, ret) => {
+    const toMoney = (val) => {
+      if (val == null) return '0.00';
+      try { return parseFloat(val.toString()).toFixed(2); } catch (e) { return String(val); }
+    };
+    const toQty = (val) => {
+      if (val == null) return '0.0000';
+      try { return parseFloat(val.toString()).toFixed(4); } catch (e) { return String(val); }
+    };
+    if (ret.averageCost !== undefined) ret.averageCost = toMoney(ret.averageCost);
+    if (ret.sellingPrice !== undefined) ret.sellingPrice = toMoney(ret.sellingPrice);
+    if (ret.costPrice !== undefined) ret.costPrice = toMoney(ret.costPrice);
+    if (ret.currentStock !== undefined) ret.currentStock = toQty(ret.currentStock);
+    if (ret.lowStockThreshold !== undefined) ret.lowStockThreshold = toQty(ret.lowStockThreshold);
+    if (ret.reorderPoint !== undefined) ret.reorderPoint = toQty(ret.reorderPoint);
+    if (ret.reorderQuantity !== undefined) ret.reorderQuantity = toQty(ret.reorderQuantity);
+    if (ret.taxRate !== undefined) ret.taxRate = (ret.taxRate == null) ? '0.000000' : parseFloat(ret.taxRate.toString()).toFixed(6);
+    return ret;
+  }
+});
+
 productSchema.set('toObject', { virtuals: true });
+
+// Apply audit/soft-delete plugin
+const auditPlugin = require('./plugins/auditSoftDeletePlugin');
+productSchema.plugin(auditPlugin);
+
+// Convert Decimal128 results to JS numbers for compatibility with tests and lean queries
+const decimalTransform = require('./plugins/decimalTransformPlugin');
+productSchema.plugin(decimalTransform);
 
 module.exports = mongoose.model('Product', productSchema);

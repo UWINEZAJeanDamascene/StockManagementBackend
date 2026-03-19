@@ -1,0 +1,33 @@
+version: '3.8'
+services:
+  mongo1:
+    image: mongo:6.0
+    container_name: mongo1
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+  mongo2:
+    image: mongo:6.0
+    container_name: mongo2
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27018:27017"
+  mongo3:
+    image: mongo:6.0
+    container_name: mongo3
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27019:27017"
+  app:
+    image: node:18
+    container_name: tn_app
+    working_dir: /usr/src/app
+    volumes:
+      - ./:/usr/src/app
+    depends_on:
+      - mongo1
+      - mongo2
+      - mongo3
+    environment:
+      - MONGODB_URI=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0
+    command: ["tail", "-f", "/dev/null"]

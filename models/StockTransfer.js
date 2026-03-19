@@ -1,25 +1,7 @@
 const mongoose = require('mongoose');
 
-const stockTransferItemSchema = new mongoose.Schema({
-  product: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Product',
-    required: true
-  },
-  quantity: {
-    type: Number,
-    required: [true, 'Please provide quantity'],
-    min: [1, 'Quantity must be at least 1']
-  },
-  // For products with serial numbers
-  serialNumbers: [{
-    type: String,
-    uppercase: true
-  }],
-  // For batch-tracked products
-  batchNumber: String,
-  notes: String
-}, { _id: false });
+// Items are stored in a separate `StockTransferLine` model to preserve
+// per-line Decimal128 precision and audit history.
 
 const stockTransferSchema = new mongoose.Schema({
   // Multi-tenancy: company reference
@@ -46,11 +28,12 @@ const stockTransferSchema = new mongoose.Schema({
     ref: 'Warehouse',
     required: true
   },
-  items: [stockTransferItemSchema],
-  // Status: draft, pending, in_transit, completed, cancelled
+  // Lines reference
+  items: [{ type: mongoose.Schema.Types.ObjectId, ref: 'StockTransferLine' }],
+  // Status: draft, pending, in_transit, confirmed, completed, cancelled
   status: {
     type: String,
-    enum: ['draft', 'pending', 'in_transit', 'completed', 'cancelled'],
+    enum: ['draft', 'pending', 'in_transit', 'confirmed', 'completed', 'cancelled'],
     default: 'draft'
   },
   transferDate: {
@@ -67,12 +50,12 @@ const stockTransferSchema = new mongoose.Schema({
     default: 'rebalance'
   },
   notes: String,
-  // Approval workflow
-  approvedBy: {
+  // Approval / confirmation
+  confirmedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
-  approvedDate: Date,
+  confirmedAt: Date,
   // Receiving info
   receivedBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -82,6 +65,12 @@ const stockTransferSchema = new mongoose.Schema({
   receivedNotes: String,
   // Reference to related documents
   referenceNumber: String,
+  // Linked journal entry (if posted on confirmation)
+  journalEntry: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
   // User who created the transfer
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -98,20 +87,21 @@ stockTransferSchema.index({ fromWarehouse: 1, status: 1 });
 stockTransferSchema.index({ toWarehouse: 1, status: 1 });
 stockTransferSchema.index({ transferDate: -1 });
 
-// Pre-save middleware to generate transfer number
+// Pre-save middleware to generate transfer number using per-year padded sequence
 stockTransferSchema.pre('save', async function(next) {
   if (this.isNew && !this.transferNumber) {
-    const count = await mongoose.model('StockTransfer').countDocuments({ company: this.company });
-    this.transferNumber = `TRF-${String(count + 1).padStart(6, '0')}`;
+    const year = new Date(this.transferDate || Date.now()).getFullYear();
+    const count = await mongoose.model('StockTransfer').countDocuments({ company: this.company, transferDate: { $gte: new Date(`${year}-01-01`), $lte: new Date(`${year}-12-31`) } });
+    this.transferNumber = `TRF-${year}-${String(count + 1).padStart(5, '0')}`;
   }
-  
+
   // Validate from and to warehouses are different
-  if (this.fromWarehouse.toString() === this.toWarehouse.toString()) {
+  if (this.fromWarehouse && this.toWarehouse && this.fromWarehouse.toString() === this.toWarehouse.toString()) {
     const error = new Error('Source and destination warehouses must be different');
     error.name = 'ValidationError';
     return next(error);
   }
-  
+
   next();
 });
 

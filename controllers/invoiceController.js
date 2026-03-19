@@ -2,6 +2,7 @@ const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const Client = require('../models/Client');
 const StockMovement = require('../models/StockMovement');
+const InventoryBatch = require('../models/InventoryBatch');
 const InvoiceReceiptMetadata = require('../models/InvoiceReceiptMetadata');
 const PDFDocument = require('pdfkit');
 const notificationService = require('../services/notificationHelper');
@@ -10,6 +11,7 @@ const Company = require('../models/Company');
 const cacheService = require('../services/cacheService');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
 const JournalService = require('../services/journalService');
+const { runInTransaction } = require('../services/transactionService');
 
 const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notifyInvoiceSent } = require('../services/notificationHelper');
 
@@ -19,29 +21,61 @@ const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notif
 exports.getInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { page = 1, limit = 20, status, clientId, startDate, endDate } = req.query;
+    const { 
+      page = 1, 
+      limit = 20, 
+      status, 
+      clientId, 
+      startDate, 
+      endDate,
+      date_from,
+      date_to,
+      expiry_before,
+      quotation_id
+    } = req.query;
     const query = { company: companyId };
 
+    // Status filter - support both old and new status names
     if (status) {
-      query.status = status;
+      // Map old status to new
+      const statusMap = {
+        'partial': 'partially_paid',
+        'paid': 'fully_paid'
+      };
+      query.status = statusMap[status] || status;
     }
 
     if (clientId) {
       query.client = clientId;
     }
 
-    if (startDate || endDate) {
+    // Date filters - Module 6 naming
+    if (startDate || endDate || date_from || date_to) {
       query.invoiceDate = {};
-      if (startDate) query.invoiceDate.$gte = new Date(startDate);
-      if (endDate) query.invoiceDate.$gte = new Date(endDate);
+      const from = startDate || date_from;
+      const to = endDate || date_to;
+      if (from) query.invoiceDate.$gte = new Date(from);
+      if (to) query.invoiceDate.$lte = new Date(to);
+    }
+
+    // Expiry/due date filter
+    if (expiry_before) {
+      query.dueDate = { $lte: new Date(expiry_before) };
+    }
+
+    // Quotation filter - Module 6 naming
+    if (quotation_id) {
+      query.quotation = quotation_id;
     }
 
     const total = await Invoice.countDocuments(query);
     const invoices = await Invoice.find(query)
       .populate('client', 'name code contact')
-      .populate('items.product', 'name sku unit')
+      .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
-      .populate('quotation', 'quotationNumber')
+      .populate('quotation', 'quotationNumber referenceNo')
+      .populate('revenueJournalEntry')
+      .populate('cogsJournalEntry')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -67,10 +101,13 @@ exports.getInvoice = async (req, res, next) => {
     const companyId = req.user.company._id;
     const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
       .populate('client', 'name code contact type taxId')
-      .populate('items.product', 'name sku unit')
+      .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
-      .populate('quotation', 'quotationNumber')
-      .populate('payments.recordedBy', 'name email');
+      .populate('quotation', 'quotationNumber referenceNo')
+      .populate('payments.recordedBy', 'name email')
+      .populate('revenueJournalEntry')
+      .populate('cogsJournalEntry')
+      .populate('lines.warehouse');
 
     if (!invoice) {
       return res.status(404).json({
@@ -100,7 +137,25 @@ exports.getInvoice = async (req, res, next) => {
 exports.createInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { items, client: clientId, quotation, currency, paymentTerms, customerTin, customerAddress, customerName } = req.body;
+    const { 
+      lines,  // Module 6 naming
+      items,  // Legacy naming
+      client: clientId, 
+      quotation,
+      currencyCode,  // Module 6 naming
+      currency,  // Legacy naming
+      exchangeRate,
+      paymentTerms, 
+      customerTin, 
+      customerAddress, 
+      customerName,
+      dueDate,
+      invoiceDate
+    } = req.body;
+
+    // Support both lines (Module 6) and items (legacy)
+    const invoiceLines = lines || items;
+    const currencyVal = currencyCode || currency || 'USD';
 
     // Get client details for TIN and address
     const client = await Client.findOne({ _id: clientId, company: companyId });
@@ -111,115 +166,287 @@ exports.createInvoice = async (req, res, next) => {
       });
     }
 
+    // Validate products and check stock
     const productMap = {};
-    for (const item of items) {
-      const product = await Product.findOne({ _id: item.product, company: companyId });
+    for (const line of invoiceLines) {
+      const product = await Product.findOne({ _id: line.product, company: companyId });
       if (!product) {
         return res.status(400).json({
           success: false,
-          message: `Product not found: ${item.product}`
+          message: `Product not found: ${line.product}`
         });
       }
-      productMap[item.product.toString()] = product;
-      if (product.currentStock < item.quantity) {
+      // Validate product is active
+      if (product.isActive === false) {
         return res.status(400).json({
           success: false,
-          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${item.quantity}`
+          code: 'ERR_INACTIVE_PRODUCT',
+          message: `Product ${product.name} is inactive`
+        });
+      }
+      productMap[line.product.toString()] = product;
+      const qty = line.qty || line.quantity || 0;
+      if (product.currentStock < qty) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INSUFFICIENT_STOCK',
+          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`
         });
       }
     }
 
-    // Process items with tax codes
-    const processedItems = items.map((item, index) => {
-      const subtotal = item.quantity * item.unitPrice;
-      const discount = item.discount || 0;
-      const netAmount = subtotal - discount;
-      const product = productMap[item.product.toString()];
-      const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
-      const taxCode = item.taxCode || product?.taxCode || 'A';
+    // Process lines with tax codes
+    const processedLines = invoiceLines.map((line, index) => {
+      const qty = line.qty || line.quantity || 0;
+      const unitPrice = line.unitPrice || 0;
+      const discountPct = line.discountPct || line.discount || 0;
+      const subtotal = qty * unitPrice;
+      const discountAmount = subtotal * (discountPct / 100);
+      const netAmount = subtotal - discountAmount;
+      const product = productMap[line.product.toString()];
+      const taxRate = (line.taxRate != null) ? line.taxRate : (product?.taxRate != null ? product.taxRate : 0);
+      const taxCode = line.taxCode || product?.taxCode || 'A';
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
 
       return {
-        ...item,
-        itemCode: item.itemCode || `ITEM-${index + 1}`,
+        ...line,
+        productName: line.productName || product?.name,
+        productCode: line.productCode || line.itemCode || product?.sku,
+        qty: qty,
+        quantity: qty,  // backwards compat
+        discountPct: discountPct,
+        discount: discountPct,  // backwards compat
         taxCode,
         taxRate,
-        subtotal,
-        taxAmount,
-        totalWithTax
+        lineSubtotal: subtotal,
+        subtotal: subtotal,  // backwards compat
+        lineTax: taxAmount,
+        taxAmount: taxAmount,  // backwards compat
+        lineTotal: totalWithTax,
+        totalWithTax: totalWithTax,  // backwards compat
+        warehouse: line.warehouse
       };
     });
 
     const invoice = await Invoice.create({
       ...req.body,
       company: companyId,
-      items: processedItems,
+      lines: processedLines,
+      items: processedLines,  // backwards compat
+      client: clientId,
+      quotation: quotation,
+      currencyCode: currencyVal,
+      currency: currencyVal,  // backwards compat
+      exchangeRate: exchangeRate || 1,
       customerTin: customerTin || client.taxId,
       customerName: customerName || client.name,
       customerAddress: customerAddress || client.contact?.address,
+      dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),  // Default 30 days
+      invoiceDate: invoiceDate || new Date(),
       createdBy: req.user.id
     });
 
-    await invoice.populate('client items.product createdBy');
+    await invoice.populate('client lines.product createdBy');
 
-    // Auto-deduct stock immediately when invoice is created (sale happens)
-    for (const item of invoice.items) {
-      const product = await Product.findOne({ _id: item.product._id, company: companyId });
-      
-      if (product) {
-        const previousStock = product.currentStock;
-        const newStock = previousStock - item.quantity;
+    // Atomically consume inventory layers, create stock movements, update product stock,
+    // and post COGS + Sales journal entries using the central transaction helper.
+    // Only deduct stock if autoConfirm is true (instant confirmation)
+    const autoConfirm = req.body.autoConfirm || false;
+    
+    if (autoConfirm) {
+      await runInTransaction(async (trx) => {
+        // If trx is provided we run the transactional path, otherwise run the non-transactional fallback logic.
+        if (trx) {
+          let totalInvoiceCOGS = 0;
 
-        // Create stock movement (ledger entry)
-        await StockMovement.create({
-          company: companyId,
-          product: product._id,
-          type: 'out',
-          reason: 'sale',
-          quantity: item.quantity,
-          previousStock,
-          newStock,
-          unitCost: item.unitPrice,
-          totalCost: item.totalWithTax,
-          referenceType: 'invoice',
-          referenceNumber: invoice.invoiceNumber,
-          referenceDocument: invoice._id,
-          referenceModel: 'Invoice',
-          notes: `Invoice ${invoice.invoiceNumber} - Sale`,
-          performedBy: req.user.id
-        });
+          for (const line of invoice.lines) {
+            const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(trx);
+            if (!product) continue;
 
-        // Update product stock
-        product.currentStock = newStock;
-        product.lastSaleDate = new Date();
-        await product.save();
-      }
-    }
+            const inventoryService = require('../services/inventoryService');
+            const qty = line.qty || line.quantity || 0;
+            const consumeResult = await inventoryService.consume(companyId, product._id, qty, { method: 'fifo', session: trx });
+            const itemCost = consumeResult.totalCost || 0;
+            totalInvoiceCOGS += itemCost;
 
-    // Mark invoice as stock deducted
-    invoice.stockDeducted = true;
-    invoice.status = 'confirmed';
-    invoice.confirmedDate = new Date();
-    invoice.confirmedBy = req.user.id;
-    await invoice.save();
+            const previousStock = product.currentStock || 0;
+            const newStock = previousStock - qty;
 
-    // Update client outstanding balance
-    client.outstandingBalance += invoice.roundedAmount;
-    await client.save();
+            const unitCost = qty > 0 ? (itemCost / qty) : 0;
+            
+            // Update line with COGS info - Module 6
+            line.unitCost = unitCost;
+            line.cogsAmount = itemCost;
+            
+            const sm = new StockMovement({
+              company: companyId,
+              product: product._id,
+              type: 'out',
+              reason: 'sale',
+              quantity: qty,
+              previousStock,
+              newStock,
+              unitCost,
+              totalCost: itemCost,
+              referenceType: 'invoice',
+              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              referenceDocument: invoice._id,
+              referenceModel: 'Invoice',
+              notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
+              performedBy: req.user.id,
+              movementDate: new Date()
+            });
+            await sm.save({ session: trx });
 
-    // Create journal entry for the sale (Accounts Receivable Debit, Sales Revenue + VAT Credit)
-    try {
-      await JournalService.createInvoiceEntry(companyId, req.user.id, {
-        _id: invoice._id,
-        invoiceNumber: invoice.invoiceNumber,
-        date: invoice.invoiceDate,
-        total: invoice.roundedAmount,
-        vatAmount: invoice.totalTax
+            product.currentStock = newStock;
+            product.lastSaleDate = new Date();
+            await product.save({ session: trx });
+          }
+
+          // Save line updates
+          await invoice.save({ session: trx });
+
+          invoice.stockDeducted = true;
+          invoice.status = 'confirmed';
+          invoice.confirmedDate = new Date();
+          invoice.confirmedBy = req.user.id;
+          await invoice.save({ session: trx });
+
+          client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
+          await client.save({ session: trx });
+
+          // Create revenue journal entry - Module 6
+          try {
+            const revenueEntry = await JournalService.createInvoiceEntry(companyId, req.user.id, {
+              _id: invoice._id,
+              invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              date: invoice.invoiceDate,
+              total: invoice.roundedAmount || 0,
+              vatAmount: invoice.totalTax || 0
+            }, { session: trx });
+            invoice.revenueJournalEntry = revenueEntry._id;
+          } catch (je) {
+            console.error('JournalService.createInvoiceEntry failed in transaction:', je);
+          }
+
+          // Create COGS journal entry - Module 6
+          try {
+            const cogsEntry = await JournalService.createSaleCOGSEntry(companyId, req.user.id, {
+              invoiceId: invoice._id,
+              invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              date: invoice.invoiceDate,
+              totalCost: totalInvoiceCOGS
+            }, { session: trx });
+            invoice.cogsJournalEntry = cogsEntry._id;
+          } catch (je2) {
+            console.error('JournalService.createSaleCOGSEntry failed in transaction:', je2);
+          }
+          
+          await invoice.save({ session: trx });
+        } else {
+          // Non-transactional fallback path
+          let totalInvoiceCOGS = 0;
+          const inventoryService = require('../services/inventoryService');
+          for (const line of invoice.lines) {
+            const product = await Product.findOne({ _id: line.product._id, company: companyId });
+            if (!product) continue;
+            let consumeResult;
+            const qty = line.qty || line.quantity || 0;
+            try {
+              const batchesReservedAgg = await InventoryBatch.aggregate([
+                { $match: { company: companyId, product: product._id } },
+                { $group: { _id: null, reserved: { $sum: { $ifNull: ["$reservedQuantity", 0] } } } }
+              ]);
+              const reserved = (batchesReservedAgg[0] && batchesReservedAgg[0].reserved) || 0;
+              const available = (product.currentStock || 0) - reserved;
+              if (available < qty) {
+                return res.status(409).json({ success: false, code: 'ERR_INSUFFICIENT_STOCK', message: 'Insufficient available stock to confirm invoice' });
+              }
+
+              consumeResult = await inventoryService.consume(companyId, product._id, qty, { method: 'fifo' });
+            } catch (cErr) {
+              if (cErr && cErr.code === 'ERR_INSUFFICIENT_STOCK') {
+                return res.status(409).json({ success: false, code: 'ERR_INSUFFICIENT_STOCK', message: 'Insufficient stock to confirm invoice' });
+              }
+              throw cErr;
+            }
+            const itemCost = consumeResult.totalCost || 0;
+            totalInvoiceCOGS += itemCost;
+
+            const previousStock = product.currentStock || 0;
+            const newStock = previousStock - qty;
+
+            // Update line with COGS info - Module 6
+            line.unitCost = itemCost > 0 && qty > 0 ? (itemCost / qty) : line.unitPrice;
+            line.cogsAmount = itemCost;
+
+            await StockMovement.create({
+              company: companyId,
+              product: product._id,
+              type: 'out',
+              reason: 'sale',
+              quantity: qty,
+              previousStock,
+              newStock,
+              unitCost: line.unitCost,
+              totalCost: itemCost,
+              referenceType: 'invoice',
+              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              referenceDocument: invoice._id,
+              referenceModel: 'Invoice',
+              notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
+              performedBy: req.user.id,
+              movementDate: new Date()
+            });
+
+            product.currentStock = Math.max(0, newStock);
+            product.lastSaleDate = new Date();
+            await product.save();
+          }
+
+          // Save line updates
+          await invoice.save();
+
+          invoice.stockDeducted = true;
+          invoice.status = 'confirmed';
+          invoice.confirmedDate = new Date();
+          invoice.confirmedBy = req.user.id;
+          await invoice.save();
+
+          client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
+          await client.save();
+
+          // Create revenue journal entry - Module 6
+          try {
+            const revenueEntry = await JournalService.createInvoiceEntry(companyId, req.user.id, {
+              _id: invoice._id,
+              invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              date: invoice.invoiceDate,
+              total: invoice.roundedAmount || 0,
+              vatAmount: invoice.totalTax || 0
+            });
+            invoice.revenueJournalEntry = revenueEntry._id;
+          } catch (je) {
+            console.error('JournalService.createInvoiceEntry failed (non-transactional):', je);
+          }
+
+          // Create COGS journal entry - Module 6
+          try {
+            const cogsEntry = await JournalService.createSaleCOGSEntry(companyId, req.user.id, {
+              invoiceId: invoice._id,
+              invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              date: invoice.invoiceDate,
+              totalCost: totalInvoiceCOGS
+            });
+            invoice.cogsJournalEntry = cogsEntry._id;
+          } catch (je2) {
+            console.error('JournalService.createSaleCOGSEntry failed (non-transactional):', je2);
+          }
+          
+          await invoice.save();
+        }
       });
-    } catch (journalError) {
-      console.error('Error creating journal entry for invoice:', journalError);
-      // Don't fail the invoice creation if journal entry fails
     }
 
     // Attempt to send invoice email to client if email exists
@@ -236,7 +463,7 @@ exports.createInvoice = async (req, res, next) => {
     }
 
     // Update client outstanding balance
-    client.outstandingBalance += invoice.roundedAmount;
+    client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
     await client.save();
 
     // Notify invoice created
@@ -270,55 +497,72 @@ exports.updateInvoice = async (req, res, next) => {
       });
     }
 
-    // Only draft invoices can be updated
+    // Only draft invoices can be updated - Module 6 Business Rule
     if (invoice.status !== 'draft') {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
-        message: 'Only draft invoices can be updated'
+        code: 'ERR_INVOICE_CONFIRMED',
+        message: 'Cannot edit invoice. Invoice is already confirmed. Cancel and create new instead.'
       });
     }
 
-    // If items are updated, validate stock
-    if (req.body.items) {
-      // build product map for provided items
-      const updateProductMap = {};
-      for (const item of req.body.items) {
-        const product = await Product.findOne({ _id: item.product, company: companyId });
+    // Support both lines (Module 6) and items (legacy)
+    const lines = req.body.lines || req.body.items;
+    
+    // If lines are updated, validate stock and products
+    if (lines) {
+      // Validate products are active
+      for (const line of lines) {
+        const product = await Product.findOne({ _id: line.product, company: companyId });
         if (!product) {
           return res.status(400).json({
             success: false,
-            message: `Product not found: ${item.product}`
+            message: `Product not found: ${line.product}`
           });
         }
-        updateProductMap[item.product.toString()] = product;
-        if (product.currentStock < item.quantity) {
+        if (product.isActive === false) {
           return res.status(400).json({
             success: false,
-            message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${item.quantity}`
+            code: 'ERR_INACTIVE_PRODUCT',
+            message: `Product ${product.name} is inactive`
+          });
+        }
+        const qty = line.qty || line.quantity || 0;
+        if (product.currentStock < qty) {
+          return res.status(400).json({
+            success: false,
+            code: 'ERR_INSUFFICIENT_STOCK',
+            message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`
           });
         }
       }
 
-      // Recalculate item totals using product defaults when missing
-      req.body.items = req.body.items.map((item, index) => {
-        const subtotal = item.quantity * item.unitPrice;
-        const discount = item.discount || 0;
-        const netAmount = subtotal - discount;
-        const product = updateProductMap[item.product.toString()];
-        const taxRate = (item.taxRate != null) ? item.taxRate : (product?.taxRate != null ? product.taxRate : 0);
-        const taxCode = item.taxCode || product?.taxCode || 'A';
+      // Recalculate line totals
+      req.body.lines = lines.map((line, index) => {
+        const qty = line.qty || line.quantity || 0;
+        const unitPrice = line.unitPrice || 0;
+        const discountPct = line.discountPct || line.discount || 0;
+        const subtotal = qty * unitPrice;
+        const discountAmount = subtotal * (discountPct / 100);
+        const netAmount = subtotal - discountAmount;
+        const taxRate = line.taxRate || 0;
         const taxAmount = netAmount * (taxRate / 100);
         const totalWithTax = netAmount + taxAmount;
         return {
-          ...item,
-          itemCode: item.itemCode || `ITEM-${index + 1}`,
-          taxCode,
-          taxRate,
-          subtotal,
-          taxAmount,
-          totalWithTax
+          ...line,
+          qty: qty,
+          quantity: qty,
+          discountPct: discountPct,
+          discount: discountPct,
+          lineSubtotal: subtotal,
+          subtotal: subtotal,
+          lineTax: taxAmount,
+          taxAmount: taxAmount,
+          lineTotal: totalWithTax,
+          totalWithTax: totalWithTax
         };
       });
+      req.body.items = req.body.lines;  // backwards compat
     }
 
     invoice = await Invoice.findOneAndUpdate(
@@ -326,7 +570,7 @@ exports.updateInvoice = async (req, res, next) => {
       req.body,
       { new: true, runValidators: true }
     )
-      .populate('client items.product createdBy');
+      .populate('client lines.product createdBy');
 
     res.json({
       success: true,
@@ -371,13 +615,13 @@ exports.deleteInvoice = async (req, res, next) => {
   }
 };
 
-// @desc    Confirm invoice (deduct stock)
+// @desc    Confirm invoice (deduct stock) - Module 6 Enhanced
 // @route   PUT /api/invoices/:id/confirm
 // @access  Private (admin, stock_manager)
 exports.confirmInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('items.product');
+    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('lines.product');
 
     if (!invoice) {
       return res.status(404).json({
@@ -386,85 +630,227 @@ exports.confirmInvoice = async (req, res, next) => {
       });
     }
 
+    // Only draft invoices can be confirmed - Module 6 Business Rule
     if (invoice.status !== 'draft') {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
-        message: 'Only draft invoices can be confirmed'
+        code: 'ERR_INVOICE_CONFIRMED',
+        message: 'Cannot confirm invoice. Invoice is not in draft status. Edit confirmed invoice is blocked - cancel and create new.'
       });
     }
 
-    // Validate stock and deduct
-    for (const item of invoice.items) {
-      const product = await Product.findOne({ _id: item.product._id, company: companyId });
-      
+    // Check if delivery note exists for this invoice - Module 6 Business Rule
+    const DeliveryNote = require('../models/DeliveryNote');
+    const existingDeliveryNote = await DeliveryNote.findOne({ 
+      invoice: invoice._id, 
+      status: 'confirmed' 
+    });
+    if (existingDeliveryNote) {
+      return res.status(409).json({
+        success: false,
+        code: 'ERR_DELIVERY_EXISTS',
+        message: 'Cannot cancel invoice. A confirmed delivery note already exists for this invoice.'
+      });
+    }
+
+    // Step 1: Pre-validation - Check products are active and stock available
+    const inventoryService = require('../services/inventoryService');
+    const warehouseService = require('../services/warehouseService');
+    let totalInvoiceCOGS = 0;
+    let hasStockableLines = false;
+    
+    for (const line of invoice.lines) {
+      const product = await Product.findOne({ _id: line.product._id, company: companyId });
       if (!product) {
-        return res.status(400).json({
-          success: false,
-          message: `Product not found: ${item.product.name}`
+        return res.status(400).json({ 
+          success: false, 
+          message: `Product not found: ${line.product.name}` 
         });
       }
 
-      if (product.currentStock < item.quantity) {
+      // Validate product is active - Module 6 Step 1
+      if (product.isActive === false) {
         return res.status(400).json({
           success: false,
-          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${item.quantity}`
+          code: 'ERR_INACTIVE_PRODUCT',
+          message: `Product ${product.name} is inactive`
         });
       }
 
-      const previousStock = product.currentStock;
-      const newStock = previousStock - item.quantity;
+      const qty = line.qty || line.quantity || 0;
+      
+      // Validate qty > 0 and unit_price >= 0 - Module 6 Step 1
+      if (qty <= 0) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_LINE_QTY',
+          message: `Line quantity must be greater than 0`
+        });
+      }
 
-      // Create stock movement (ledger entry)
-      await StockMovement.create({
-        company: companyId,
-        product: product._id,
-        type: 'out',
-        reason: 'sale',
-        quantity: item.quantity,
-        previousStock,
-        newStock,
-        unitCost: item.unitPrice,
-        totalCost: item.totalWithTax,
-        referenceType: 'invoice',
-        referenceNumber: invoice.invoiceNumber,
-        referenceDocument: invoice._id,
-        referenceModel: 'Invoice',
-        notes: `Invoice ${invoice.invoiceNumber} - Sale`,
-        performedBy: req.user.id
-      });
+      const unitPrice = line.unitPrice || 0;
+      if (unitPrice < 0) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_UNIT_PRICE',
+          message: `Unit price cannot be negative`
+        });
+      }
 
-      // Update product stock
-      product.currentStock = newStock;
-      product.lastSaleDate = new Date();
-      await product.save();
+      // Check if product is stockable
+      const isStockable = product.isStockable !== false;
+      
+      if (isStockable) {
+        hasStockableLines = true;
+        
+        // Step 2: Resolve COGS cost per line - FIFO or WAC (peek, NOT consume)
+        let unitCost = 0;
+        
+        if (product.costMethod === 'fifo') {
+          // FIFO: peek at oldest lot cost (do NOT consume yet)
+          const oldestLot = await InventoryBatch.findOne({
+            company: companyId,
+            product: product._id,
+            quantity: { $gt: 0 }
+          }).sort({ receivedDate: 1 });
+          
+          if (oldestLot) {
+            unitCost = parseFloat(oldestLot.unitCost) || 0;
+          } else {
+            // No lots found - check if product has cost set directly
+            unitCost = parseFloat(product.cost) || 0;
+          }
+        } else if (product.costMethod === 'wac') {
+          // WAC: use avg_cost from product
+          unitCost = parseFloat(product.avgCost) || parseFloat(product.cost) || 0;
+        } else {
+          // Default or non-stockable
+          unitCost = parseFloat(product.cost) || 0;
+        }
+
+        // Module 6 Step 5: If COGS cost is 0 for stockable product, it's an error
+        if (unitCost === 0) {
+          return res.status(500).json({
+            success: false,
+            code: 'ERR_COST_LOOKUP_FAILED',
+            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`
+          });
+        }
+
+        // Calculate cogsAmount for this line
+        const cogsAmount = qty * unitCost;
+        totalInvoiceCOGS += cogsAmount;
+
+        // Update line with COGS info - Module 6
+        line.unitCost = unitCost;
+        line.cogsAmount = cogsAmount;
+
+        // Step 1: Check stock availability at warehouse
+        const warehouseId = line.warehouse || product.defaultWarehouse;
+        let availableQty = 0;
+        
+        if (warehouseId) {
+          // Get warehouse stock level
+          const stockLevel = await warehouseService.getStockLevel(companyId, product._id, warehouseId);
+          availableQty = stockLevel.qty_available || 0;
+        } else {
+          // Use product's current stock
+          availableQty = product.currentStock || 0;
+        }
+
+        // Module 6 Step 1: If insufficient stock, return 409 INSUFFICIENT_STOCK
+        if (availableQty < qty) {
+          return res.status(409).json({ 
+            success: false, 
+            code: 'ERR_INSUFFICIENT_STOCK', 
+            product_id: product._id,
+            message: `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}` 
+          });
+        }
+
+        // Step 3: Reserve stock - qty_reserved += line.qty
+        if (warehouseId) {
+          try {
+            await warehouseService.reserveStock(companyId, product._id, warehouseId, qty);
+          } catch (reserveErr) {
+            console.error('Stock reservation error:', reserveErr);
+            return res.status(409).json({ 
+              success: false, 
+              code: 'ERR_INSUFFICIENT_STOCK', 
+              message: `Failed to reserve stock for ${product.name}` 
+            });
+          }
+        } else {
+          // Reserve from product currentStock
+          product.qtyReserved = (product.qtyReserved || 0) + qty;
+          await product.save();
+        }
+      } else {
+        // Non-stockable product: unit_cost = 0, cogs_amount = 0
+        line.unitCost = 0;
+        line.cogsAmount = 0;
+      }
     }
 
-    // Update invoice status
-    invoice.status = 'confirmed';
-    invoice.stockDeducted = true;
-    invoice.confirmedDate = new Date();
-    invoice.confirmedBy = req.user.id;
+    // Save line updates with COGS
     await invoice.save();
 
-    // Create journal entry for the sale (Accounts Receivable Debit, Sales Revenue + VAT Credit)
+    // Step 4: Post Entry A (Revenue Recognition) - Module 6
+    // DR 1200 Accounts Receivable, CR 2200 VAT Output, CR product.revenue_account_id
+    const subtotal = parseFloat(invoice.subtotal) || 0;
+    const taxAmount = parseFloat(invoice.taxAmount) || 0;
+    const totalAmount = subtotal + taxAmount;
+
+    let revenueEntry = null;
     try {
-      await JournalService.createInvoiceEntry(companyId, req.user.id, {
+      revenueEntry = await JournalService.createSalesRevenueEntry(companyId, req.user.id, {
         _id: invoice._id,
-        invoiceNumber: invoice.invoiceNumber,
+        invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+        clientName: invoice.client?.name || 'Unknown Client',
         date: invoice.invoiceDate,
-        total: invoice.roundedAmount,
-        vatAmount: invoice.totalTax
+        subtotal: subtotal,
+        vatAmount: taxAmount,
+        totalAmount: totalAmount
       });
+      invoice.revenueJournalEntry = revenueEntry._id;
     } catch (journalError) {
-      console.error('Error creating journal entry for invoice:', journalError);
-      // Don't fail the invoice confirmation if journal entry fails
+      console.error('Error creating revenue journal entry:', journalError);
+      // Don't fail if journal entry fails, but log it
     }
 
-    // Notify payment received
-    try {
-      await notifyPaymentReceived(companyId, invoice, 0);
-    } catch (e) {
-      console.error('notifyPaymentReceived failed', e);
+    // Step 5: Post Entry B (COGS Recognition) - Module 6
+    // Only for stockable products
+    if (hasStockableLines && totalInvoiceCOGS > 0) {
+      try {
+        const cogsEntry = await JournalService.createCOGSEntry(companyId, req.user.id, {
+          invoiceId: invoice._id,
+          invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+          clientName: invoice.client?.name || 'Unknown Client',
+          date: invoice.invoiceDate,
+          totalCost: totalInvoiceCOGS,
+          lines: invoice.lines.filter(l => l.cogsAmount > 0).map(l => ({
+            productId: l.product._id,
+            cogsAmount: l.cogsAmount
+          }))
+        });
+        invoice.cogsJournalEntry = cogsEntry._id;
+      } catch (journalError) {
+        console.error('Error creating COGS journal entry:', journalError);
+      }
+    }
+
+    // Step 6: Update invoice status - Module 6
+    invoice.status = 'confirmed';
+    invoice.confirmedDate = new Date();
+    invoice.confirmedBy = req.user.id;
+    invoice.stockReserved = true;
+    await invoice.save();
+
+    // Update client outstanding balance
+    const client = await Client.findOne({ _id: invoice.client, company: companyId });
+    if (client) {
+      client.outstandingBalance += invoice.roundedAmount || 0;
+      await client.save();
     }
 
     // Update linked quotation if exists
@@ -477,11 +863,11 @@ exports.confirmInvoice = async (req, res, next) => {
       });
     }
 
-    // Update client stats
-    const client = await Client.findOne({ _id: invoice.client, company: companyId });
-    if (client) {
-      client.outstandingBalance += invoice.roundedAmount;
-      await client.save();
+    // Notify
+    try {
+      await notifyPaymentReceived(companyId, invoice, 0);
+    } catch (e) {
+      console.error('notifyPaymentReceived failed', e);
     }
 
     // Invalidate report cache
@@ -493,7 +879,7 @@ exports.confirmInvoice = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Invoice confirmed and stock deducted',
+      message: 'Invoice confirmed and stock reserved',
       data: invoice
     });
   } catch (error) {
@@ -510,7 +896,7 @@ exports.recordPayment = async (req, res, next) => {
     const { amount, paymentMethod, reference, notes } = req.body;
 
     const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('items.product');
+      .populate('lines.product');
 
     if (!invoice) {
       return res.status(404).json({
@@ -522,13 +908,16 @@ exports.recordPayment = async (req, res, next) => {
     if (invoice.status === 'cancelled') {
       return res.status(400).json({
         success: false,
+        code: 'ERR_INVALID_STATUS_TRANSITION',
         message: 'Cannot record payment for cancelled invoice'
       });
     }
 
-    if (amount > invoice.balance) {
+    const balance = invoice.balance || parseFloat(invoice.amountOutstanding) || 0;
+    if (amount > balance) {
       return res.status(400).json({
         success: false,
+        code: 'ERR_PAYMENT_EXCEEDS_BALANCE',
         message: 'Payment amount exceeds invoice balance'
       });
     }
@@ -542,42 +931,51 @@ exports.recordPayment = async (req, res, next) => {
       recordedBy: req.user.id
     });
 
-    invoice.amountPaid += amount;
+    // Update amount paid - handle Decimal128
+    const currentPaid = parseFloat(invoice.amountPaid) || 0;
+    invoice.amountPaid = currentPaid + amount;
 
     // Explicitly recalculate balance
-    invoice.balance = invoice.roundedAmount - invoice.amountPaid;
+    const grandTotal = invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
+    invoice.balance = grandTotal - invoice.amountPaid;
     if (invoice.balance < 0) invoice.balance = 0;
+    
+    // Update amountOutstanding - Module 6
+    invoice.amountOutstanding = grandTotal - invoice.amountPaid;
 
     // Auto-confirm if stock not yet deducted and payment is made
     if (!invoice.stockDeducted && invoice.status === 'draft') {
-      for (const item of invoice.items) {
-        const product = await Product.findOne({ _id: item.product._id, company: companyId });
+      for (const line of invoice.lines) {
+        const product = await Product.findOne({ _id: line.product._id, company: companyId });
         
-        if (product && product.currentStock >= item.quantity) {
-          const previousStock = product.currentStock;
-          const newStock = previousStock - item.quantity;
+        if (product) {
+          const qty = line.qty || line.quantity || 0;
+          if (product.currentStock >= qty) {
+            const previousStock = product.currentStock;
+            const newStock = previousStock - qty;
 
-          await StockMovement.create({
-            company: companyId,
-            product: product._id,
-            type: 'out',
-            reason: 'sale',
-            quantity: item.quantity,
-            previousStock,
-            newStock,
-            unitCost: item.unitPrice,
-            totalCost: item.totalWithTax,
-            referenceType: 'invoice',
-            referenceNumber: invoice.invoiceNumber,
-            referenceDocument: invoice._id,
-            referenceModel: 'Invoice',
-            notes: `Sale via invoice ${invoice.invoiceNumber}`,
-            performedBy: req.user.id
-          });
+            await StockMovement.create({
+              company: companyId,
+              product: product._id,
+              type: 'out',
+              reason: 'sale',
+              quantity: qty,
+              previousStock,
+              newStock,
+              unitCost: line.unitPrice,
+              totalCost: line.totalWithTax,
+              referenceType: 'invoice',
+              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
+              referenceDocument: invoice._id,
+              referenceModel: 'Invoice',
+              notes: `Sale via invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+              performedBy: req.user.id
+            });
 
-          product.currentStock = newStock;
-          product.lastSaleDate = new Date();
-          await product.save();
+            product.currentStock = newStock;
+            product.lastSaleDate = new Date();
+            await product.save();
+          }
         }
       }
 
@@ -697,7 +1095,7 @@ exports.recordPayment = async (req, res, next) => {
   }
 };
 
-// @desc    Cancel invoice (reverse stock)
+// @desc    Cancel invoice (reverse stock and journal entries) - Module 6 Enhanced
 // @route   PUT /api/invoices/:id/cancel
 // @access  Private (admin)
 exports.cancelInvoice = async (req, res, next) => {
@@ -705,7 +1103,7 @@ exports.cancelInvoice = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { reason } = req.body;
 
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('items.product');
+    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('lines.product');
 
     if (!invoice) {
       return res.status(404).json({
@@ -714,50 +1112,86 @@ exports.cancelInvoice = async (req, res, next) => {
       });
     }
 
-    if (invoice.status === 'paid') {
+    // Cannot cancel fully paid invoices - Module 6 Business Rule
+    if (invoice.status === 'fully_paid') {
       return res.status(400).json({
         success: false,
+        code: 'ERR_INVALID_STATUS_TRANSITION',
         message: 'Cannot cancel fully paid invoice. Please contact administrator'
       });
     }
 
-    // Reverse stock if it was deducted
-    if (invoice.stockDeducted) {
-      for (const item of invoice.items) {
-        const product = await Product.findOne({ _id: item.product._id, company: companyId });
+    // Module 6 Business Rule: Cannot cancel if delivery note exists
+    const DeliveryNote = require('../models/DeliveryNote');
+    const existingDeliveryNote = await DeliveryNote.findOne({ 
+      invoice: invoice._id, 
+      status: 'confirmed' 
+    });
+    if (existingDeliveryNote) {
+      return res.status(409).json({
+        success: false,
+        code: 'ERR_DELIVERY_EXISTS',
+        message: 'Cannot cancel invoice. A confirmed delivery note already exists for this invoice.'
+      });
+    }
+
+    // Reverse stock if reserved - Module 6: release qty_reserved
+    if (invoice.stockReserved) {
+      const warehouseService = require('../services/warehouseService');
+      
+      for (const line of invoice.lines) {
+        const product = await Product.findOne({ _id: line.product._id, company: companyId });
+        if (!product) continue;
         
-        if (product) {
-          const previousStock = product.currentStock;
-          const newStock = previousStock + item.quantity;
-
-          await StockMovement.create({
-            company: companyId,
-            product: product._id,
-            type: 'in',
-            reason: 'return',
-            quantity: item.quantity,
-            previousStock,
-            newStock,
-            unitCost: item.unitPrice,
-            totalCost: item.totalWithTax,
-            referenceType: 'invoice',
-            referenceNumber: invoice.invoiceNumber,
-            referenceDocument: invoice._id,
-            referenceModel: 'Invoice',
-            notes: `Invoice ${invoice.invoiceNumber} cancelled - Stock reversal`,
-            performedBy: req.user.id
-          });
-
-          product.currentStock = newStock;
+        const qty = line.qty || line.quantity || 0;
+        const warehouseId = line.warehouse || product.defaultWarehouse;
+        
+        if (warehouseId) {
+          // Release from warehouse reservation
+          try {
+            await warehouseService.releaseStock(companyId, product._id, warehouseId, qty);
+          } catch (relErr) {
+            console.error('Failed to release warehouse stock:', relErr);
+          }
+        } else {
+          // Release from product qtyReserved
+          product.qtyReserved = Math.max(0, (product.qtyReserved || 0) - qty);
           await product.save();
         }
+      }
+      invoice.stockReserved = false;
+    }
+
+    // Module 6 Business Rule: Reverse journal entries
+    if (invoice.revenueJournalEntry || invoice.cogsJournalEntry) {
+      try {
+        // Reverse revenue entry
+        if (invoice.revenueJournalEntry) {
+          await JournalService.reverse(companyId, req.user.id, {
+            entryId: invoice.revenueJournalEntry,
+            narration: `Reversed: Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`
+          });
+        }
+        
+        // Reverse COGS entry
+        if (invoice.cogsJournalEntry) {
+          await JournalService.reverse(companyId, req.user.id, {
+            entryId: invoice.cogsJournalEntry,
+            narration: `Reversed: COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`
+          });
+        }
+      } catch (reverseErr) {
+        console.error('Failed to reverse journal entries:', reverseErr);
+        // Don't fail the cancellation, just log the error
       }
     }
 
     // Update client outstanding balance
     const client = await Client.findOne({ _id: invoice.client, company: companyId });
     if (client) {
-      const unpaidAmount = invoice.roundedAmount - invoice.amountPaid;
+      const grandTotal = invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
+      const paid = parseFloat(invoice.amountPaid) || 0;
+      const unpaidAmount = grandTotal - paid;
       client.outstandingBalance -= unpaidAmount;
       if (client.outstandingBalance < 0) client.outstandingBalance = 0;
       await client.save();
@@ -779,7 +1213,7 @@ exports.cancelInvoice = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Invoice cancelled and stock reversed',
+      message: 'Invoice cancelled, journal entries reversed, and stock reservations released',
       data: invoice
     });
   } catch (error) {
@@ -842,7 +1276,7 @@ exports.getClientInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const invoices = await Invoice.find({ client: req.params.clientId, company: companyId })
-      .populate('items.product', 'name sku')
+      .populate('lines.product', 'name sku')
       .populate('createdBy', 'name email')
       .sort({ invoiceDate: -1 });
 
@@ -862,7 +1296,7 @@ exports.getClientInvoices = async (req, res, next) => {
 exports.getProductInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoices = await Invoice.find({ 'items.product': req.params.productId, company: companyId })
+    const invoices = await Invoice.find({ 'lines.product': req.params.productId, company: companyId })
       .populate('client', 'name code')
       .populate('createdBy', 'name email')
       .sort({ invoiceDate: -1 });
@@ -885,7 +1319,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
     const companyId = req.user.company._id;
     const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
       .populate('client')
-      .populate('items.product')
+      .populate('lines.product')
       .populate('createdBy');
 
     if (!invoice) {
@@ -903,13 +1337,13 @@ exports.generateInvoicePDF = async (req, res, next) => {
 
     // Set response headers
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=invoice-${invoice.invoiceNumber}.pdf`);
+    res.setHeader('Content-Disposition', `attachment; filename=invoice-${invoice.referenceNo || invoice.invoiceNumber}.pdf`);
 
     // Pipe PDF to response
     doc.pipe(res);
 
-    const currency = invoice.currency || 'FRW';
-    const currencySymbol = currency === 'USD' ? '$' : '';
+    const currency = invoice.currencyCode || invoice.currency || 'USD';
+    const currencySymbol = currency === 'USD' ? '$' : currency === 'EUR' ? '€' : currency === 'GBP' ? '£' : currency === 'LBP' ? 'LL' : '$';
 
     // Helper to format money
     const fmt = (v) => (currencySymbol ? `${currencySymbol} ${Number(v || 0).toFixed(2)}` : Number(v || 0).toLocaleString());

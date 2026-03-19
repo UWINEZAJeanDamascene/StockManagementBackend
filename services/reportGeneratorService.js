@@ -3486,20 +3486,32 @@ const generateStockValuationReport = async (companyId, categoryId = null) => {
     .populate('supplier', 'name code')
     .sort({ name: 1 });
 
-  const report = products.map(product => ({
-    _id: product._id,
-    sku: product.sku,
-    name: product.name,
-    category: product.category?.name,
-    supplier: product.supplier,
-    unit: product.unit,
-    currentStock: product.currentStock,
-    averageCost: product.averageCost,
-    sellingPrice: product.sellingPrice,
-    totalValue: product.currentStock * product.averageCost,
-    potentialRevenue: product.currentStock * product.sellingPrice,
-    potentialProfit: (product.currentStock * product.sellingPrice) - (product.currentStock * product.averageCost)
-  }));
+  const InventoryLayer = require('../models/InventoryLayer');
+
+  const report = [];
+  for (const product of products) {
+    let totalValue = product.currentStock * product.averageCost;
+    // If product uses FIFO costing, compute valuation from inventory layers
+    if (product.costingMethod === 'fifo') {
+      const layers = await InventoryLayer.find({ company: product.company, product: product._id, qtyRemaining: { $gt: 0 } }).lean();
+      totalValue = layers.reduce((s, l) => s + ((l.qtyRemaining || 0) * (l.unitCost || 0)), 0);
+    }
+
+    report.push({
+      _id: product._id,
+      sku: product.sku,
+      name: product.name,
+      category: product.category?.name,
+      supplier: product.supplier,
+      unit: product.unit,
+      currentStock: product.currentStock,
+      averageCost: product.averageCost,
+      sellingPrice: product.sellingPrice,
+      totalValue,
+      potentialRevenue: product.currentStock * product.sellingPrice,
+      potentialProfit: (product.currentStock * product.sellingPrice) - (product.currentStock * product.averageCost)
+    });
+  }
 
   const summary = {
     totalProducts: report.length,

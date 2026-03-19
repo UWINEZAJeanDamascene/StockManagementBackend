@@ -14,14 +14,30 @@ exports.getCategories = async (req, res, next) => {
       query.isActive = isActive === 'true';
     }
 
+    // Return categories as a nested tree (max depth 3)
     const categories = await Category.find(query)
       .populate('createdBy', 'name email')
-      .sort({ name: 1 });
+      .sort({ name: 1 })
+      .lean();
+
+    const map = new Map();
+    categories.forEach(c => map.set(String(c._id), Object.assign(c, { children: [] })));
+
+    const roots = [];
+    for (const c of categories) {
+      if (c.parent) {
+        const p = map.get(String(c.parent));
+        if (p) p.children.push(map.get(String(c._id)));
+        else roots.push(map.get(String(c._id)));
+      } else {
+        roots.push(map.get(String(c._id)));
+      }
+    }
 
     res.json({
       success: true,
       count: categories.length,
-      data: categories
+      data: roots
     });
   } catch (error) {
     next(error);
@@ -73,6 +89,14 @@ exports.createCategory = async (req, res, next) => {
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
 
+    // Validate parent existence (if provided) and rely on model hook for depth
+    if (req.body.parent) {
+      const parent = await Category.findOne({ _id: req.body.parent, company: companyId });
+      if (!parent) {
+        return res.status(400).json({ success: false, message: 'Parent category not found' });
+      }
+    }
+
     const category = await Category.create(req.body);
 
     res.status(201).json({
@@ -86,6 +110,8 @@ exports.createCategory = async (req, res, next) => {
         success: false,
         message: 'Category with this name already exists'
       });
+    } else if (error.name === 'MaxNestingDepth') {
+      return res.status(400).json({ success: false, message: error.message });
     }
     next(error);
   }
@@ -101,14 +127,24 @@ exports.updateCategory = async (req, res, next) => {
     
     // Allow updating name even if duplicates exist
     
-    const category = await Category.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      req.body,
-      {
-        new: true,
-        runValidators: true
+    // If parent is provided, verify it exists and belongs to company
+    if (req.body.parent) {
+      const parent = await Category.findOne({ _id: req.body.parent, company: companyId });
+      if (!parent) {
+        return res.status(400).json({ success: false, message: 'Parent category not found' });
       }
-    );
+    }
+
+    // Apply update then re-load to trigger hooks/validation
+    let category = await Category.findOne({ _id: req.params.id, company: companyId });
+    if (!category) {
+      return res.status(404).json({ success: false, message: 'Category not found' });
+    }
+
+    Object.assign(category, req.body);
+    await category.save();
+
+    category = await Category.findById(category._id).populate('createdBy', 'name email');
 
     if (!category) {
       return res.status(404).json({
@@ -144,10 +180,11 @@ exports.deleteCategory = async (req, res, next) => {
     const productsCount = await Product.countDocuments({ category: req.params.id, company: companyId });
 
     if (productsCount > 0) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot delete category. It has ${productsCount} product(s) associated with it.`
-      });
+        return res.status(409).json({
+          success: false,
+          code: 'CATEGORY_IN_USE',
+          message: `Cannot delete category. It has ${productsCount} product(s) associated with it.`
+        });
     }
 
     const category = await Category.findOneAndDelete({ _id: req.params.id, company: companyId });
