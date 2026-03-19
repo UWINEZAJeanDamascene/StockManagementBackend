@@ -729,16 +729,67 @@ exports.confirmDelivery = async (req, res, next) => {
 
       // ========== POST COGS ADJUSTMENTS ==========
       if (cogsAdjustments.length > 0) {
+        const { getAccount } = require('../constants/chartOfAccounts');
+        const entries = [];
+
         for (const adj of cogsAdjustments) {
+          const product = adj.product;
+          const line = adj.line;
+          const difference = adj.difference;
+          const isIncrease = difference > 0;
+
+          const cogsAccount = product.cogsAccount || product.cogs_account_id;
+          const inventoryAccount = product.inventoryAccount || product.inventory_account_id;
+
+          if (!cogsAccount || !inventoryAccount) {
+            console.warn('Missing COGS or Inventory account for product:', product._id);
+            continue;
+          }
+
+          const cogsAccountName = getAccount(cogsAccount)?.name || 'Cost of Goods Sold';
+          const inventoryAccountName = getAccount(inventoryAccount)?.name || 'Inventory';
+
+          const narration = `COGS Adjustment - ${line.productName} - DN#${deliveryNote.referenceNo} - cost variance`;
+
+          const journalEntry = {
+            date: new Date(),
+            description: narration,
+            sourceType: 'cogs_adjustment',
+            sourceId: deliveryNote._id,
+            sourceReference: `DN-ADJ-${deliveryNote.referenceNo}`,
+            lines: [
+              {
+                accountCode: isIncrease ? cogsAccount : inventoryAccount,
+                accountName: isIncrease ? cogsAccountName : inventoryAccountName,
+                debit: isIncrease ? Math.abs(difference) : 0,
+                credit: isIncrease ? 0 : Math.abs(difference),
+                description: narration
+              },
+              {
+                accountCode: isIncrease ? inventoryAccount : cogsAccount,
+                accountName: isIncrease ? inventoryAccountName : cogsAccountName,
+                debit: isIncrease ? 0 : Math.abs(difference),
+                credit: isIncrease ? Math.abs(difference) : 0,
+                description: narration
+              }
+            ]
+          };
+
+          entries.push(journalEntry);
+        }
+
+        if (entries.length > 0) {
           try {
-            await createCOGSAdjustmentEntry(companyId, req.user.id, {
-              product: adj.product,
-              deliveryNote: deliveryNote,
-              line: adj.line,
-              difference: adj.difference
-            }, { session });
-          } catch (adjErr) {
-            console.error('COGS adjustment failed:', adjErr);
+            if (typeof JournalService.createEntriesAtomic === 'function') {
+              await JournalService.createEntriesAtomic(companyId, req.user.id, entries, { session });
+            } else {
+              // Fallback: create entries one by one but keep session
+              for (const e of entries) {
+                await JournalService.createEntry(companyId, req.user.id, { ...e, session });
+              }
+            }
+          } catch (err) {
+            console.error('COGS adjustment failed (atomic post):', err);
           }
         }
       }

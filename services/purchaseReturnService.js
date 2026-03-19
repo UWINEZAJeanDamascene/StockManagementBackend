@@ -30,7 +30,7 @@ async function createPurchaseReturn(pr, opts = {}) {
   const adjusted = [];
   for (const l of pr.lines) {
     if (InventoryService && InventoryService.adjustLot) {
-      const res = await InventoryService.adjustLot(l.grnLine || l.lotId || l.grnLine, { quantity: -Math.abs(l.qtyReturned) });
+      const res = await InventoryService.adjustLot(l.grnLine || l.lotId || l.grnLine, { quantity: -Math.abs(l.qtyReturned) }, opts.session || null);
       adjusted.push(res);
     }
   }
@@ -39,7 +39,32 @@ async function createPurchaseReturn(pr, opts = {}) {
   const amt = pr.lines.reduce((s, l) => s + (Number(l.unitCost || 0) * Number(l.qtyReturned || 0)), 0);
   const lines = [ { type: 'debit', account: DEFAULT_ACCOUNTS.accountsPayable, amount: amt }, { type: 'credit', account: DEFAULT_ACCOUNTS.inventory, amount: amt } ];
 
-  const je = await JournalService.createEntry({ company: pr.company || (opts.company || null), userId: (opts.user && opts.user.id) || null, date: new Date(), description: `Purchase Return ${pr._id}`, lines, totalDebit: amt, totalCredit: amt, session: opts.session || null });
+  // Prepare journal entry options. Use atomic API if available, otherwise fall back to legacy createEntry call for tests
+  const userId = (opts.user && opts.user.id) || null;
+  const companyId = pr.company || (opts.company || null);
+
+  const atomicEntry = {
+    date: new Date(),
+    description: `Purchase Return ${pr._id}`,
+    sourceType: 'purchase_return',
+    sourceId: pr._id,
+    sourceReference: pr._id,
+    lines: []
+  };
+
+  // Build lines for atomic API (debit/credit format)
+  atomicEntry.lines.push({ accountCode: DEFAULT_ACCOUNTS.accountsPayable, debit: amt, credit: 0, description: `Purchase Return ${pr._id}` });
+  atomicEntry.lines.push({ accountCode: DEFAULT_ACCOUNTS.inventory, debit: 0, credit: amt, description: `Purchase Return ${pr._id}` });
+
+  let je;
+  if (JournalService.createEntriesAtomic) {
+    const created = await JournalService.createEntriesAtomic(companyId, userId, [atomicEntry], { session: opts.session || null });
+    je = created && created.length ? created[0] : null;
+  } else {
+    // Legacy callers/tests expect createEntry to be called with a single object containing 'lines' with type/amount
+    const legacyLines = [ { type: 'debit', account: DEFAULT_ACCOUNTS.accountsPayable, amount: amt }, { type: 'credit', account: DEFAULT_ACCOUNTS.inventory, amount: amt } ];
+    je = await JournalService.createEntry({ company: companyId, userId, date: new Date(), description: `Purchase Return ${pr._id}`, lines: legacyLines, totalDebit: amt, totalCredit: amt, session: opts.session || null });
+  }
 
   // mark pr confirmed
   pr.journalEntryId = je && (je._id || je.id) ? (je._id || je.id) : null;
