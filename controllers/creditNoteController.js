@@ -428,11 +428,15 @@ exports.confirmCreditNote = async (req, res, next) => {
     const creditNoteId = req.params.id;
     
     // Find credit note with populated data
+    console.log('DEBUG: creditNoteId =', creditNoteId);
     let creditNote = await CreditNote.findOne({ _id: creditNoteId, company: companyId })
       .populate('lines.product')
       .populate('invoice')
       .populate('client')
       .populate('lines.returnToWarehouse');
+    
+    console.log('DEBUG: creditNote =', creditNote ? 'found' : 'not found');
+    console.log('DEBUG: creditNote.invoice =', creditNote?.invoice);
     
     if (!creditNote) {
       return res.status(404).json({ success: false, code: ERR_CREDIT_NOT_FOUND, message: 'Credit note not found' });
@@ -450,8 +454,11 @@ exports.confirmCreditNote = async (req, res, next) => {
     }
     
     // Invoice must be confirmed, partially_paid, or fully_paid
-    const validInvoiceStatuses = ['confirmed', 'partial', 'partially_paid', 'paid', 'fully_paid'];
-    if (!validInvoiceStatuses.includes(invoice.status)) {
+    const validInvoiceStatuses = ['confirmed', 'partially_paid', 'fully_paid'];
+    console.log('DEBUG: invoice.status =', invoice.status);
+    console.log('DEBUG: validInvoiceStatuses =', validInvoiceStatuses);
+    if (!invoice.status || !validInvoiceStatuses.includes(invoice.status)) {
+      console.log('DEBUG: Invoice validation failed - returning 400');
       return res.status(400).json({ success: false, code: ERR_INVOICE_NOT_CONFIRMED, message: 'Invoice must be confirmed, partially paid, or fully paid' });
     }
     
@@ -508,14 +515,25 @@ exports.confirmCreditNote = async (req, res, next) => {
       const isGoodsReturn = creditNote.type === 'goods_return';
       
       // Process each line
+      console.log('DEBUG: Processing lineArray =', JSON.stringify(lineArray, null, 2));
       for (const line of lineArray) {
         const product = line.product;
         if (!product) continue;
         
+        // Get taxRate from credit note line or fall back to invoice line
+        let taxRate = line.taxRate;
+        if (!taxRate && line.invoiceLineId) {
+          const invoiceLine = invoice.lines.id(line.invoiceLineId);
+          if (invoiceLine) {
+            taxRate = invoiceLine.taxRate;
+          }
+        }
+        console.log('DEBUG: line.taxRate =', line.taxRate, 'taxRate from invoice =', taxRate, 'line.quantity =', line.quantity, 'line.unitPrice =', line.unitPrice);
         const lineSubtotal = (line.quantity || 0) * (line.unitPrice || 0);
-        const lineTax = lineSubtotal * ((line.taxRate || 0) / 100);
+        const lineTax = lineSubtotal * ((taxRate || 0) / 100);
         const lineCogs = (line.unitCost || 0) * (line.quantity || 0);
         
+        console.log('DEBUG: lineSubtotal =', lineSubtotal, 'lineTax =', lineTax);
         totalSubtotal += lineSubtotal;
         totalTax += lineTax;
         totalCogs += lineCogs;
@@ -524,16 +542,16 @@ exports.confirmCreditNote = async (req, res, next) => {
         if (isGoodsReturn && product.isStockable) {
           const warehouse = line.returnToWarehouse;
           
-          // Add stock using inventory service
-          await inventoryService.receive(
+          // Add stock using inventory service createLayer
+          await inventoryService.createLayer(
             companyId,
             product._id,
             line.quantity,
+            line.unitCost || 0,
             { 
-              warehouse: warehouse ? warehouse._id : null, 
-              unitCost: line.unitCost || 0,
-              reason: 'credit_note_return',
-              session 
+              warehouse: warehouse ? warehouse._id : null,
+              session,
+              userId: req.user.id
             }
           );
           
@@ -556,15 +574,16 @@ exports.confirmCreditNote = async (req, res, next) => {
           }
           
           // Create stock movement
-          const previousStock = product.currentStock || 0;
-          const newStock = previousStock + line.quantity;
+          // Use Number() to avoid string concatenation (currentStock can be Decimal128 string)
+          const previousStock = Number(product.currentStock) || 0;
+          const newStock = previousStock + Number(line.quantity);
           
           await StockMovement.create([{
             company: companyId,
             product: product._id,
             warehouse: warehouse ? warehouse._id : null,
             type: 'in',
-            reason: 'credit_note_return',
+            reason: 'return',
             quantity: line.quantity,
             previousStock,
             newStock,
@@ -605,26 +624,20 @@ exports.confirmCreditNote = async (req, res, next) => {
         }
       }
       
-      const revenueEntry = await JournalService.createEntry(companyId, req.user.id, {
-        date: new Date(),
-        description: narration,
-        sourceType: 'credit_note',
-        sourceId: creditNote._id,
-        sourceReference: creditNote.referenceNo || creditNote.creditNoteNumber,
-        lines: [
-          { accountCode: revenueAccount, accountName: 'Sales Revenue', debit: totalSubtotal, credit: 0, description: narration },
-          { accountCode: DEFAULT_ACCOUNTS.vatOutput, accountName: 'VAT Output', debit: totalTax, credit: 0, description: narration },
-          { accountCode: DEFAULT_ACCOUNTS.accountsReceivable, accountName: 'Accounts Receivable', debit: 0, credit: totalAmount, description: narration }
-        ]
-      }, { session });
-      
-      creditNote.revenueReversalEntry = revenueEntry._id;
-      
-      // ========== STEP 3: Post COGS Reversal Journal Entry (Entry B) - goods return only ==========
+      console.log('DEBUG: Creating revenue + COGS entries with totalSubtotal =', totalSubtotal, 'totalTax =', totalTax, 'totalAmount =', totalAmount);
+
+      // Build revenue lines
+      const revenueLines = [
+        { accountCode: revenueAccount, accountName: 'Sales Revenue', debit: totalSubtotal, credit: 0, description: narration },
+        { accountCode: DEFAULT_ACCOUNTS.vatPayable, accountName: 'VAT Output', debit: totalTax || 0, credit: 0, description: narration },
+        { accountCode: DEFAULT_ACCOUNTS.accountsReceivable, accountName: 'Accounts Receivable', debit: 0, credit: totalAmount || (totalSubtotal + (totalTax || 0)), description: narration }
+      ];
+
+      // Build COGS lines if goods return
+      let cogsLines = null;
       if (isGoodsReturn && totalCogs > 0) {
         let inventoryAccount = DEFAULT_ACCOUNTS.inventory;
-        let cogsAccount = DEFAULT_ACCOUNTS.cogs;
-        
+        let cogsAccount = DEFAULT_ACCOUNTS.costOfGoodsSold;
         if (lineArray[0] && lineArray[0].product) {
           const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
           if (firstProduct) {
@@ -632,22 +645,41 @@ exports.confirmCreditNote = async (req, res, next) => {
             if (firstProduct.cogsAccount) cogsAccount = firstProduct.cogsAccount;
           }
         }
-        
         const cogsNarration = 'COGS Reversal - ' + (creditNote.client?.name || 'Client') + ' - CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber);
-        
-        const cogsEntry = await JournalService.createEntry(companyId, req.user.id, {
+        cogsLines = [
+          { accountCode: inventoryAccount, accountName: 'Inventory', debit: totalCogs, credit: 0, description: cogsNarration },
+          { accountCode: cogsAccount, accountName: 'Cost of Goods Sold', debit: 0, credit: totalCogs, description: cogsNarration }
+        ];
+      }
+
+      // Prepare entries array
+      const entriesToCreate = [
+        {
           date: new Date(),
-          description: cogsNarration,
+          description: narration,
+          sourceType: 'credit_note',
+          sourceId: creditNote._id,
+          sourceReference: creditNote.referenceNo || creditNote.creditNoteNumber,
+          lines: revenueLines,
+          isAutoGenerated: true
+        }
+      ];
+      if (cogsLines) {
+        entriesToCreate.push({
+          date: new Date(),
+          description: `COGS Reversal - ${creditNote.referenceNo || creditNote.creditNoteNumber}`,
           sourceType: 'credit_note_cogs',
           sourceId: creditNote._id,
-          sourceReference: 'CN-COGS-' + (creditNote.referenceNo || creditNote.creditNoteNumber),
-          lines: [
-            { accountCode: inventoryAccount, accountName: 'Inventory', debit: totalCogs, credit: 0, description: cogsNarration },
-            { accountCode: cogsAccount, accountName: 'Cost of Goods Sold', debit: 0, credit: totalCogs, description: cogsNarration }
-          ]
-        }, { session });
-        
-        creditNote.cogsReversalEntry = cogsEntry._id;
+          sourceReference: `CN-COGS-${creditNote.referenceNo || creditNote.creditNoteNumber}`,
+          lines: cogsLines,
+          isAutoGenerated: true
+        });
+      }
+
+      const created = await JournalService.createEntriesAtomic(companyId, req.user.id, entriesToCreate, { session });
+      if (Array.isArray(created) && created.length > 0) {
+        creditNote.revenueReversalEntry = created[0]._id;
+        if (created[1]) creditNote.cogsReversalEntry = created[1]._id;
       }
       
       // ========== STEP 5: Update AR balance ==========
@@ -670,7 +702,7 @@ exports.confirmCreditNote = async (req, res, next) => {
       await creditNote.save({ session });
     });
     
-    await creditNote.populate('lines.product warehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry');
+    await creditNote.populate('lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry');
     
     res.json({ success: true, message: 'Credit note confirmed successfully', data: creditNote });
   } catch (err) {

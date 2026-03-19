@@ -235,9 +235,8 @@ creditNoteSchema.index({ creditDate: 1 });
 creditNoteSchema.pre('save', async function(next) {
   // Generate CN-YYYY-NNNNN format for referenceNo
   if (this.isNew && !this.referenceNo) {
-    const year = new Date().getFullYear();
-    const uniqueNo = await generateUniqueNumber('CN', mongoose.model('CreditNote'), this.company, 'referenceNo');
-    this.referenceNo = `${year}-${String(uniqueNo).padStart(5, '0')}`;
+    // generateUniqueNumber already returns 'CN-YYYY-NNNNN'
+    this.referenceNo = await generateUniqueNumber('CN', mongoose.model('CreditNote'), this.company, 'referenceNo');
   }
   
   // Legacy: also set creditNoteNumber if not set

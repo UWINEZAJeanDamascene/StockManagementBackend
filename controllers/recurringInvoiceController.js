@@ -1,11 +1,26 @@
 const RecurringInvoice = require('../models/RecurringInvoice');
+const RecurringInvoiceRun = require('../models/RecurringInvoiceRun');
 const recurringService = require('../services/recurringService');
 
 // List recurring templates
+// GET /api/recurring-templates - List. Filters: client_id, status, frequency
 exports.getRecurringInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const recs = await RecurringInvoice.find({ company: companyId }).populate('client createdBy');
+    const { status, client_id, frequency } = req.query;
+    
+    const query = { company: companyId };
+    if (status) {
+      query.status = status;
+    }
+    if (client_id) {
+      query.client = client_id;
+    }
+    if (frequency) {
+      query['schedule.frequency'] = frequency;
+    }
+    
+    const recs = await RecurringInvoice.find(query).populate('client createdBy');
     res.json({ success: true, count: recs.length, data: recs });
   } catch (err) {
     next(err);
@@ -25,6 +40,7 @@ exports.getRecurringInvoice = async (req, res, next) => {
 };
 
 // Create template
+// POST /api/recurring-templates — Create template
 exports.createRecurringInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
@@ -33,16 +49,31 @@ exports.createRecurringInvoice = async (req, res, next) => {
       company: companyId,
       createdBy: req.user.id
     };
+    
+    // Set default values
+    if (!payload.status) {
+      payload.status = 'active';
+    }
+    if (!payload.startDate) {
+      payload.startDate = new Date();
+    }
+    if (!payload.nextRunDate) {
+      payload.nextRunDate = new Date();
+    }
+    
     const rec = await RecurringInvoice.create(payload);
 
-    // compute initial nextRunDate
-    try {
-      const next = recurringService.computeNextRunDate(rec.schedule, rec.startDate || new Date());
-      rec.nextRunDate = next;
-      await rec.save();
-    } catch (e) {
-      // ignore schedule compute errors
+    // Compute initial nextRunDate if not provided
+    if (rec.schedule && rec.startDate && !payload.nextRunDate) {
+      try {
+        const next = recurringService.computeNextRunDate(rec.schedule, rec.startDate);
+        rec.nextRunDate = next;
+        await rec.save();
+      } catch (e) {
+        // ignore schedule compute errors
+      }
     }
+    
     res.status(201).json({ success: true, data: rec });
   } catch (err) {
     next(err);
@@ -50,26 +81,50 @@ exports.createRecurringInvoice = async (req, res, next) => {
 };
 
 // Update
+// PUT /api/recurring-templates/:id — Edit (only when status is active or paused)
 exports.updateRecurringInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    
+    // Find existing template
     const recOld = await RecurringInvoice.findOne({ _id: req.params.id, company: companyId });
-    const rec = await RecurringInvoice.findOneAndUpdate({ _id: req.params.id, company: companyId }, req.body, { new: true, runValidators: true });
-    if (!rec) return res.status(404).json({ success: false, message: 'Not found' });
-    try {
-      const next = recurringService.computeNextRunDate(rec.schedule, rec.startDate || new Date());
-      rec.nextRunDate = next;
-      await rec.save();
-    } catch (e) {}
+    if (!recOld) {
+      return res.status(404).json({ success: false, message: 'Not found' });
+    }
+    
+    // Validation: can only edit when status is active or paused
+    if (!['active', 'paused'].includes(recOld.status)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Can only edit templates when status is active or paused' 
+      });
+    }
+    
+    const rec = await RecurringInvoice.findOneAndUpdate(
+      { _id: req.params.id, company: companyId }, 
+      req.body, 
+      { new: true, runValidators: true }
+    );
+    
+    // Recompute nextRunDate if schedule changed
+    if (rec.schedule && rec.startDate) {
+      try {
+        const next = recurringService.computeNextRunDate(rec.schedule, rec.startDate);
+        rec.nextRunDate = next;
+        await rec.save();
+      } catch (e) {}
+    }
+    
     // If template was active and is now paused, notify
     try {
-      if (recOld && recOld.active && rec && rec.active === false) {
+      if (recOld && recOld.status === 'active' && rec && rec.status === 'paused') {
         const { notifyRecurringPaused } = require('../services/notificationHelper');
         await notifyRecurringPaused(companyId, rec);
       }
     } catch (e) {
       console.error('notifyRecurringPaused failed', e);
     }
+    
     res.json({ success: true, data: rec });
   } catch (err) {
     next(err);
@@ -107,7 +162,94 @@ exports.triggerTemplate = async (req, res, next) => {
     if (!rec) return res.status(404).json({ success: false, message: 'Template not found' });
 
     const invoice = await recurringService.generateForTemplate(rec._id);
+    
+    if (!invoice) {
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Template already run today (idempotent)',
+        data: null 
+      });
+    }
+    
     res.json({ success: true, data: invoice });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get runs for a template
+// GET /api/recurring-templates/:id/runs — History of all invoice runs for this template
+exports.getRecurringInvoiceRuns = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { templateId } = req.params;
+    
+    // Verify template exists and belongs to company
+    const template = await RecurringInvoice.findOne({ _id: templateId, company: companyId });
+    if (!template) {
+      return res.status(404).json({ success: false, message: 'Template not found' });
+    }
+    
+    const runs = await RecurringInvoiceRun.find({ 
+      template: templateId,
+      company: companyId 
+    })
+    .populate('invoice', 'referenceNo status totalAmount')
+    .sort({ createdAt: -1 })
+    .limit(50);
+    
+    res.json({ success: true, count: runs.length, data: runs });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Pause a recurring invoice
+// POST /api/recurring-templates/:id/pause — Pause
+exports.pauseRecurringInvoice = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const rec = await RecurringInvoice.findOneAndUpdate(
+      { _id: req.params.id, company: companyId, status: 'active' },
+      { status: 'paused' },
+      { new: true }
+    );
+    if (!rec) return res.status(404).json({ success: false, message: 'Template not found or not active' });
+    res.json({ success: true, data: rec });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Resume a recurring invoice
+// POST /api/recurring-templates/:id/resume — Resume
+exports.resumeRecurringInvoice = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const rec = await RecurringInvoice.findOneAndUpdate(
+      { _id: req.params.id, company: companyId, status: 'paused' },
+      { status: 'active' },
+      { new: true }
+    );
+    if (!rec) return res.status(404).json({ success: false, message: 'Template not found or not paused' });
+    res.json({ success: true, data: rec });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Cancel a recurring invoice
+// POST /api/recurring-templates/:id/cancel — Cancel permanently
+exports.cancelRecurringInvoice = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const rec = await RecurringInvoice.findOneAndUpdate(
+      { _id: req.params.id, company: companyId },
+      { status: 'cancelled' },
+      { new: true }
+    );
+    if (!rec) return res.status(404).json({ success: false, message: 'Template not found' });
+    res.json({ success: true, data: rec });
   } catch (err) {
     next(err);
   }

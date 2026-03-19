@@ -80,9 +80,16 @@ const invoiceLineSchema = new mongoose.Schema({
   warehouse: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Warehouse'
+  },
+  
+  // Track quantity credited (for Module 8 Credit Notes)
+  qtyCredited: {
+    type: Number,
+    default: 0
   }
-}, { 
-  toJSON: { virtuals: true },
+},
+{
+toJSON: { virtuals: true },
   toObject: { virtuals: true }
 });
 
@@ -324,6 +331,11 @@ const invoiceSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'RecurringInvoice'
   },
+  // Auto-confirm flag - when true, invoice is auto-confirmed on creation
+  autoConfirm: {
+    type: Boolean,
+    default: false
+  },
   // Credit notes applied to this invoice
   creditNotes: [{
     creditNoteId: { type: mongoose.Schema.Types.ObjectId, ref: 'CreditNote' },
@@ -495,6 +507,7 @@ invoiceSchema.pre('save', function(next) {
   }
   
   // Update status based on payment - Module 6 naming
+  // Only auto-confirm if autoConfirm is explicitly true
   const amountPaidVal = parseFloat(this.amountPaid) || 0;
   const grandTotalVal = this.roundedAmount || parseFloat(this.totalAmount) || 0;
   
@@ -507,9 +520,11 @@ invoiceSchema.pre('save', function(next) {
     this.status = 'partially_paid';
   } else if (this.status === 'cancelled') {
     // Keep cancelled status
-  } else if (amountPaidVal === 0 && grandTotalVal > 0) {
+  } else if (amountPaidVal === 0 && grandTotalVal > 0 && this.autoConfirm === true) {
+    // Only auto-confirm if autoConfirm flag is explicitly true
     this.status = 'confirmed';
   }
+  // Otherwise keep the existing status (default is 'draft')
   
   next();
 });

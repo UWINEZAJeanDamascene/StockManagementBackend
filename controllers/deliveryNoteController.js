@@ -168,14 +168,6 @@ exports.createDeliveryNote = async (req, res, next) => {
       });
     }
 
-    if (invoice.status !== 'confirmed') {
-      return res.status(400).json({
-        success: false,
-        code: ERR_INVOICE_NOT_CONFIRMED,
-        message: 'Invoice must be confirmed before creating delivery note'
-      });
-    }
-
     // Get client from invoice
     const client = invoice.client;
 
@@ -229,7 +221,7 @@ exports.createDeliveryNote = async (req, res, next) => {
           qtyToDeliver: qtyToDeliver,
           deliveredQty: 0,
           pendingQty: qtyToDeliver,
-          unitCost: invoiceLine.quantity > 0 ? invoiceLine.cogsAmount / invoiceLine.quantity : 0,
+            unitCost: invoiceLine.quantity > 0 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount || 0)) / Number(invoiceLine.quantity || 1) : 0,
           batchId: line.batchId || null,
           serialNumbers: line.serialNumbers || [],
           notes: line.notes || ''
@@ -251,7 +243,7 @@ exports.createDeliveryNote = async (req, res, next) => {
             qtyToDeliver: remainingQty,
             deliveredQty: 0,
             pendingQty: remainingQty,
-            unitCost: invoiceLine.quantity > 0 ? invoiceLine.cogsAmount / invoiceLine.quantity : 0,
+              unitCost: invoiceLine.quantity > 0 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount || 0)) / Number(invoiceLine.quantity || 1) : 0,
             batchId: null,
             serialNumbers: [],
             notes: ''
@@ -491,6 +483,23 @@ exports.confirmDelivery = async (req, res, next) => {
 
       const trackingType = product.trackingType || 'none';
 
+      // If product is stockable, ensure estimated unit cost from invoice exists and is > 0
+      const isStockable = product.isStockable !== false;
+      if (isStockable) {
+        const invoiceLine = invoice.lines.id(line.invoiceLineId);
+        const estimatedUnitCost = (invoiceLine && invoiceLine.unitCost !== undefined && invoiceLine.unitCost !== null)
+          ? (invoiceLine.unitCost.toString ? Number(invoiceLine.unitCost.toString()) : Number(invoiceLine.unitCost))
+          : (invoiceLine && invoiceLine.cogsAmount ? ((invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount)) / Number(invoiceLine.quantity || 1)) : 0);
+
+        if (estimatedUnitCost === 0) {
+          return res.status(500).json({
+            success: false,
+            code: ERR_COST_LOOKUP_FAILED,
+            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`
+          });
+        }
+      }
+
       // Batch validation
       if (trackingType === 'batch') {
         if (!line.batchId) {
@@ -610,17 +619,17 @@ exports.confirmDelivery = async (req, res, next) => {
             line.qtyToDeliver,
             { method: 'fifo', warehouse: deliveryNote.warehouse._id, session }
           );
-          actualUnitCost = consumeResult.averageCost || 0;
-          totalCost = consumeResult.totalCost || 0;
+          actualUnitCost = consumeResult.averageCost ? (consumeResult.averageCost.toString ? Number(consumeResult.averageCost.toString()) : Number(consumeResult.averageCost)) : 0;
+          totalCost = consumeResult.totalCost ? (consumeResult.totalCost.toString ? Number(consumeResult.totalCost.toString()) : Number(consumeResult.totalCost)) : 0;
         } else if (trackingType === 'wac') {
           // WAC - use average cost from product
-          actualUnitCost = product.averageCost ? Number(product.averageCost.toString()) : 0;
-          totalCost = actualUnitCost * line.qtyToDeliver;
+          actualUnitCost = product.averageCost ? (product.averageCost.toString ? Number(product.averageCost.toString()) : Number(product.averageCost)) : 0;
+          totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
         } else if (trackingType === 'batch' && line.batchId) {
           // Batch-specific consumption
           const batch = await StockBatch.findById(line.batchId).session(session);
-          actualUnitCost = batch?.unitCost || 0;
-          totalCost = actualUnitCost * line.qtyToDeliver;
+          actualUnitCost = batch?.unitCost ? (batch.unitCost.toString ? Number(batch.unitCost.toString()) : Number(batch.unitCost)) : 0;
+          totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
           
           // Deduct from batch
           batch.qtyOnHand = (batch.qtyOnHand || 0) - line.qtyToDeliver;
@@ -683,16 +692,23 @@ exports.confirmDelivery = async (req, res, next) => {
         // Compare actual cost vs estimated cost from invoice line
         const invoiceLine = invoice.lines.id(line.invoiceLineId);
         if (invoiceLine && invoiceLine.quantity > 0) {
-          const estimatedUnitCost = invoiceLine.cogsAmount / invoiceLine.quantity;
-          const costDifference = totalCost - (estimatedUnitCost * line.qtyToDeliver);
+          // Prefer unitCost recorded on the invoice line (set at invoice confirmation),
+          // fall back to cogsAmount/quantity when unitCost is not present.
+          const estimatedUnitCost = (invoiceLine.unitCost !== undefined && invoiceLine.unitCost !== null)
+            ? (invoiceLine.unitCost.toString ? Number(invoiceLine.unitCost.toString()) : Number(invoiceLine.unitCost))
+            : (invoiceLine.cogsAmount ? (invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount)) / Number(invoiceLine.quantity || 1) : 0);
+
+          const rawDiff = Number(totalCost || 0) - (Number(estimatedUnitCost || 0) * Number(line.qtyToDeliver || 0));
+          // Round to cents to avoid tiny floating point mismatches
+          const costDifference = Math.round(rawDiff * 100) / 100;
 
           // Only post adjustment if difference > tolerance
           if (Math.abs(costDifference) > COGS_TOLERANCE) {
             cogsAdjustments.push({
               product: product,
               line: line,
-              estimatedCost: estimatedUnitCost * line.qtyToDeliver,
-              actualCost: totalCost,
+              estimatedCost: Math.round((Number(estimatedUnitCost || 0) * Number(line.qtyToDeliver || 0)) * 100) / 100,
+              actualCost: Math.round(Number(totalCost || 0) * 100) / 100,
               difference: costDifference
             });
           }
@@ -927,28 +943,37 @@ exports.cancelDeliveryNote = async (req, res, next) => {
         sourceId: deliveryNote._id
       }).session(session);
 
+      // Aggregate reversal entries and mark originals as reversed, then post atomically
+      const reversalEntries = [];
       for (const adjEntry of cogsAdjustments) {
-        // Reverse the journal entry
+        // Mark original entry as reversed
         adjEntry.status = 'reversed';
         adjEntry.reversalDate = new Date();
         adjEntry.reversedBy = req.user.id;
         await adjEntry.save({ session });
 
-        // Create reverse entry - fix the JournalService.createEntry call
-        await JournalService.createEntry(companyId, userId, {
+        // Build reverse journal entry options
+        const reverseLines = adjEntry.lines.map(e => ({
+          accountCode: e.accountCode,
+          accountName: e.accountName,
+          debit: e.credit,
+          credit: e.debit,
+          description: `Reversed: ${e.description}`
+        }));
+
+        reversalEntries.push({
           date: new Date(),
           description: `Reversal of COGS Adjustment - DN#${deliveryNote.referenceNo}`,
           sourceType: 'cogs_adjustment_reversal',
           sourceId: deliveryNote._id,
           sourceReference: `DN-ADJ-REV-${deliveryNote.referenceNo}`,
-          lines: adjEntry.lines.map(e => ({
-            accountCode: e.accountCode,
-            accountName: e.accountName,
-            debit: e.credit,
-            credit: e.debit,
-            description: `Reversed: ${e.description}`
-          }))
-        }, { session });
+          lines: reverseLines,
+          isAutoGenerated: true
+        });
+      }
+
+      if (reversalEntries.length > 0) {
+        await JournalService.createEntriesAtomic(companyId, req.user.id, reversalEntries, { session });
       }
 
       // Update delivery note status

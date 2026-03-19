@@ -112,7 +112,7 @@ const productSchema = new mongoose.Schema({
   // Costing method
   costingMethod: {
     type: String,
-    enum: ['fifo', 'weighted'],
+    enum: ['fifo', 'weighted', 'wac', 'avg'],
     default: 'fifo'
   },
   // Accounting mappings (store account codes)
@@ -273,6 +273,36 @@ productSchema.set('toJSON', {
 });
 
 productSchema.set('toObject', { virtuals: true });
+
+// Legacy field compatibility virtuals
+productSchema.virtual('cost').get(function() {
+  try {
+    const v = this.costPrice;
+    return v && v.toString ? parseFloat(v.toString()) : Number(v || 0);
+  } catch (e) {
+    return Number(this.costPrice || 0);
+  }
+}).set(function(val) {
+  // Accept number or Decimal-like
+  this.costPrice = (val && val.toString) ? mongoose.Types.Decimal128.fromString(parseFloat(val).toFixed(2)) : val;
+});
+
+productSchema.virtual('avgCost').get(function() {
+  try {
+    const v = this.averageCost;
+    return v && v.toString ? parseFloat(v.toString()) : Number(v || 0);
+  } catch (e) {
+    return Number(this.averageCost || 0);
+  }
+}).set(function(val) {
+  this.averageCost = (val && val.toString) ? mongoose.Types.Decimal128.fromString(parseFloat(val).toFixed(2)) : val;
+});
+
+productSchema.virtual('costMethod').get(function() {
+  return this.costingMethod;
+}).set(function(val) {
+  this.costingMethod = val;
+});
 
 // Apply audit/soft-delete plugin
 const auditPlugin = require('./plugins/auditSoftDeletePlugin');

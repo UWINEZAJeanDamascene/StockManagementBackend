@@ -210,10 +210,8 @@ deliveryNoteSchema.index({ deliveryDate: 1 });
 deliveryNoteSchema.pre('save', async function(next) {
   // Generate DN-YYYY-NNNNN format for referenceNo
   if (this.isNew && !this.referenceNo) {
-    const year = new Date().getFullYear();
-    const DeliveryNote = mongoose.model('DeliveryNote');
-    const uniqueNo = await generateUniqueNumber('DN', DeliveryNote, this.company, 'referenceNo');
-    this.referenceNo = `${year}-${String(uniqueNo).padStart(5, '0')}`;
+    // generateUniqueNumber returns 'DN-YYYY-NNNNN'
+    this.referenceNo = await generateUniqueNumber('DN', mongoose.model('DeliveryNote'), this.company, 'referenceNo');
   }
   
   // Legacy: also set deliveryNumber if not set

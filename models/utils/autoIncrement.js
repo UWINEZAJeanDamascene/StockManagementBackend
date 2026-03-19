@@ -83,7 +83,35 @@ async function generateUniqueNumber(prefix, Model, companyId, fieldName) {
   return number;
 }
 
+/**
+ * Generate a unique sequential number WITHOUT year (e.g., REC-NNNNN)
+ */
+async function generateUniqueNumberNoYear(prefix, Model, companyId, fieldName) {
+  let number = '';
+  let exists = true;
+  let attempts = 0;
+  const maxAttempts = 20;
+
+  while (exists && attempts < maxAttempts) {
+    const count = await Model.countDocuments({ company: companyId });
+    const sequence = String(count + 1 + Math.floor(Math.random() * 100)).padStart(5, '0');
+    number = `${prefix}-${sequence}`;
+
+    const existing = await Model.findOne({ company: companyId, [fieldName]: number }).lean();
+    exists = !!existing;
+    attempts++;
+  }
+
+  if (exists) {
+    const timestamp = Date.now().toString().slice(-8);
+    number = `${prefix}-${timestamp}`;
+  }
+
+  return number;
+}
+
 module.exports = {
   generateUniqueCode,
-  generateUniqueNumber
+  generateUniqueNumber,
+  generateUniqueNumberNoYear
 };

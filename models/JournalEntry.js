@@ -39,7 +39,7 @@ const journalEntrySchema = new mongoose.Schema({
   // Reference to source document (optional)
   sourceType: {
     type: String,
-    enum: ['manual', 'invoice', 'purchase', 'purchase_order', 'credit_note', 'expense', 'asset', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_expense', 'petty_cash_replenishment', 'purchase_return', 'stock_adjustment', 'payroll', 'tax_payment', 'bank_transfer', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', null],
+    enum: ['manual', 'invoice', 'purchase', 'purchase_order', 'credit_note', 'credit_note_cogs', 'expense', 'asset', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_expense', 'petty_cash_replenishment', 'purchase_return', 'stock_adjustment', 'payroll', 'tax_payment', 'bank_transfer', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', null],
     default: 'manual'
   },
   sourceId: {

@@ -109,12 +109,16 @@ describe('Module 7 - Delivery Notes Acceptance Tests', () => {
       sku: 'FIFO001',
       type: 'product',
       trackingType: 'none',
+      costMethod: 'fifo',
       category: category._id,
       quantity: 100,
       currentStock: 100,
+      cost: 10,
       averageCost: 10,
+      avgCost: 10,
       cogsAccount: '5000',
       inventoryAccount: '1500',
+      isStockable: true,
       isActive: true
     });
 
@@ -125,12 +129,16 @@ describe('Module 7 - Delivery Notes Acceptance Tests', () => {
       sku: 'SERIAL001',
       type: 'product',
       trackingType: 'serial',
+      costMethod: 'wac',
       category: category._id,
       quantity: 10,
       currentStock: 10,
+      cost: 50,
       averageCost: 50,
+      avgCost: 50,
       cogsAccount: '5000',
       inventoryAccount: '1500',
+      isStockable: true,
       isActive: true
     });
 
@@ -141,12 +149,16 @@ describe('Module 7 - Delivery Notes Acceptance Tests', () => {
       sku: 'BATCH001',
       type: 'product',
       trackingType: 'batch',
+      costMethod: 'wac',
       category: category._id,
       quantity: 50,
       currentStock: 50,
+      cost: 20,
       averageCost: 20,
+      avgCost: 20,
       cogsAccount: '5000',
       inventoryAccount: '1500',
+      isStockable: true,
       isActive: true
     });
 

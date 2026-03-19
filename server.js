@@ -123,6 +123,8 @@ app.use('/api/exchange-rates', require('./routes/exchangeRateRoutes'));
 // Advanced access control & security routes
 app.use('/api/access', require('./routes/advancedAccessRoutes'));
 // Recurring invoices & subscriptions
+app.use('/api/recurring-templates', require('./routes/recurringInvoiceRoutes'));
+// Backwards compatibility alias
 app.use('/api/recurring-invoices', require('./routes/recurringInvoiceRoutes'));
 app.use('/api/subscriptions', require('./routes/subscriptionRoutes'));
 // Credit notes
