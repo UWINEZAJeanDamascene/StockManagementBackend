@@ -1,21 +1,19 @@
 const express = require('express');
 const router = express.Router();
 const { 
-  getPurchaseReturns, 
+  listPurchaseReturns,
   getPurchaseReturn, 
   createPurchaseReturn, 
   updatePurchaseReturn,
-  approvePurchaseReturn,
-  deletePurchaseReturn,
-  getPurchaseReturnSummary,
-  recordRefund
+  confirmPurchaseReturn,
+  getPurchaseReturnSummary
 } = require('../controllers/purchaseReturnController');
 const { protect } = require('../middleware/auth');
 
 router.use(protect);
 
 router.route('/')
-  .get(getPurchaseReturns)
+  .get(listPurchaseReturns)
   .post(createPurchaseReturn);
 
 router.route('/summary')
@@ -23,13 +21,9 @@ router.route('/summary')
 
 router.route('/:id')
   .get(getPurchaseReturn)
-  .put(updatePurchaseReturn)
-  .delete(deletePurchaseReturn);
+  .put(updatePurchaseReturn);
 
-router.route('/:id/approve')
-  .put(approvePurchaseReturn);
-
-router.route('/:id/refund')
-  .put(recordRefund);
+router.route('/:id/confirm')
+  .put(confirmPurchaseReturn);
 
 module.exports = router;

@@ -23,19 +23,35 @@ const {
   getProfitAndLossReport,
   getProfitAndLossDetailed,
   getProfitAndLossFull,
-  getFinancialRatios,
   getAgingReport,
   getVATSummaryReport,
   getProductPerformanceReport,
   getCLVReport,
-  getCashFlowStatement,
   getBudgetVsActualReport,
-  getBalanceSheet,
   // Period-based report functions
   getPeriodReport,
   getAvailablePeriods,
   generateManualSnapshot
 } = require('../controllers/reportController');
+
+// General Ledger controller (separate file for maintainability)
+const { getGeneralLedger, getGeneralLedgerSummary } = require('../controllers/generalLedgerController');
+
+// Trial Balance controller
+const { getTrialBalance } = require('../controllers/trialBalanceController');
+
+// P&L Statement controller
+const { getPLStatement } = require('../controllers/plStatementController');
+
+// Balance Sheet controller
+const { getBalanceSheet } = require('../controllers/balanceSheetController');
+
+// Cash Flow controller
+const { getCashFlow } = require('../controllers/cashFlowController');
+
+// Financial Ratios controller
+const { getFinancialRatios } = require('../controllers/financialRatiosController');
+
 const { protect, authorize } = require('../middleware/auth');
 const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -70,9 +86,23 @@ router.get('/aging', cacheMiddleware({ type: 'report', ttl: 900 }), getAgingRepo
 router.get('/vat-summary', cacheMiddleware({ type: 'report', ttl: 900 }), getVATSummaryReport);
 router.get('/product-performance', cacheMiddleware({ type: 'report', ttl: 900 }), getProductPerformanceReport);
 router.get('/clv', cacheMiddleware({ type: 'report', ttl: 900 }), getCLVReport);
-router.get('/cash-flow', cacheMiddleware({ type: 'report', ttl: 900 }), getCashFlowStatement);
+router.get('/cash-flow', cacheMiddleware({ type: 'report', ttl: 900 }), getCashFlow);
 router.get('/budget-vs-actual', cacheMiddleware({ type: 'report', ttl: 900 }), getBudgetVsActualReport);
 router.get('/balance-sheet', cacheMiddleware({ type: 'report', ttl: 300 }), getBalanceSheet);
+
+// General Ledger routes
+// GET /api/reports/general-ledger (requires: account_id, date_from, date_to)
+router.get('/general-ledger', getGeneralLedger);
+// GET /api/reports/general-ledger/summary (requires: date_from, date_to)
+router.get('/general-ledger/summary', getGeneralLedgerSummary);
+
+// Trial Balance route
+// GET /api/reports/trial-balance (requires: date_from, date_to)
+router.get('/trial-balance', getTrialBalance);
+
+// P&L Statement route (detailed)
+// GET /api/reports/profit-and-loss (requires: date_from, date_to)
+router.get('/profit-and-loss', getPLStatement);
 
 // Period-based report routes - MORE SPECIFIC ROUTES MUST COME FIRST
 // Get available periods for a period type (MUST be before /period/:periodType)

@@ -1,316 +1,445 @@
+/**
+ * Module 5 - Fixed Assets Model
+ * 
+ * Fixed assets are long-lived items (equipment, vehicles, computers) that are
+ * capitalised rather than expensed immediately. They depreciate over their useful life.
+ */
+
 const mongoose = require('mongoose');
+const { nextSequence } = require('../services/sequenceService');
 
 const fixedAssetSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
+  // Company reference
   company: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Company',
-    required: [true, 'Fixed asset must belong to a company']
+    required: true,
+    index: true
   },
+
+  // Reference number (AST-NNNNN per Module 5 spec) - auto-generated in pre-save
+  referenceNo: {
+    type: String
+  },
+
+  // Asset details
   name: {
     type: String,
-    required: [true, 'Please provide asset name'],
-    trim: true
-  },
-  assetCode: {
-    type: String,
-    uppercase: true,
-    trim: true
-  },
-  category: {
-    type: String,
-    enum: ['equipment', 'furniture', 'vehicles', 'buildings', 'land', 'computers', 'machinery', 'other'],
-    required: true
+    required: true,
+    maxlength: 200
   },
   description: {
     type: String,
-    trim: true
+    default: null
   },
-  // Purchase/acquisition details
+
+  // Category reference (for reporting and defaults - separate from account codes)
+  categoryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AssetCategory',
+    default: null
+  },
+
+  // Account references (1500-series for asset accounts)
+  assetAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccount',
+    default: null
+  },
+  assetAccountCode: {
+    type: String,
+    required: true
+  },
+
+  // Accumulated depreciation account (1510-series)
+  accumDepreciationAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccount',
+    default: null
+  },
+  accumDepreciationAccountCode: {
+    type: String,
+    required: true
+  },
+
+  // Depreciation expense account (6xxx)
+  depreciationExpenseAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccount',
+    default: null
+  },
+  depreciationExpenseAccountCode: {
+    type: String,
+    required: true
+  },
+
+  // Purchase details
   purchaseDate: {
     type: Date,
     required: true
   },
   purchaseCost: {
-    type: Number,
-    required: true,
-    min: 0
+    type: mongoose.Schema.Types.Decimal128,
+    required: true
   },
-  supplier: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Supplier'
+  salvageValue: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0')
   },
-  invoiceNumber: String,
-  
+
   // Depreciation settings
-  usefulLifeYears: {
+  usefulLifeMonths: {
     type: Number,
     required: true,
     min: 1
   },
   depreciationMethod: {
     type: String,
-    enum: ['straight-line', 'declining-balance', 'sum-of-years'],
-    default: 'straight-line'
+    enum: ['straight_line', 'declining_balance'],
+    required: true,
+    default: 'straight_line'
   },
-  salvageValue: {
-    type: Number,
-    default: 0,
-    min: 0
+  decliningRate: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null // Required if method = declining_balance
   },
-  
-  // Current status
+
+  // Status tracking
   status: {
     type: String,
-    enum: ['active', 'disposed', 'fully-depreciated'],
+    enum: ['active', 'fully_depreciated', 'disposed'],
     default: 'active'
   },
-  location: String,
-  serialNumber: String,
-  notes: String,
-  
-  // Payment method for asset purchase (used for journal entry)
-  paymentMethod: {
-    type: String,
-    enum: ['cash', 'bank_transfer', 'cheque', 'mobile_money', 'bank'],
-    default: 'bank_transfer'
-  },
-  bankAccountCode: {
-    type: String,
-    default: ''
-  },
-  
-  // Stored accumulated depreciation (updated when depreciation journal entries are created)
-  accumulatedDepreciation: {
-    type: Number,
-    default: 0,
-    min: 0
-  },
-  
+
   // Disposal details
   disposalDate: {
-    type: Date
+    type: Date,
+    default: null
   },
-  disposalAmount: {
-    type: Number,
-    default: 0
+  disposalProceeds: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null
   },
-  disposalMethod: {
-    type: String,
-    enum: ['sold', 'scrapped', 'donated', 'trade-in', 'other'],
+  disposalJournalEntryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
   },
-  disposalNotes: String,
-  
-  // Maintenance tracking
-  maintenanceHistory: [
-    {
-      date: Date,
-      type: {
-        type: String,
-        enum: ['preventive', 'corrective', 'inspection', 'upgrade', 'other']
-      },
-      description: String,
-      cost: Number,
-      vendor: String,
-      nextMaintenanceDate: Date
-    }
-  ],
-  
-  // User tracking
+
+  // Computed/calculated fields
+  accumulatedDepreciation: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0')
+  },
+  netBookValue: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0')
+  },
+
+  // Links
+  supplierId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Supplier',
+    default: null
+  },
+  purchaseJournalEntryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
+
+  // Depreciation calculated flag
+  lastDepreciationDate: {
+    type: Date,
+    default: null
+  },
+
+  // Soft delete
+  isDeleted: {
+    type: Boolean,
+    default: false
+  },
+  deletedAt: {
+    type: Date,
+    default: null
+  },
+
+  // Tracking
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     required: true
-  }
-}, {
-  timestamps: true
-});
-
-// Compound index for company + unique asset code
-fixedAssetSchema.index({ company: 1, assetCode: 1 }, { unique: true });
-fixedAssetSchema.index({ company: 1 });
-
-// Helper: declining-balance rate
-// Rate = 1 - (Salvage / Cost) ^ (1 / UsefulLife)
-// Falls back to double-declining (2/n) when salvage = 0
-function _dbRate(cost, salvage, years) {
-  if (salvage > 0 && cost > 0) {
-    return 1 - Math.pow(salvage / cost, 1 / years);
-  }
-  return 2 / years;
-}
-
-// Helper: return depreciation start as UTC Date snapped to the 1st of the purchase month.
-// Uses UTC getters to avoid server timezone shifting a "YYYY-MM-01" string into the previous month.
-function _depreciationStartDate(purchaseDate) {
-  const d = new Date(purchaseDate);
-  // Use UTC fields so a date stored as "2025-01-01T00:00:00.000Z" stays January, not December
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
-}
-
-// Helper: depreciation end date (exclusive) — startDate + usefulLifeYears months, UTC
-function _depreciationEndDate(startDate, usefulLifeYears) {
-  return new Date(Date.UTC(
-    startDate.getUTCFullYear(),
-    startDate.getUTCMonth() + usefulLifeYears * 12,
-    1
-  ));
-}
-
-const MS_PER_DAY = 1000 * 60 * 60 * 24;
-
-// Helper: total days in an asset's useful life (start → end, both UTC 1st-of-month)
-function _totalDays(startDate, endDate) {
-  return Math.round((endDate - startDate) / MS_PER_DAY);
-}
-
-// Helper: days elapsed from startDate to refDate, clamped to [0, totalDays]
-function _daysUsed(startDate, endDate, refDate) {
-  const elapsed = Math.floor((refDate - startDate) / MS_PER_DAY);
-  return Math.max(0, Math.min(elapsed, _totalDays(startDate, endDate)));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ACCUMULATED DEPRECIATION (Balance Sheet)
-//
-// The stored accumulatedDepreciation field holds the value that has been
-// posted via journal entries from "Run Depreciation". This is the source of
-// truth for the balance sheet.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Virtual: calculated accumulated depreciation for reference (from purchase date to now)
-fixedAssetSchema.virtual('calculatedAccumulatedDepreciation').get(function() {
-  if (!this.purchaseDate || !this.purchaseCost) return 0;
-
-  const now        = new Date();
-  const startDate  = _depreciationStartDate(this.purchaseDate);
-  const endDate    = _depreciationEndDate(startDate, this.usefulLifeYears);
-  const totalDays  = _totalDays(startDate, endDate);
-
-  if (totalDays <= 0) return 0;
-
-  const daysUsed   = _daysUsed(startDate, endDate, now);
-  if (daysUsed <= 0) return 0;
-
-  const depreciable = this.purchaseCost - (this.salvageValue || 0);
-  if (depreciable <= 0) return 0;
-
-  const daysPerYear = totalDays / this.usefulLifeYears;
-
-  switch (this.depreciationMethod) {
-    case 'straight-line': {
-      // Constant daily rate → linear accumulation
-      return Math.min((depreciable / totalDays) * daysUsed, depreciable);
-    }
-
-    case 'sum-of-years': {
-      const syd = (this.usefulLifeYears * (this.usefulLifeYears + 1)) / 2;
-      const fullYears    = Math.floor(daysUsed / daysPerYear);
-      const remainDays   = daysUsed - fullYears * daysPerYear;
-      let accumulated    = 0;
-      for (let i = 0; i < fullYears && i < this.usefulLifeYears; i++) {
-        accumulated += (depreciable * (this.usefulLifeYears - i)) / syd;
-      }
-      if (remainDays > 0 && fullYears < this.usefulLifeYears) {
-        const yearlyDep = (depreciable * (this.usefulLifeYears - fullYears)) / syd;
-        accumulated += (yearlyDep / daysPerYear) * remainDays;
-      }
-      return Math.min(accumulated, depreciable);
-    }
-
-    case 'declining-balance': {
-      const rate      = _dbRate(this.purchaseCost, this.salvageValue || 0, this.usefulLifeYears);
-      const fullYears = Math.floor(daysUsed / daysPerYear);
-      const remainDays = daysUsed - fullYears * daysPerYear;
-      let accumulated  = 0;
-      let bookValue    = this.purchaseCost;
-      for (let i = 0; i < fullYears && bookValue > (this.salvageValue || 0); i++) {
-        const dep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
-        accumulated += dep;
-        bookValue   -= dep;
-      }
-      if (remainDays > 0 && bookValue > (this.salvageValue || 0)) {
-        const yearlyDep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
-        accumulated += (yearlyDep / daysPerYear) * remainDays;
-      }
-      return Math.min(accumulated, depreciable);
-    }
-
-    default:
-      return Math.min((depreciable / totalDays) * daysUsed, depreciable);
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
   }
 });
 
-// Virtual: Net Book Value = Cost − Accumulated Depreciation (Balance Sheet)
-fixedAssetSchema.virtual('netBookValue').get(function() {
-  return Math.max(0, this.purchaseCost - (this.accumulatedDepreciation || 0));
-});
+// Indexes
+fixedAssetSchema.index({ company: 1, status: 1 });
+// Make referenceNo unique per company (avoid global collisions across test DBs)
+fixedAssetSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
 
-// Virtual: depreciation start date exposed to the API (always 1st of purchase month, UTC)
-fixedAssetSchema.virtual('depreciationStartDate').get(function() {
-  if (!this.purchaseDate) return null;
-  return _depreciationStartDate(this.purchaseDate);
-});
-
-// Virtual: depreciation end date exposed to the API
-fixedAssetSchema.virtual('depreciationEndDate').get(function() {
-  if (!this.purchaseDate) return null;
-  const start = _depreciationStartDate(this.purchaseDate);
-  return _depreciationEndDate(start, this.usefulLifeYears);
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ANNUAL DEPRECIATION (P&L)
-//
-// Returns the FULL annual depreciation amount for the CURRENT depreciation year.
-// P&L uses: (annualDepreciation / 12) × periodMonths = period expense.
-// For straight-line this is the same every year.
-// Kicks in on the 1st of each calendar month (monthly boundary = accounting rule).
-// ─────────────────────────────────────────────────────────────────────────────
-fixedAssetSchema.virtual('annualDepreciation').get(function() {
-  if (!this.purchaseDate || !this.purchaseCost || !this.usefulLifeYears) return 0;
-
-  const now         = new Date();
-  const startDate   = _depreciationStartDate(this.purchaseDate);
-  const totalMonths = this.usefulLifeYears * 12;
-
-  // Count complete months elapsed (UTC) so month boundary is consistent
-  const monthsElapsed =
-    (now.getUTCFullYear() - startDate.getUTCFullYear()) * 12 +
-    (now.getUTCMonth()   - startDate.getUTCMonth());
-
-  if (monthsElapsed <= 0) return 0;           // hasn't started yet
-  if (monthsElapsed >= totalMonths) return 0; // fully depreciated
-
-  const currentYearIdx  = Math.floor(monthsElapsed / 12); // 0-indexed year in asset life
-  const depreciable     = this.purchaseCost - (this.salvageValue || 0);
-
-  switch (this.depreciationMethod) {
-    case 'straight-line':
-      return depreciable / this.usefulLifeYears;
-
-    case 'sum-of-years': {
-      const syd = (this.usefulLifeYears * (this.usefulLifeYears + 1)) / 2;
-      const remainingLife = this.usefulLifeYears - currentYearIdx;
-      return (depreciable * remainingLife) / syd;
+// Pre-save hook to generate reference number and calculate net book value
+fixedAssetSchema.pre('save', async function(next) {
+  // Generate reference number if not provided
+  if (!this.referenceNo) {
+    try {
+      const seq = await nextSequence(this.company, 'fixed_asset');
+      const year = new Date().getFullYear();
+      this.referenceNo = `AST-${year}-${seq}`;
+    } catch (e) {
+      // Fallback to timestamp-based ref if sequence service fails
+      const ts = Date.now();
+      this.referenceNo = `AST-${new Date().getFullYear()}-${String(ts).slice(-5)}`;
     }
-
-    case 'declining-balance': {
-      const rate = _dbRate(this.purchaseCost, this.salvageValue || 0, this.usefulLifeYears);
-      let bookValue = this.purchaseCost;
-      for (let i = 0; i < currentYearIdx; i++) {
-        const dep = Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
-        bookValue -= dep;
-      }
-      return Math.min(bookValue * rate, Math.max(0, bookValue - (this.salvageValue || 0)));
-    }
-
-    default:
-      return depreciable / this.usefulLifeYears;
   }
+
+  // Calculate net book value - NBV should never go below salvage value
+  // BUT: Don't recalculate for disposed assets - NBV should remain 0 after disposal
+  if (this.status === 'disposed') {
+    // For disposed assets, keep NBV at 0 (set explicitly in disposal controller)
+    this.netBookValue = mongoose.Types.Decimal128.fromString('0');
+  } else if (this.purchaseCost && this.accumulatedDepreciation) {
+    const purchaseCost = typeof this.purchaseCost === 'object' 
+      ? parseFloat(this.purchaseCost.toString()) 
+      : this.purchaseCost;
+    const accumDep = typeof this.accumulatedDepreciation === 'object' 
+      ? parseFloat(this.accumulatedDepreciation.toString()) 
+      : this.accumulatedDepreciation;
+    const salvage = typeof this.salvageValue === 'object' 
+      ? parseFloat(this.salvageValue.toString()) 
+      : this.salvageValue;
+    
+    // NBV = max(salvage_value, purchase_cost - accumulated_depreciation)
+    const nbv = Math.max(salvage, purchaseCost - accumDep);
+    this.netBookValue = mongoose.Types.Decimal128.fromString(nbv.toString());
+  }
+
+  // Update status based on accumulated depreciation - NBV has reached salvage value
+  if (this.purchaseCost && this.accumulatedDepreciation && this.usefulLifeMonths) {
+    const purchaseCost = typeof this.purchaseCost === 'object' 
+      ? parseFloat(this.purchaseCost.toString()) 
+      : this.purchaseCost;
+    const accumDep = typeof this.accumulatedDepreciation === 'object' 
+      ? parseFloat(this.accumulatedDepreciation.toString()) 
+      : this.accumulatedDepreciation;
+    
+    // Check if fully depreciated (accumulated >= depreciable amount = purchase_cost - salvage)
+    const salvageVal = typeof this.salvageValue === 'object' 
+      ? parseFloat(this.salvageValue.toString()) 
+      : this.salvageValue;
+    const depreciableAmount = purchaseCost - salvageVal;
+    if (accumDep >= depreciableAmount) {
+      this.status = 'fully_depreciated';
+    } else if (this.status === 'fully_depreciated') {
+      // Restore to active if depreciation was reversed
+      this.status = 'active';
+    }
+  }
+
+  this.updatedAt = new Date();
+  next();
 });
 
+// Virtual for monthly depreciation amount
+fixedAssetSchema.virtual('monthlyDepreciation').get(function() {
+  if (!this.purchaseCost || !this.usefulLifeMonths) return 0;
+  
+  const purchaseCost = typeof this.purchaseCost === 'object' 
+    ? parseFloat(this.purchaseCost.toString()) 
+    : this.purchaseCost;
+  const salvage = typeof this.salvageValue === 'object' 
+    ? parseFloat(this.salvageValue.toString()) 
+    : this.salvageValue;
+  
+  if (this.depreciationMethod === 'straight_line') {
+    return (purchaseCost - salvage) / this.usefulLifeMonths;
+  }
+  
+  // For declining balance, this is just the current year rate
+  if (this.decliningRate) {
+    const rate = typeof this.decliningRate === 'object' 
+      ? parseFloat(this.decliningRate.toString()) 
+      : this.decliningRate;
+    const nbv = typeof this.netBookValue === 'object' 
+      ? parseFloat(this.netBookValue.toString()) 
+      : this.netBookValue;
+    return nbv * rate;
+  }
+  
+  return 0;
+});
+
+// Method to calculate depreciation for a period
+fixedAssetSchema.methods.calculateDepreciation = function(periodDate = new Date()) {
+  const purchaseCost = typeof this.purchaseCost === 'object' 
+    ? parseFloat(this.purchaseCost.toString()) 
+    : this.purchaseCost;
+  const salvage = typeof this.salvageValue === 'object' 
+    ? parseFloat(this.salvageValue.toString()) 
+    : this.salvageValue;
+  const accumDep = typeof this.accumulatedDepreciation === 'object' 
+    ? parseFloat(this.accumulatedDepreciation.toString()) 
+    : this.accumulatedDepreciation;
+  
+  const depreciableAmount = purchaseCost - salvage;
+  
+  // Already fully depreciated (NBV has reached salvage value)
+  if (accumDep >= depreciableAmount) {
+    return 0;
+  }
+  
+  let depreciationAmount = 0;
+  
+  if (this.depreciationMethod === 'straight_line') {
+    // Monthly depreciation
+    depreciationAmount = depreciableAmount / this.usefulLifeMonths;
+  } else if (this.depreciationMethod === 'declining_balance') {
+    // Declining balance based on current NBV
+    const rate = this.decliningRate 
+      ? (typeof this.decliningRate === 'object' ? parseFloat(this.decliningRate.toString()) : this.decliningRate)
+      : 0.2; // Default 20% if not specified
+    const nbvVal = purchaseCost - accumDep;
+    depreciationAmount = nbvVal * rate / 12; // Monthly amount
+  }
+  
+  // CRITICAL: Cap depreciation so NBV never goes below salvage value
+  // Use Math.min to prevent over-depreciation in final month(s)
+  const remainingDepreciable = depreciableAmount - accumDep;
+  depreciationAmount = Math.min(depreciationAmount, remainingDepreciable);
+  
+  return Math.round(depreciationAmount * 100) / 100;
+};
+
+// Static method to generate reference number
+fixedAssetSchema.statics.generateReferenceNo = async function(companyId) {
+  const seq = await nextSequence(companyId, 'fixed_asset');
+  const year = new Date().getFullYear();
+  return `AST-${year}-${seq}`;
+};
+
+// Ensure virtuals are serialized
 fixedAssetSchema.set('toJSON', { virtuals: true });
 fixedAssetSchema.set('toObject', { virtuals: true });
 
-module.exports = mongoose.model('FixedAsset', fixedAssetSchema);
+const FixedAsset = mongoose.model('FixedAsset', fixedAssetSchema);
+
+/**
+ * Depreciation Entry Model
+ * 
+ * Records individual depreciation entries for fixed assets.
+ */
+const depreciationEntrySchema = new mongoose.Schema({
+  // Company reference
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true,
+    index: true
+  },
+
+  // Asset reference
+  asset: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'FixedAsset',
+    required: true
+  },
+
+  // Period this depreciation covers
+  periodDate: {
+    type: Date,
+    required: true
+  },
+
+  // Depreciation amounts
+  depreciationAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true
+  },
+  accumulatedBefore: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true
+  },
+  accumulatedAfter: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true
+  },
+  netBookValueAfter: {
+    type: mongoose.Schema.Types.Decimal128,
+    required: true
+  },
+
+  // Journal entry reference
+  journalEntryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    required: true
+  },
+
+  // Posted by
+  postedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+
+  // Status
+  isReversed: {
+    type: Boolean,
+    default: false
+  },
+  reversedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  reversedAt: {
+    type: Date,
+    default: null
+  },
+
+  // Soft delete
+  isDeleted: {
+    type: Boolean,
+    default: false
+  },
+  deletedAt: {
+    type: Date,
+    default: null
+  },
+
+  // Tracking
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Indexes
+depreciationEntrySchema.index({ company: 1, asset: 1, periodDate: 1 }, { unique: true });
+depreciationEntrySchema.index({ company: 1, periodDate: 1 });
+depreciationEntrySchema.index({ asset: 1, isReversed: 1 });
+
+// Pre-save
+depreciationEntrySchema.pre('save', function(next) {
+  this.updatedAt = new Date();
+  next();
+});
+
+const DepreciationEntry = mongoose.model('DepreciationEntry', depreciationEntrySchema);
+
+// Export so that callers can `const FixedAsset = require('./models/FixedAsset')`
+// or destructure `const { FixedAsset, DepreciationEntry } = require('./models/FixedAsset')`.
+module.exports = FixedAsset;
+module.exports.FixedAsset = FixedAsset;
+module.exports.DepreciationEntry = DepreciationEntry;

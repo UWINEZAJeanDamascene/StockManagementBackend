@@ -247,7 +247,7 @@ exports.createStockTransfer = async (req, res, next) => {
     for (const item of items) {
       const qty = mongoose.Types.Decimal128.fromString(String(item.quantity || item.qty || 0));
       const unitCost = item.unitCost ? mongoose.Types.Decimal128.fromString(String(item.unitCost)) : null;
-      const line = await StockTransferLine.create({ transfer: transfer._id, product: item.product, qty, unitCost, notes: item.notes || null, createdBy: req.user.id });
+      const line = await StockTransferLine.create({ company: companyId, transfer: transfer._id, product: item.product, qty, unitCost, notes: item.notes || null, createdBy: req.user.id });
       createdLineIds.push(line._id);
     }
 

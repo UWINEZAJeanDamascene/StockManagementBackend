@@ -21,23 +21,29 @@ const getNotificationSettings = async (companyId) => {
   try {
     let settings = await NotificationSettings.findOne({ company: companyId });
     
-    // Create default settings if none exist
+    // Create default settings if none exist (use upsert to avoid duplicate-key race)
     if (!settings) {
-      settings = await NotificationSettings.create({
-        company: companyId,
-        emailNotifications: {
-          enabled: true,
-          paymentReminders: true,
-          lowStockAlerts: true,
-          dailySummary: false,
-          weeklySummary: true
+      settings = await NotificationSettings.findOneAndUpdate(
+        { company: companyId },
+        {
+          $setOnInsert: {
+            company: companyId,
+            emailNotifications: {
+              enabled: true,
+              paymentReminders: true,
+              lowStockAlerts: true,
+              dailySummary: false,
+              weeklySummary: true
+            },
+            smsNotifications: {
+              enabled: false,
+              criticalOnly: true,
+              adminPhones: []
+            }
+          }
         },
-        smsNotifications: {
-          enabled: false,
-          criticalOnly: true,
-          adminPhones: []
-        }
-      });
+        { upsert: true, new: true }
+      );
     }
     
     return settings;

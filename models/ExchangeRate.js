@@ -1,6 +1,13 @@
 const mongoose = require('mongoose');
 
 const exchangeRateSchema = new mongoose.Schema({
+  // Multi-tenancy: company reference
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true,
+    index: true
+  },
   baseCurrency: {
     type: String,
     required: true,

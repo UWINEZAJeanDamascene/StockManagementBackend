@@ -624,3 +624,97 @@ exports.bulkCreatePayroll = async (req, res, next) => {
     next(error);
   }
 };
+
+// @desc    Finalise payroll record (ready for PayrollRun)
+// @route   POST /api/payroll/:id/finalise
+// @access  Private (admin, manager)
+exports.finalisePayroll = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const payroll = await Payroll.findOne({ _id: req.params.id, company: companyId });
+    
+    if (!payroll) {
+      return res.status(404).json({ success: false, message: 'Payroll record not found' });
+    }
+    
+    // Check if already finalised or paid
+    if (payroll.record_status === 'finalised') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Payroll record already finalised' 
+      });
+    }
+    
+    if (payroll.record_status === 'paid') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Payroll record already paid' 
+      });
+    }
+    
+    // Set pay period if not set
+    if (!payroll.pay_period_start || !payroll.pay_period_end) {
+      const year = payroll.period.year;
+      const month = payroll.period.month;
+      payroll.pay_period_start = new Date(year, month - 1, 1);
+      payroll.pay_period_end = new Date(year, month, 0); // Last day of month
+    }
+    
+    payroll.record_status = 'finalised';
+    await payroll.save();
+    
+    res.json({
+      success: true,
+      data: payroll,
+      message: 'Payroll record finalised - ready for PayrollRun'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get payslip for payroll record
+// @route   GET /api/payroll/:id/payslip
+// @access  Private
+exports.getPayslip = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const payroll = await Payroll.findOne({ _id: req.params.id, company: companyId });
+    
+    if (!payroll) {
+      return res.status(404).json({ success: false, message: 'Payroll record not found' });
+    }
+    
+    // Build payslip data
+    const payslip = {
+      employee: payroll.employee,
+      period: payroll.period,
+      earnings: {
+        basicSalary: payroll.salary.basicSalary,
+        transportAllowance: payroll.salary.transportAllowance,
+        housingAllowance: payroll.salary.housingAllowance,
+        otherAllowances: payroll.salary.otherAllowances,
+        grossSalary: payroll.salary.grossSalary
+      },
+      deductions: {
+        paye: payroll.deductions.paye,
+        rssbPension: payroll.deductions.rssbEmployeePension,
+        rssbMaternity: payroll.deductions.rssbEmployeeMaternity,
+        totalDeductions: payroll.deductions.totalDeductions
+      },
+      netPay: payroll.netPay,
+      employerContributions: payroll.contributions,
+      status: payroll.record_status,
+      payrollRunId: payroll.payroll_run_id
+    };
+    
+    res.json({
+      success: true,
+      data: payslip
+    });
+  } catch (error) {
+    next(error);
+  }
+};

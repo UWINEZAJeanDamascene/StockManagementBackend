@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-// Petty Cash Expense Schema (individual expense entries)
+// Petty Cash Expense Schema (individual expense entries per Module 4 spec)
 const pettyCashExpenseSchema = new mongoose.Schema({
   // Company reference
   company: {
@@ -8,21 +8,28 @@ const pettyCashExpenseSchema = new mongoose.Schema({
     ref: 'Company',
     required: true
   },
-  // Float reference
+  // Float reference (fund_id per Module 4 spec)
   float: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'PettyCashFloat',
     required: true
   },
+  // Description (per Module 4 spec)
   description: {
     type: String,
     required: true,
     trim: true
   },
+  // Amount (per Module 4 spec)
   amount: {
     type: Number,
     required: true,
     min: 0
+  },
+  // Expense account ID (per Module 4 spec: expense_account_id - required for type=expense)
+  expenseAccountId: {
+    type: String,
+    default: '5100'
   },
   category: {
     type: String,
@@ -66,7 +73,7 @@ const pettyCashExpenseSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Petty Cash Float/Balance Schema
+// Petty Cash Float/Balance Schema (per Module 4 spec)
 const pettyCashFloatSchema = new mongoose.Schema({
   // Company reference
   company: {
@@ -78,7 +85,13 @@ const pettyCashFloatSchema = new mongoose.Schema({
   name: {
     type: String,
     trim: true,
-    default: 'Main Petty Cash'
+    maxlength: 100,
+    required: [true, 'Please provide a petty cash fund name']
+  },
+  // Ledger account ID (1110-series per Module 4 spec)
+  ledgerAccountId: {
+    type: String,
+    default: '1110'
   },
   // Opening/float balance
   openingBalance: {
@@ -87,30 +100,52 @@ const pettyCashFloatSchema = new mongoose.Schema({
     min: 0,
     default: 0
   },
-  // Current balance (calculated)
+  // Current balance (calculated automatically)
   currentBalance: {
     type: Number,
     required: true,
     min: 0,
     default: 0
   },
-  // Minimum threshold for replenishment
+  // Target float level (per Module 4 spec: float_amount)
+  floatAmount: {
+    type: Number,
+    required: true,
+    min: 0,
+    default: 0
+  },
+  // Minimum threshold for replenishment (kept for backwards compatibility)
   minimumBalance: {
     type: Number,
     default: 10000
   },
-  // Responsible person
+  // Responsible person (custodian_id per Module 4 spec)
   custodian: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true
+    required: [true, 'Please specify a custodian']
   },
   // Location/description
   location: String,
-  // Status
+  // Status (is_active per Module 4 spec)
   isActive: {
     type: Boolean,
     default: true
+  },
+  // Cached balance (similar to BankAccount)
+  cachedBalance: {
+    type: Number,
+    default: 0
+  },
+  // Cache validity flag
+  cacheValid: {
+    type: Boolean,
+    default: false
+  },
+  // Timestamp when cache was last computed
+  cacheLastComputed: {
+    type: Date,
+    default: null
   },
   // Notes
   notes: String
@@ -120,6 +155,15 @@ const pettyCashFloatSchema = new mongoose.Schema({
 
 // Index for efficient queries
 pettyCashFloatSchema.index({ company: 1, isActive: 1 });
+
+// Static method to invalidate cache for all floats linked to a ledger account
+// Called by JournalService when journal entries are posted
+pettyCashFloatSchema.statics.invalidateCacheForLedgerAccount = async function(companyId, ledgerAccountId) {
+  return this.updateMany(
+    { company: companyId, ledgerAccountId: ledgerAccountId },
+    { $set: { cacheValid: false } }
+  );
+};
 pettyCashExpenseSchema.index({ company: 1, float: 1, date: -1 });
 pettyCashExpenseSchema.index({ company: 1, status: 1 });
 
@@ -127,6 +171,10 @@ pettyCashExpenseSchema.index({ company: 1, status: 1 });
 pettyCashFloatSchema.pre('save', async function(next) {
   if (this.isNew) {
     this.currentBalance = this.openingBalance;
+    this.floatAmount = this.floatAmount || this.openingBalance;
+    this.cachedBalance = this.openingBalance;
+    this.cacheValid = true;
+    this.cacheLastComputed = new Date();
   }
   next();
 });
@@ -233,7 +281,10 @@ pettyCashReplenishmentSchema.pre('save', async function(next) {
   next();
 });
 
-// Main Petty Cash Transaction Schema (tracks all activities)
+// Main Petty Cash Transaction Schema (tracks all activities per Module 4 spec)
+// NOTE: Schema includes nullable fields for future approval workflow support
+// In v1 (simple mode): all transactions have status='posted', approved_by=NULL
+// In v2 (workflow mode): add pending→approved state transitions without migration
 const pettyCashTransactionSchema = new mongoose.Schema({
   // Company reference
   company: {
@@ -241,17 +292,52 @@ const pettyCashTransactionSchema = new mongoose.Schema({
     ref: 'Company',
     required: true
   },
-  // Float reference
+  // Float reference (fund_id per Module 4 spec)
   float: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'PettyCashFloat',
     required: true
   },
-  // Transaction type
+  // Reference number (PCT-YYYY-NNNNN per Module 4 spec)
+  // Auto-generated in pre-save hook if not provided
+  referenceNo: {
+    type: String,
+    unique: true,
+    default: function() {
+      // Use timestamp + random for uniqueness in tests/seed data
+      // Pre-save hook will replace with proper sequential numbering
+      return `PCT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+  },
+  // Transaction type (top_up, expense per Module 4 spec)
   type: {
     type: String,
-    enum: ['opening', 'expense', 'replenishment', 'adjustment', 'closing'],
+    enum: ['top_up', 'expense', 'opening', 'replenishment', 'adjustment', 'closing'],
     required: true
+  },
+  // Transaction date (per Module 4 spec)
+  transactionDate: {
+    type: Date,
+    required: true,
+    default: Date.now
+  },
+  // Status: 'posted' (v1 simple mode), or 'pending','approved','rejected' (v2 workflow mode)
+  status: {
+    type: String,
+    enum: ['posted', 'pending', 'approved', 'rejected'],
+    default: 'posted',
+    required: true
+  },
+  // Approved by (nullable - for future workflow support)
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  // Approved at timestamp (nullable - for future workflow support)
+  approvedAt: {
+    type: Date,
+    default: null
   },
   // Reference to related document
   reference: {
@@ -263,24 +349,35 @@ const pettyCashTransactionSchema = new mongoose.Schema({
     enum: ['PettyCashExpense', 'PettyCashReplenishment', null],
     default: null
   },
-  // Amount
+  // Amount (per Module 4 spec)
+  // For expenses, use negative amount to reduce balance; positive for top-ups
   amount: {
     type: Number,
     required: true
+  },
+  // Receipt reference (receipt_ref per Module 4 spec)
+  receiptRef: {
+    type: String,
+    maxlength: 100,
+    default: null
   },
   // Balance after transaction
   balanceAfter: {
     type: Number,
     required: true
   },
-  // Description
-  description: String,
-  // Date
-  date: {
-    type: Date,
-    default: Date.now
+  // Description (per Module 4 spec)
+  description: {
+    type: String,
+    required: true
   },
-  // User who created the transaction
+  // Journal entry ID (per Module 4 spec: journal_entry_id)
+  journalEntryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
+  // User who created the transaction (posted_by per Module 4 spec)
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -293,7 +390,20 @@ const pettyCashTransactionSchema = new mongoose.Schema({
 });
 
 // Index for efficient queries
-pettyCashTransactionSchema.index({ company: 1, float: 1, date: -1 });
+pettyCashTransactionSchema.index({ company: 1, float: 1, transactionDate: -1 });
+pettyCashTransactionSchema.index({ company: 1, referenceNo: 1 });
+
+// Auto-generate reference number (PCT-YYYY-NNNNN per Module 4 spec)
+pettyCashTransactionSchema.pre('save', async function(next) {
+  if (this.isNew && !this.referenceNo) {
+    const year = new Date().getFullYear();
+    const count = await mongoose.model('PettyCashTransaction').countDocuments({ 
+      company: this.company 
+    });
+    this.referenceNo = `PCT-${year}-${String(count + 1).padStart(5, '0')}`;
+  }
+  next();
+});
 
 // Create models
 const PettyCashFloat = mongoose.model('PettyCashFloat', pettyCashFloatSchema);

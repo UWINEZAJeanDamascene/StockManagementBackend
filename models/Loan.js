@@ -22,6 +22,48 @@ const loanPaymentSchema = new mongoose.Schema({
   }
 });
 
+// Liability Transaction Schema - for tracking drawdowns, repayments, interest charges
+const liabilityTransactionSchema = new mongoose.Schema({
+  transactionDate: {
+    type: Date,
+    required: true
+  },
+  type: {
+    type: String,
+    enum: ['drawdown', 'repayment', 'interest_charge'],
+    required: true
+  },
+  amount: {
+    type: Number,
+    required: true,
+    min: 0.01
+  },
+  principalPortion: {
+    type: Number,
+    default: 0
+  },
+  interestPortion: {
+    type: Number,
+    default: 0
+  },
+  bankAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BankAccount',
+    default: null
+  },
+  journalEntryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
+  notes: {
+    type: String,
+    default: null
+  }
+}, {
+  timestamps: true
+});
+
 const loanSchema = new mongoose.Schema({
   // Multi-tenancy: company reference
   company: {
@@ -35,26 +77,47 @@ const loanSchema = new mongoose.Schema({
   },
   lenderName: {
     type: String,
-    required: [true, 'Please provide lender name'],
     trim: true
   },
   lenderContact: String,
   
-  // Loan details
+  // Liability name/description
+  name: {
+    type: String,
+    required: [true, 'Please provide liability name'],
+    trim: true
+  },
+  
+  // Loan/Liability type - expanded to include hire_purchase and accrual
   loanType: {
     type: String,
-    enum: ['short-term', 'long-term'],
+    enum: ['short-term', 'long-term', 'loan', 'hire_purchase', 'accrual', 'other'],
     required: true
+  },
+  // Legacy alias for compatibility
+  type: {
+    type: String,
+    enum: ['short-term', 'long-term', 'loan', 'hire_purchase', 'accrual', 'other']
   },
   purpose: {
     type: String,
     trim: true
   },
+  
+  // Financial amounts
   originalAmount: {
     type: Number,
     required: true,
-    min: 0
+    min: 0.01
   },
+  // Outstanding balance - tracked separately
+  outstandingBalance: {
+    type: Number,
+    required: true,
+    default: function() { return this.originalAmount; }
+  },
+  
+  // Interest
   interestRate: {
     type: Number,
     default: 0,
@@ -73,6 +136,18 @@ const loanSchema = new mongoose.Schema({
     min: 1
   },
   
+  // Account references for journal entries
+  liabilityAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccounts',
+    required: [true, 'Liability account is required']
+  },
+  interestExpenseAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccounts',
+    default: null
+  },
+  
   // Dates
   startDate: {
     type: Date,
@@ -83,7 +158,7 @@ const loanSchema = new mongoose.Schema({
   // Status
   status: {
     type: String,
-    enum: ['active', 'paid-off', 'defaulted', 'cancelled'],
+    enum: ['active', 'paid-off', 'fully_repaid', 'defaulted', 'cancelled'],
     default: 'active'
   },
   
@@ -93,6 +168,8 @@ const loanSchema = new mongoose.Schema({
     default: 0
   },
   payments: [loanPaymentSchema],
+  // New: Liability transactions for drawdowns, repayments, interest
+  transactions: [liabilityTransactionSchema],
   
   // Terms
   paymentTerms: {
@@ -127,12 +204,16 @@ loanSchema.pre('save', async function(next) {
     const count = await mongoose.model('Loan').countDocuments({ company: this.company });
     this.loanNumber = `LN-${String(count + 1).padStart(5, '0')}`;
   }
+  // Set outstandingBalance to originalAmount if not set
+  if (this.isNew && !this.outstandingBalance) {
+    this.outstandingBalance = this.originalAmount;
+  }
   next();
 });
 
-// Virtual for remaining balance
+// Virtual for remaining balance (alias for outstandingBalance)
 loanSchema.virtual('remainingBalance').get(function() {
-  return this.originalAmount - this.amountPaid;
+  return this.outstandingBalance || (this.originalAmount - this.amountPaid);
 });
 
 // Virtual for next payment due (simplified)

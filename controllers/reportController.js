@@ -988,16 +988,6 @@ exports.getFinancialRatios = async (req, res, next) => {
     };
 
     // If no snapshot available, fall back to aggregations
-    let currentRatio = null;
-    let quickRatio = null;
-    let grossMargin = null;
-    let inventoryTurnover = null;
-    let daysInventory = null;
-    let apTurnover = null;
-    let returnOnAssets = null;
-    let debtToEquity = null;
-    let netProfitMargin = null;
-
     if (balances) {
       // Current Assets: sum of current asset accounts (use typical codes)
       const cash = netFrom(DEFAULT_ACCOUNTS.cashAtBank, 'debit') || 0;
@@ -1202,15 +1192,15 @@ exports.getFinancialRatios = async (req, res, next) => {
     // Compute ratios (guard divide by zero)
     const safeDiv = (num, den) => (den && den !== 0) ? num / den : null;
 
-    const currentRatio = safeDiv(totalCurrentAssets, totalCurrentLiabilities);
-    const quickRatio = safeDiv(totalCurrentAssets - inventoryValue, totalCurrentLiabilities);
-    const debtToEquity = safeDiv(totalLiabilities, totalEquity);
-    const returnOnAssets = safeDiv(netProfit, totalAssets);
+    currentRatio = safeDiv(totalCurrentAssets, totalCurrentLiabilities);
+    quickRatio = safeDiv(totalCurrentAssets - inventoryValue, totalCurrentLiabilities);
+    debtToEquity = safeDiv(totalLiabilities, totalEquity);
+    returnOnAssets = safeDiv(netProfit, totalAssets);
     const returnOnEquity = safeDiv(netProfit, totalEquity);
     const grossMarginPercent = netRevenue ? (grossProfit / netRevenue) * 100 : null;
     const netProfitMarginPercent = netRevenue ? (netProfit / netRevenue) * 100 : null;
     const cogs = (netRevenue - grossProfit) || 0;
-    const inventoryTurnover = safeDiv(cogs, inventoryValue || 0);
+    inventoryTurnover = safeDiv(cogs, inventoryValue || 0);
 
     // Payables Days = (Accounts Payable × 365) / Actual Purchases
     // Use purchasesTotal (actual purchases from P&L) not payables

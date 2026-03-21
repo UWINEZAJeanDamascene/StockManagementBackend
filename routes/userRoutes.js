@@ -10,10 +10,14 @@ const {
   resetPassword,
   toggleUserStatus
 } = require('../controllers/userController');
+const { inviteUser } = require('../controllers/userAuthController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
 
+// All routes require authentication
 router.use(protect);
+
+// Admin only routes
 router.use(authorize('admin'));
 
 router.route('/')
@@ -24,6 +28,9 @@ router.route('/:id')
   .get(getUser)
   .put(logAction('user'), updateUser)
   .delete(logAction('user'), deleteUser);
+
+// Invite user to company
+router.post('/invite', logAction('user'), inviteUser);
 
 // Admin-only special actions
 router.post('/:id/reset-password', logAction('user'), resetPassword);

@@ -1,6 +1,13 @@
 const mongoose = require('mongoose');
 
 const invoiceReceiptMetadataSchema = new mongoose.Schema({
+  // Multi-tenancy: company reference
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true,
+    index: true
+  },
   invoice: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Invoice',

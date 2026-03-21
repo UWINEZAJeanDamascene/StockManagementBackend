@@ -485,7 +485,7 @@ invoiceSchema.pre('save', function(next) {
     const totalTaxVal = totalTaxA + totalTaxB;
     const grandTotalVal = subtotalVal - totalDiscount + totalTaxVal;
     
-    this.subtotal = mongoose.Types.Decimal128.fromString(subtotalVal.toString());
+    this.subtotal = mongoose.Types.Decimal128.fromString(subtotalVal.toFixed(2));
     this.taxAmount = mongoose.Types.Decimal128.fromString(totalTaxVal.toString());
     this.totalAmount = mongoose.Types.Decimal128.fromString(grandTotalVal.toString());
     this.totalTax = totalTaxVal; // backwards compat
@@ -502,7 +502,7 @@ invoiceSchema.pre('save', function(next) {
     
     // Amount outstanding calculation - Module 6
     const amountPaidVal = parseFloat(this.amountPaid) || 0;
-    this.amountOutstanding = mongoose.Types.Decimal128.fromString((grandTotalVal - amountPaidVal).toString());
+    this.amountOutstanding = mongoose.Types.Decimal128.fromString((grandTotalVal - amountPaidVal).toFixed(2));
     this.balance = (grandTotalVal - amountPaidVal); // backwards compat
   }
   
@@ -529,6 +529,21 @@ invoiceSchema.pre('save', function(next) {
   next();
 });
 
+// Ensure Decimal128 money fields expose fixed 2-decimal string when accessed
+if (invoiceSchema.path('amountPaid')) {
+  invoiceSchema.path('amountPaid').get(function(v) {
+    if (v == null) return '0.00';
+    try { return parseFloat(v.toString()).toFixed(2); } catch (e) { return String(v); }
+  });
+}
+
+if (invoiceSchema.path('amountOutstanding')) {
+  invoiceSchema.path('amountOutstanding').get(function(v) {
+    if (v == null) return '0.00';
+    try { return parseFloat(v.toString()).toFixed(2); } catch (e) { return String(v); }
+  });
+}
+
 // Virtual for backwards compatibility
 invoiceSchema.virtual('invoiceNumber').get(function() {
   return this.referenceNo;
@@ -537,10 +552,19 @@ invoiceSchema.virtual('items').get(function() {
   return this.lines || this.items;
 });
 invoiceSchema.virtual('grandTotal').get(function() {
-  return parseFloat(this.totalAmount) || this.grandTotal;
+  const val = this.totalAmount || this._doc && this._doc.total;
+  return parseFloat(val) || this.grandTotal || 0;
 });
+
 invoiceSchema.virtual('balance').get(function() {
-  return parseFloat(this.amountOutstanding) || this.balance;
+  // Avoid referencing the virtual itself (this.balance) which causes recursion.
+  if (this.amountOutstanding !== undefined && this.amountOutstanding !== null) {
+    return parseFloat(this.amountOutstanding) || 0;
+  }
+  if (this._doc && this._doc.balance !== undefined) {
+    return parseFloat(this._doc.balance) || 0;
+  }
+  return 0;
 });
 invoiceSchema.virtual('currency').get(function() {
   return this.currencyCode || this.currency;

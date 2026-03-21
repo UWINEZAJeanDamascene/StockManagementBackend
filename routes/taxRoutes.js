@@ -6,6 +6,25 @@ const { protect, authorize } = require('../middleware/auth');
 // All routes require authentication
 router.use(protect);
 
+// =====================================================
+// TAX RATE CONFIGURATION (Module 9: Taxes)
+// =====================================================
+// Tax rate CRUD
+router.get('/rates', taxController.getTaxRates);
+router.post('/rates', taxController.createTaxRate);
+router.get('/rates/:id', taxController.getTaxRateById);
+router.put('/rates/:id', taxController.updateTaxRate);
+router.delete('/rates/:id', taxController.deleteTaxRate);
+
+// Tax liability report - computed from journal entries
+router.get('/liability-report', taxController.getLiabilityReport);
+
+// Tax settlement - post payment to authorities
+router.post('/settlements', taxController.postSettlement);
+
+// =====================================================
+// TAX TRACKING (existing - for filings, payments, calendar)
+// =====================================================
 // Tax records CRUD
 router.get('/', taxController.getTaxRecords);
 router.get('/summary', taxController.getTaxSummary);

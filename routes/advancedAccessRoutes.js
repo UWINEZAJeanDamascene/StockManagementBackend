@@ -2,7 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { protect, authorize } = require('../middleware/auth');
 const ipWhitelist = require('../middleware/ipWhitelist');
-const { createRole, getRoles, updateRole, deleteRole } = require('../controllers/roleController');
+const { 
+  createRole, 
+  getRoles, 
+  getRoleById,
+  getRolePermissions,
+  updateRole, 
+  deleteRole 
+} = require('../controllers/roleController');
 const { setup2FA, verify2FA, disable2FA } = require('../controllers/securityController');
 const IPWhitelist = require('../models/IPWhitelist');
 
@@ -17,9 +24,20 @@ router.post('/2fa/disable', disable2FA);
 // IP whitelist should be enforced for admin-only routes
 router.use(ipWhitelist);
 
-// Role management - admin/platform_admin only
+/**
+ * Role management endpoints
+ * 
+ * GET    /api/roles              - List system roles + company custom roles
+ * POST   /api/roles              - Create custom role for company (admin only)
+ * GET    /api/roles/:id          - Get a specific role
+ * PUT    /api/roles/:id          - Update custom role (cannot modify system roles)
+ * DELETE /api/roles/:id          - Delete custom role (cannot delete system roles)
+ * GET    /api/roles/:id/permissions - Get all permissions for a role
+ */
 router.get('/roles', authorize('platform_admin', 'admin'), getRoles);
 router.post('/roles', authorize('platform_admin', 'admin'), createRole);
+router.get('/roles/:id', authorize('platform_admin', 'admin'), getRoleById);
+router.get('/roles/:id/permissions', authorize('platform_admin', 'admin'), getRolePermissions);
 router.put('/roles/:id', authorize('platform_admin', 'admin'), updateRole);
 router.delete('/roles/:id', authorize('platform_admin', 'admin'), deleteRole);
 

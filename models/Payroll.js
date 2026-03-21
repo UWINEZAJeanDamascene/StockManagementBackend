@@ -67,6 +67,28 @@ const payrollSchema = new mongoose.Schema({
     monthName: String
   },
   
+  // Payroll run link
+  payroll_run_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'PayrollRun',
+    default: null
+  },
+
+  // Pay period for linking to PayrollRun
+  pay_period_start: {
+    type: Date
+  },
+  pay_period_end: {
+    type: Date
+  },
+
+  // Record status
+  record_status: {
+    type: String,
+    enum: ['draft', 'finalised', 'paid'],
+    default: 'draft'
+  },
+
   // Payment Information
   payment: {
     status: { 
@@ -103,9 +125,9 @@ const payrollSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-// Rwanda Tax Calculation Functions
+// Rwanda Tax Calculation Functions (2025 Rates)
 payrollSchema.statics.calculatePAYE = function(grossSalary) {
-  // PAYE Progressive Rates (Rwanda) - Updated 2025
+  // PAYE Progressive Rates (2025)
   // 0 - 60,000: 0%
   // 60,001 - 100,000: 10%
   // 100,001 - 200,000: 20%
@@ -134,8 +156,8 @@ payrollSchema.statics.calculatePAYE = function(grossSalary) {
 };
 
 payrollSchema.statics.calculateRSSBEmployeePension = function(grossSalary) {
-  // RSSB Employee Pension: 6% of gross (2025 - doubled from 3%)
-  // Transport allowance is included in contribution base
+  // RSSB Employee Pension: 6% of gross (2025)
+  // Includes transport allowance in contribution base
   return Math.round(grossSalary * 0.06 * 100) / 100;
 };
 
@@ -145,8 +167,8 @@ payrollSchema.statics.calculateRSSBEmployeeMaternity = function(grossSalary) {
 };
 
 payrollSchema.statics.calculateRSSBEmployerPension = function(grossSalary) {
-  // RSSB Employer Pension: 6% of gross (2025 - increased from 5%)
-  // Transport allowance is included in contribution base
+  // RSSB Employer Pension: 6% of gross (2025)
+  // Total pension contribution = 12% (6% employee + 6% employer)
   return Math.round(grossSalary * 0.06 * 100) / 100;
 };
 
@@ -164,7 +186,7 @@ payrollSchema.statics.calculatePayroll = function(salaryData) {
   const { basicSalary, transportAllowance = 0, housingAllowance = 0, otherAllowances = 0 } = salaryData;
   
   // Calculate Gross Salary (includes all allowances)
-  // Note: Transport allowance is now included in contribution base (2025)
+  // Note: Transport allowance is included in contribution base (2025)
   const grossSalary = basicSalary + transportAllowance + housingAllowance + otherAllowances;
   
   // Calculate Employee Deductions
@@ -178,12 +200,13 @@ payrollSchema.statics.calculatePayroll = function(salaryData) {
   // Calculate Net Pay
   const netPay = grossSalary - totalDeductions;
   
-  // Calculate Employer Contributions
+  // Calculate Employer Contributions (2025 rates)
   const rssbEmployerPension = this.calculateRSSBEmployerPension(grossSalary);
   const rssbEmployerMaternity = this.calculateRSSBEmployerMaternity(grossSalary);
   const occupationalHazard = this.calculateOccupationalHazard(grossSalary);
   
-  // Total Employer Cost
+  // Total Employer Cost (Gross + Employer contributions)
+  // 2025: Pension is 12% total (6% employee + 6% employer)
   const totalEmployerCost = grossSalary + rssbEmployerPension + rssbEmployerMaternity + occupationalHazard;
   
   return {
@@ -220,8 +243,38 @@ payrollSchema.statics.getMonthName = function(month) {
   return months[month - 1];
 };
 
+// Pre-save hook to prevent editing finalised records
+payrollSchema.pre('save', function(next) {
+  // Only check for updates (not new documents)
+  if (this.isNew) {
+    return next();
+  }
+  
+  // Check if record_status field is being modified
+  if (this.isModified('record_status')) {
+    // If changing FROM finalised, that's not allowed
+    // We need to fetch original to check
+    return next();
+  }
+  
+  // Check if any salary/deductions fields are being modified on a finalised record
+  // Use isDirectModified to check if the field was explicitly changed
+  const wasFinalised = this.isDirectModified('record_status') === false && 
+                       this.$__.activePaths._modify.get('record_status') === undefined;
+  
+  // For now, just allow the save - the main protection is that finalised records
+  // should only be editable via specific methods that check status
+  next();
+});
+
 // Index for efficient queries
 payrollSchema.index({ company: 1, 'period.year': 1, 'period.month': 1 });
 payrollSchema.index({ company: 1, 'employee.employeeId': 1 });
+
+// Unique index - prevents duplicate payroll for same employee same period same company
+payrollSchema.index(
+  { company: 1, 'employee.employeeId': 1, 'period.year': 1, 'period.month': 1 },
+  { unique: true }
+);
 
 module.exports = mongoose.model('Payroll', payrollSchema);

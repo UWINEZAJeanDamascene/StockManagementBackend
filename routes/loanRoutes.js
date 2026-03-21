@@ -7,7 +7,11 @@ const {
   updateLoan,
   deleteLoan,
   recordPayment,
-  getLoansSummary
+  getLoansSummary,
+  recordDrawdown,
+  recordRepayment,
+  recordInterest,
+  getTransactions
 } = require('../controllers/loanController');
 const { protect } = require('../middleware/auth');
 
@@ -27,5 +31,18 @@ router.route('/:id')
 
 router.route('/:id/payment')
   .post(recordPayment);
+
+// New liability transaction routes
+router.route('/:id/drawdown')
+  .post(recordDrawdown);
+
+router.route('/:id/repayment')
+  .post(recordRepayment);
+
+router.route('/:id/interest')
+  .post(recordInterest);
+
+router.route('/:id/transactions')
+  .get(getTransactions);
 
 module.exports = router;

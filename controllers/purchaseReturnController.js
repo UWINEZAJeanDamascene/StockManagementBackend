@@ -251,3 +251,34 @@ exports.getPurchaseReturn = async (req, res, next) => {
     res.json({ success: true, data: pr });
   } catch (err) { next(err); }
 };
+
+// Get summary of purchase returns
+exports.getPurchaseReturnSummary = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    
+    const match = { company: companyId };
+    if (startDate || endDate) {
+      match.returnDate = {};
+      if (startDate) match.returnDate.$gte = new Date(startDate);
+      if (endDate) match.returnDate.$lte = new Date(endDate);
+    }
+    
+    const summary = await PurchaseReturn.aggregate([
+      { $match: match },
+      { $group: {
+        _id: '$status',
+        count: { $sum: 1 },
+        totalAmount: { $sum: '$grandTotal' }
+      }}
+    ]);
+    
+    const result = {
+      total: summary.reduce((s, g) => s + g.count, 0),
+      byStatus: summary
+    };
+    
+    res.json({ success: true, data: result });
+  } catch (err) { next(err); }
+};

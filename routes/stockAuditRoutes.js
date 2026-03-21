@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const stockAuditController = require('../controllers/stockAuditController');
-const auth = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 
 // All routes require authentication
-router.use(auth);
+router.use(protect);
 
 // CRUD operations
 router.post('/', stockAuditController.createStockAudit);

@@ -20,14 +20,129 @@ const expenseItemSchema = new mongoose.Schema({
 });
 
 const expenseSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
+  // Multi-tenancy: company reference (keeping existing pattern)
   company: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Company',
-    required: [true, 'Expense must belong to a company']
+    required: [true, 'Expense must belong to a company'],
+    index: true
   },
 
-  // Expense type/category
+  // Reference number - unique per company
+  reference_no: {
+    type: String
+  },
+
+  // Expense date
+  expense_date: {
+    type: Date,
+    required: true
+  },
+
+  // Description
+  description: {
+    type: String,
+    required: true,
+    trim: true
+  },
+
+  // Expense account (ChartOfAccounts reference)
+  expense_account_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccounts',
+    required: true
+  },
+
+  // Amount (net of tax)
+  amount: {
+    type: Number,
+    required: true,
+    min: 0.01
+  },
+
+  // Tax amount (VAT input)
+  tax_amount: {
+    type: Number,
+    default: 0
+  },
+
+  // Total amount (including tax)
+  total_amount: {
+    type: Number,
+    required: true
+  },
+
+  // Tax account for input VAT
+  tax_account_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccounts',
+    default: null
+  },
+
+  // Payment method: bank, petty_cash, credit_card, payable
+  payment_method: {
+    type: String,
+    enum: ['bank', 'petty_cash', 'credit_card', 'payable'],
+    required: true
+  },
+
+  // Bank account (required when payment_method = 'bank')
+  bank_account_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BankAccount',
+    default: null
+  },
+
+  // Petty cash fund (required when payment_method = 'petty_cash')
+  petty_cash_fund_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'PettyCashFund',
+    default: null
+  },
+
+  // Supplier reference
+  supplier_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Supplier',
+    default: null
+  },
+
+  // Receipt reference
+  receipt_ref: {
+    type: String,
+    default: null
+  },
+
+  // Status: posted, reversed
+  status: {
+    type: String,
+    enum: ['posted', 'reversed'],
+    default: 'posted'
+  },
+
+  // Journal entry for the expense
+  journal_entry_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
+
+  // Reversal journal entry
+  reversal_journal_entry_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'JournalEntry',
+    default: null
+  },
+
+  // Posted by user
+  posted_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+
+  // Legacy fields - keeping for backward compatibility
+  // Expense type/category (kept for reporting)
   type: {
     type: String,
     enum: [
@@ -39,9 +154,9 @@ const expenseSchema = new mongoose.Schema({
       'other_expense',
       'interest_income',
       'other_income',
-      'other_expense_income' // For other expenses in income statement
+      'other_expense_income'
     ],
-    required: true
+    default: 'other_expense'
   },
 
   // For backward compatibility - category name
@@ -52,29 +167,15 @@ const expenseSchema = new mongoose.Schema({
     }
   },
 
-  // Reference number
+  // Reference number (legacy)
   expenseNumber: {
     type: String,
     uppercase: true
   },
 
-  // Description
-  description: {
-    type: String,
-    trim: true
-  },
-
-  // Amount
-  amount: {
-    type: Number,
-    required: true,
-    min: 0
-  },
-
-  // Date
+  // Date (legacy)
   expenseDate: {
-    type: Date,
-    default: Date.now
+    type: Date
   },
 
   // Period for reporting (monthly)
@@ -83,14 +184,7 @@ const expenseSchema = new mongoose.Schema({
     index: true
   },
 
-  // Status
-  status: {
-    type: String,
-    enum: ['draft', 'recorded', 'approved', 'cancelled'],
-    default: 'recorded'
-  },
-
-  // Payment info
+  // Payment info (legacy)
   paymentMethod: {
     type: String,
     enum: ['cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit'],
@@ -113,11 +207,10 @@ const expenseSchema = new mongoose.Schema({
     default: 'monthly'
   },
 
-  // User tracking
+  // User tracking (legacy)
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
+    ref: 'User'
   },
   approvedBy: {
     type: mongoose.Schema.Types.ObjectId,
@@ -136,24 +229,38 @@ const expenseSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Index for efficient queries
+// Compound indexes for efficient queries
+expenseSchema.index({ company: 1, reference_no: 1 }, { unique: true });
+expenseSchema.index({ company: 1, expense_date: -1 });
+expenseSchema.index({ company: 1, expense_account_id: 1 });
+expenseSchema.index({ company: 1, payment_method: 1 });
 expenseSchema.index({ company: 1, type: 1 });
-expenseSchema.index({ company: 1, expenseDate: 1 });
-expenseSchema.index({ company: 1, period: 1 });
 expenseSchema.index({ company: 1, status: 1 });
 
-// Auto-generate expense number
+// Auto-generate reference number
 expenseSchema.pre('save', async function(next) {
-  if (this.isNew && !this.expenseNumber) {
+  if (this.isNew && !this.reference_no) {
     const count = await mongoose.model('Expense').countDocuments({ company: this.company });
-    this.expenseNumber = `EXP-${String(count + 1).padStart(5, '0')}`;
+    this.reference_no = `EXP-${String(count + 1).padStart(5, '0')}`;
   }
   
-  // Set period from expenseDate
-  if (this.expenseDate) {
-    const year = this.expenseDate.getFullYear();
-    const month = String(this.expenseDate.getMonth() + 1).padStart(2, '0');
+  // Set period from expense_date
+  if (this.expense_date) {
+    const year = this.expense_date.getFullYear();
+    const month = String(this.expense_date.getMonth() + 1).padStart(2, '0');
     this.period = `${year}-${month}`;
+  }
+
+  // Set total_amount if not set
+  if (this.isNew && !this.total_amount && this.amount !== undefined) {
+    this.total_amount = this.amount + (this.tax_amount || 0);
+  }
+  
+  // Sync legacy fields
+  if (this.isNew) {
+    if (!this.expenseNumber) this.expenseNumber = this.reference_no;
+    if (!this.expenseDate) this.expenseDate = this.expense_date;
+    if (!this.createdBy) this.createdBy = this.posted_by;
   }
   
   next();
@@ -164,13 +271,13 @@ expenseSchema.statics.getByTypeAndPeriod = async function(companyId, type, start
   const match = {
     company: companyId,
     type: type,
-    status: { $ne: 'cancelled' }
+    status: { $ne: 'reversed' }
   };
   
   if (startDate || endDate) {
-    match.expenseDate = {};
-    if (startDate) match.expenseDate.$gte = startDate;
-    if (endDate) match.expenseDate.$lte = endDate;
+    match.expense_date = {};
+    if (startDate) match.expense_date.$gte = startDate;
+    if (endDate) match.expense_date.$lte = endDate;
   }
   
   const expenses = await this.find(match);

@@ -1,6 +1,13 @@
 const mongoose = require('mongoose');
 
 const stockTransferLineSchema = new mongoose.Schema({
+  // Multi-tenancy: company reference (denormalized for direct queries)
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true,
+    index: true
+  },
   transfer: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'StockTransfer',

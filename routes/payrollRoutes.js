@@ -9,7 +9,9 @@ const {
   processPayment,
   getPayrollSummary,
   calculatePayroll,
-  bulkCreatePayroll
+  bulkCreatePayroll,
+  finalisePayroll,
+  getPayslip
 } = require('../controllers/payrollController');
 const { protect, authorize } = require('../middleware/auth');
 
@@ -40,5 +42,13 @@ router.route('/:id')
 // Process payment
 router.route('/:id/pay')
   .post(authorize('admin', 'manager'), processPayment);
+
+// Finalise payroll record (ready for PayrollRun)
+router.route('/:id/finalise')
+  .post(authorize('admin', 'manager'), finalisePayroll);
+
+// Get payslip
+router.route('/:id/payslip')
+  .get(getPayslip);
 
 module.exports = router;

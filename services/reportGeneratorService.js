@@ -1413,29 +1413,44 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
 
   for (const { type, generator } of reportTypes) {
     try {
-      // Check if snapshot already exists
-      let snapshot = await ReportSnapshot.findOne({
+      // Check if snapshot already exists (completed). Use atomic upsert to avoid
+      // duplicate key errors when multiple schedulers attempt to create the
+      // same snapshot concurrently.
+      const snapshotFilter = {
         company: companyId,
         reportType: type,
         periodType,
         year,
-        periodNumber,
-        status: 'completed'
-      });
+        periodNumber
+      };
+
+      // Try to find a completed snapshot first
+      let snapshot = await ReportSnapshot.findOne({ ...snapshotFilter, status: 'completed' });
 
       if (!snapshot) {
-        // Generate new snapshot
-        snapshot = new ReportSnapshot({
-          company: companyId,
-          reportType: type,
-          periodType,
-          year,
-          periodNumber,
-          periodStart: startDate,
-          periodEnd: endDate,
-          periodLabel: label,
-          status: 'in-progress',
-          generatedBy: userId
+        // Create or mark in-progress atomically
+        const upsertDoc = {
+          $setOnInsert: {
+            company: companyId,
+            reportType: type,
+            periodType,
+            year,
+            periodNumber,
+            periodStart: startDate,
+            periodEnd: endDate,
+            periodLabel: label,
+            generatedBy: userId
+          },
+          $set: {
+            status: 'in-progress',
+            updatedAt: new Date()
+          }
+        };
+
+        snapshot = await ReportSnapshot.findOneAndUpdate(snapshotFilter, upsertDoc, {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true
         });
       } else {
         snapshot.status = 'in-progress';

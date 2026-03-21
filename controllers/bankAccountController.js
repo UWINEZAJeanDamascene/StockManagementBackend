@@ -1,9 +1,13 @@
-const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const { BankAccount, BankTransaction, BankStatementLine, BankReconciliationMatch } = require('../models/BankAccount');
 const mongoose = require('mongoose');
 const Invoice = require('../models/Invoice');
 const Purchase = require('../models/Purchase');
 const Expense = require('../models/Expense');
+const JournalEntry = require('../models/JournalEntry');
 const JournalService = require('../services/journalService');
+
+// RETAINED EARNINGS account code for opening balance entry
+const RETAINED_EARNINGS_CODE = '3200';
 
 // @desc    Get all bank accounts for a company
 // @route   GET /api/bank-accounts
@@ -789,7 +793,7 @@ exports.getBankStatement = async (req, res, next) => {
 exports.importCSV = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { transactions: csvTransactions, autoMatch = false, bankFormat, dateFrom, dateTo } = req.body;
+    const { transactions: csvTransactions, autoMatch = false, bankFormat, dateFrom, dateTo, skipReordering = false } = req.body;
     
     const account = await BankAccount.findOne({
       _id: req.params.id,
@@ -803,6 +807,24 @@ exports.importCSV = async (req, res, next) => {
     
     if (!csvTransactions || !Array.isArray(csvTransactions) || csvTransactions.length === 0) {
       return res.status(400).json({ success: false, message: 'No transactions provided' });
+    }
+    
+    // Per spec: Check for sequential import - warn if earliest line has date earlier than latest existing statement
+    const latestExistingStatement = await BankStatementLine.findOne({
+      bankAccount: account._id
+    }).sort({ transactionDate: -1 });
+    
+    let sequentialWarning = null;
+    if (latestExistingStatement && !skipReordering) {
+      // Find earliest date in new import
+      const earliestImportDate = csvTransactions
+        .map(tx => tx.date ? new Date(tx.date) : null)
+        .filter(d => d && !isNaN(d.getTime()))
+        .sort((a, b) => a - b)[0];
+      
+      if (earliestImportDate && earliestImportDate < latestExistingStatement.transactionDate) {
+        sequentialWarning = `Warning: Earliest imported date (${earliestImportDate.toISOString().split('T')[0]}) is earlier than latest existing statement (${latestExistingStatement.transactionDate.toISOString().split('T')[0]}). Computed running balance may be incorrect. Set skipReordering=true to ignore.`;
+      }
     }
     
     // Filter by date range if provided
@@ -827,73 +849,120 @@ exports.importCSV = async (req, res, next) => {
       });
     }
     
-    const importedTransactions = [];
-    let currentBalance = account.currentBalance;
+    // Per spec: Sort by transaction_date ASC, then by row order
+    filteredTransactions = filteredTransactions
+      .map((tx, index) => ({ ...tx, _importOrder: index }))
+      .sort((a, b) => {
+        const dateA = a.date ? new Date(a.date) : new Date(0);
+        const dateB = b.date ? new Date(b.date) : new Date(0);
+        if (dateA.getTime() === dateB.getTime()) {
+          return a._importOrder - b._importOrder;
+        }
+        return dateA - dateB;
+      });
     
+    const importedStatementLines = [];
+    
+    // Per spec: Compute running balance from opening_balance if balance not in CSV
+    // First, get the anchor: bank_accounts.opening_balance
+    const openingBalance = parseFloat(account.openingBalance?.toString() || '0');
+    
+    // Get existing statement lines to compute starting balance
+    const existingStatements = await BankStatementLine.find({ bankAccount: account._id })
+      .sort({ transactionDate: 1, _id: 1 })
+      .lean();
+    
+    // Compute the balance at the end of existing statements
+    let runningBalance = openingBalance;
+    for (const stmt of existingStatements) {
+      const debit = parseFloat(stmt.debitAmount?.toString() || '0');
+      const credit = parseFloat(stmt.creditAmount?.toString() || '0');
+      runningBalance = runningBalance + credit - debit;
+    }
+    
+    // Now process new statements, computing balance if not provided
     for (const tx of filteredTransactions) {
-      // Parse amount - handle different CSV formats
-      let amount = 0;
-      if (typeof tx.amount === 'number') {
-        amount = tx.amount;
-      } else if (typeof tx.amount === 'string') {
-        // Remove currency symbols and commas
-        amount = parseFloat(tx.amount.replace(/[^0-9.-]/g, '')) || 0;
+      // Parse debit/credit amounts
+      const debitAmount = tx.debitAmount !== undefined 
+        ? parseFloat(String(tx.debitAmount).replace(/[^0-9.-]/g, '')) || 0
+        : (tx.debit ? parseFloat(String(tx.debit).replace(/[^0-9.-]/g, '')) || 0 : 0);
+      
+      const creditAmount = tx.creditAmount !== undefined 
+        ? parseFloat(String(tx.creditAmount).replace(/[^0-9.-]/g, '')) || 0
+        : (tx.credit ? parseFloat(String(tx.credit).replace(/[^0-9.-]/g, '')) || 0 : 0);
+      
+      // If balance is provided in CSV, use it; otherwise compute
+      let balance = null;
+      if (tx.balance !== undefined) {
+        balance = parseFloat(String(tx.balance).replace(/[^0-9.-]/g, '')) || null;
       }
       
-      // Determine if credit or debit - check debitCredit field from frontend
-      const isCredit = tx.debitCredit === 'credit' || tx.type === 'credit' || tx.type === 'C' || amount > 0;
-      const isDebit = tx.debitCredit === 'debit' || tx.type === 'debit' || tx.type === 'D' || amount < 0;
+      // Compute running balance: running_balance = running_balance + credit - debit
+      runningBalance = runningBalance + creditAmount - debitAmount;
       
       // Parse date
-      let date = new Date();
+      let transactionDate = new Date();
       if (tx.date) {
         const parsed = new Date(tx.date);
         if (!isNaN(parsed.getTime())) {
-          date = parsed;
+          transactionDate = parsed;
         }
       }
       
-      // Determine transaction type based on credit/debit
+      // Determine transaction type
       let transactionType = 'deposit';
-      if (isDebit) {
+      if (debitAmount > 0 && creditAmount === 0) {
         transactionType = 'withdrawal';
-      } else if (isCredit) {
+      } else if (creditAmount > 0 && debitAmount === 0) {
         transactionType = 'deposit';
       }
       
-      // Create transaction
+      // Create bank statement line (not BankTransaction)
+      const statementLine = new BankStatementLine({
+        company: companyId,
+        bankAccount: account._id,
+        transactionDate,
+        description: tx.description || tx.narration || tx.details || 'Imported from CSV',
+        debitAmount: mongoose.Types.Decimal128.fromString(String(debitAmount)),
+        creditAmount: mongoose.Types.Decimal128.fromString(String(creditAmount)),
+        balance: balance !== null ? mongoose.Types.Decimal128.fromString(String(balance)) : mongoose.Types.Decimal128.fromString(String(runningBalance)),
+        reference: tx.reference || tx.ref || tx.transactionId || '',
+        isReconciled: false,
+        importedAt: new Date()
+      });
+      
+      await statementLine.save();
+      importedStatementLines.push(statementLine);
+    }
+    
+    // Also create BankTransaction entries for backwards compatibility
+    const importedTransactions = [];
+    for (const line of importedStatementLines) {
+      const debitAmount = parseFloat(line.debitAmount?.toString() || '0');
+      const creditAmount = parseFloat(line.creditAmount?.toString() || '0');
+      const amount = Math.max(debitAmount, creditAmount);
+      
       const transaction = new BankTransaction({
         company: companyId,
         account: account._id,
-        type: transactionType,
-        amount: Math.abs(amount),
-        balanceAfter: currentBalance,
-        description: tx.description || tx.narration || tx.details || 'Imported from CSV',
-        date,
-        referenceNumber: tx.reference || tx.ref || tx.transactionId || '',
+        type: debitAmount > 0 ? 'withdrawal' : 'deposit',
+        amount,
+        balanceAfter: parseFloat(line.balance?.toString() || '0'),
+        description: line.description,
+        date: line.transactionDate,
+        referenceNumber: line.reference,
         paymentMethod: 'bank_transfer',
         status: 'completed',
         createdBy: req.user._id,
-        notes: `Imported: ${tx.date} | ${tx.reference || ''} | Format: ${bankFormat || 'auto'}`
+        notes: `Imported from CSV: ${line.transactionDate.toISOString().split('T')[0]} | ${line.reference || ''}`
       });
       
       await transaction.save();
-      
-      // Update running balance
-      if (isCredit) {
-        currentBalance += Math.abs(amount);
-      } else if (isDebit) {
-        currentBalance -= Math.abs(amount);
-      }
-      
-      transaction.balanceAfter = currentBalance;
-      await transaction.save();
-      
       importedTransactions.push(transaction);
     }
     
-    // Update account balance
-    account.currentBalance = currentBalance;
+    // Update account cache - invalidate since journal entries may have changed
+    account.cacheValid = false;
     await account.save();
     
     let matchResults = null;
@@ -910,14 +979,18 @@ exports.importCSV = async (req, res, next) => {
     res.status(201).json({
       success: true,
       data: {
-        imported: importedTransactions.length,
+        imported: importedStatementLines.length,
         matched,
         unmatched,
-        newBalance: currentBalance,
+        computedEndingBalance: runningBalance,
+        statementLines: importedStatementLines,
         transactions: importedTransactions,
-        matchResults
+        matchResults,
+        sequentialWarning
       },
-      message: `Successfully imported ${importedTransactions.length} transactions`
+      message: sequentialWarning 
+        ? `Imported ${importedStatementLines.length} transactions. ${sequentialWarning}`
+        : `Successfully imported ${importedStatementLines.length} transactions`
     });
   } catch (error) {
     next(error);
@@ -1182,3 +1255,797 @@ function findMatch(tx, invoices, purchases, expenses) {
   
   return null;
 }
+
+// @desc    Get computed bank balance from journal entries (Section 3.3)
+// @route   GET /api/bank-accounts/:id/balance
+// @access  Private
+exports.getComputedBalance = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { asOfDate, forceRecompute } = req.query;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    // Per spec 3.3: Use dirty flag caching pattern
+    // If cache is valid and forceRecompute is not true, return cached balance
+    if (!forceRecompute && account.cacheValid) {
+      return res.json({
+        success: true,
+        data: {
+          accountId: account._id,
+          accountName: account.name,
+          ledgerAccountId: account.ledgerAccountId || '1100',
+          balance: parseFloat(account.cachedBalance?.toString() || '0'),
+          openingBalance: parseFloat(account.openingBalance?.toString() || '0'),
+          openingBalanceDate: account.openingBalanceDate,
+          cached: true,
+          computedAt: account.cacheLastComputed,
+          cacheValid: true
+        }
+      });
+    }
+    
+    // Cache invalid - must recompute from journal
+    // Use the model's getBalance method which handles caching
+    const result = await account.getBalance(JournalEntry, asOfDate);
+    
+    res.json({
+      success: true,
+      data: {
+        accountId: account._id,
+        accountName: account.name,
+        ledgerAccountId: account.ledgerAccountId || '1100',
+        openingBalance: result.details.openingBalance,
+        openingBalanceDate: account.openingBalanceDate,
+        totalDebits: result.details.totalDebits,
+        totalCredits: result.details.totalCredits,
+        balance: Math.round(result.balance * 100) / 100,
+        asOfDate: asOfDate ? new Date(asOfDate) : new Date(),
+        journalEntryCount: result.details.journalEntryCount,
+        cached: result.cached,
+        computedAt: result.computedAt,
+        cacheValid: true  // After computation, cache is valid
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get journal entry lines for bank account (for reconciliation)
+// @route   GET /api/bank-accounts/:id/transactions
+// @access  Private
+exports.getJournalTransactions = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate, reconciled } = req.query;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    const ledgerAccountId = account.ledgerAccountId || account.accountCode || '1100';
+    
+    // Build date query
+    const dateQuery = {};
+    if (startDate) dateQuery.$gte = new Date(startDate);
+    if (endDate) dateQuery.$lte = new Date(endDate);
+    
+    // Build query for journal entries
+    const query = {
+      company: companyId,
+      status: 'posted',
+      lines: { $elemMatch: { accountCode: ledgerAccountId } }
+    };
+    
+    if (startDate || endDate) {
+      query.date = dateQuery;
+    }
+    
+    const entries = await JournalEntry.find(query)
+      .populate('createdBy', 'name')
+      .sort({ date: -1 })
+      .lean();
+    
+    // Extract and flatten lines for this account
+    const transactions = [];
+    for (const entry of entries) {
+      for (const line of entry.lines) {
+        if (line.accountCode === ledgerAccountId) {
+          const amount = parseFloat(line.debit?.toString() || '0') || -parseFloat(line.credit?.toString() || '0');
+          transactions.push({
+            journalEntryId: entry._id,
+            entryNumber: entry.entryNumber,
+            date: entry.date,
+            description: line.description || entry.description,
+            debit: parseFloat(line.debit?.toString() || '0'),
+            credit: parseFloat(line.credit?.toString() || '0'),
+            amount: amount,
+            reference: line.reference,
+            reconciled: line.reconciled || false,
+            matchedStatementLineId: line.matchedStatementLineId || null
+          });
+        }
+      }
+    }
+    
+    // Filter by reconciled status if specified
+    let filteredTransactions = transactions;
+    if (reconciled !== undefined) {
+      filteredTransactions = transactions.filter(t => t.reconciled === (reconciled === 'true'));
+    }
+    
+    // Calculate totals
+    const totals = {
+      totalDebits: filteredTransactions.reduce((sum, t) => sum + t.debit, 0),
+      totalCredits: filteredTransactions.reduce((sum, t) => sum + t.credit, 0),
+      reconciledCount: filteredTransactions.filter(t => t.reconciled).length,
+      unreconciledCount: filteredTransactions.filter(t => !t.reconciled).length
+    };
+    
+    res.json({
+      success: true,
+      data: filteredTransactions,
+      totals,
+      account: {
+        name: account.name,
+        ledgerAccountId
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Add bank statement line manually
+// @route   POST /api/bank-accounts/:id/statement
+// @access  Private
+exports.addStatementLine = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { transactionDate, description, debitAmount, creditAmount, balance, reference } = req.body;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId,
+      isActive: true
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    if (!transactionDate || !description) {
+      return res.status(400).json({ success: false, message: 'transactionDate and description are required' });
+    }
+    
+    const statementLine = new BankStatementLine({
+      company: companyId,
+      bankAccount: account._id,
+      transactionDate,
+      description,
+      debitAmount: mongoose.Types.Decimal128.fromString(String(debitAmount || 0)),
+      creditAmount: mongoose.Types.Decimal128.fromString(String(creditAmount || 0)),
+      balance: mongoose.Types.Decimal128.fromString(String(balance || 0)),
+      reference,
+      isReconciled: false,
+      importedAt: new Date()
+    });
+    
+    await statementLine.save();
+    
+    res.status(201).json({
+      success: true,
+      data: statementLine
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get bank statement lines
+// @route   GET /api/bank-accounts/:id/statement
+// @access  Private
+exports.getStatementLines = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate, reconciled } = req.query;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    const query = { bankAccount: account._id };
+    
+    if (startDate || endDate) {
+      query.transactionDate = {};
+      if (startDate) query.transactionDate.$gte = new Date(startDate);
+      if (endDate) query.transactionDate.$lte = new Date(endDate);
+    }
+    
+    if (reconciled !== undefined) {
+      query.isReconciled = reconciled === 'true';
+    }
+    
+    const lines = await BankStatementLine.find(query)
+      .sort({ transactionDate: -1 })
+      .lean();
+    
+    // Calculate totals
+    const totals = {
+      totalDebits: lines.reduce((sum, l) => sum + parseFloat(l.debitAmount?.toString() || '0'), 0),
+      totalCredits: lines.reduce((sum, l) => sum + parseFloat(l.creditAmount?.toString() || '0'), 0),
+      reconciledCount: lines.filter(l => l.isReconciled).length,
+      unreconciledCount: lines.filter(l => !l.isReconciled).length
+    };
+    
+    res.json({
+      success: true,
+      data: lines,
+      totals
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get reconciliation - unmatched items on both sides (Section 3.4)
+// @route   GET /api/bank-accounts/:id/reconciliation
+// @access  Private
+exports.getReconciliation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    const ledgerAccountId = account.ledgerAccountId || account.accountCode || '1100';
+    
+    // Date filter
+    const dateQuery = {};
+    if (startDate) dateQuery.$gte = new Date(startDate);
+    if (endDate) dateQuery.$lte = new Date(endDate);
+    
+    // Get ALL journal entries in period (for computing book balance)
+    const allJournalEntries = await JournalEntry.find({
+      company: companyId,
+      status: 'posted',
+      date: dateQuery,
+      lines: { $elemMatch: { accountCode: ledgerAccountId } }
+    }).lean();
+    
+    // Get all matches for this bank account (to determine reconciled status)
+    const allMatches = await BankReconciliationMatch.find({
+      company: companyId,
+      bankAccount: account._id
+    }).lean();
+    
+    // Create set of reconciled line IDs
+    const reconciledLineIds = new Set(allMatches.map(m => m.journalEntryLineId.toString()));
+    
+    // Calculate book balance from all journal entries
+    let bookDebits = 0;
+    let bookCredits = 0;
+    const journalLines = [];
+    
+    for (const entry of allJournalEntries) {
+      for (const line of entry.lines) {
+        if (line.accountCode === ledgerAccountId) {
+          const lineIdStr = line._id ? line._id.toString() : null;
+          const isReconciled = lineIdStr ? reconciledLineIds.has(lineIdStr) : line.reconciled;
+          
+          const debit = parseFloat(line.debit?.toString() || '0');
+          const credit = parseFloat(line.credit?.toString() || '0');
+          bookDebits += debit;
+          bookCredits += credit;
+          
+          // Only include unreconciled in the list
+          if (!isReconciled) {
+            const amount = debit || -credit;
+            journalLines.push({
+              type: 'journal',
+              id: entry._id,
+              lineId: line._id,
+              date: entry.date,
+              description: line.description || entry.description,
+              amount: Math.abs(amount),
+              isDebit: amount > 0,
+              reconciled: false
+            });
+          }
+        }
+      }
+    }
+    
+    // Book balance = opening_balance + DR - CR
+    const openingBalance = parseFloat(account.openingBalance?.toString() || '0');
+    const bookBalance = openingBalance + bookDebits - bookCredits;
+    
+    // Get ALL bank statement lines in period (for computing bank balance)
+    const statementQuery = { bankAccount: account._id };
+    if (startDate || endDate) {
+      statementQuery.transactionDate = {};
+      if (startDate) statementQuery.transactionDate.$gte = new Date(startDate);
+      if (endDate) statementQuery.transactionDate.$lte = new Date(endDate);
+    }
+    
+    const allStatementLines = await BankStatementLine.find(statementQuery).lean();
+    
+    // Get statement line IDs that have matches
+    const matchedStatementIds = new Set(allMatches.map(m => m.bankStatementLine.toString()));
+    
+    // Calculate bank balance from statement lines (per spec 3.3: bank's reported balance)
+    let bankBalance = 0;
+    const bankLines = [];
+    
+    for (const line of allStatementLines) {
+      const lineIdStr = line._id.toString();
+      const matchesForLine = allMatches.filter(m => m.bankStatementLine.toString() === lineIdStr);
+      const hasMatches = matchesForLine.length > 0;
+      
+      // Per spec: isReconciled = TRUE only when SUM(matched amounts) = statement line amount
+      const statementAmount = Math.abs(parseFloat(line.creditAmount?.toString() || line.debitAmount?.toString() || '0'));
+      
+      // Calculate total matched amount for this line
+      let totalMatchedAmount = 0;
+      for (const m of matchesForLine) {
+        const je = allJournalEntries.find(e => e._id.toString() === m.journalEntry?.toString());
+        if (je) {
+          const jLine = je.lines.find(l => l._id && l._id.toString() === m.journalEntryLineId.toString());
+          if (jLine) {
+            const debit = parseFloat(jLine.debit?.toString() || '0');
+            const credit = parseFloat(jLine.credit?.toString() || '0');
+            totalMatchedAmount += Math.abs(debit || credit);
+          }
+        }
+      }
+      
+      // Per spec: reconciled only when exact amount match
+      const isReconciled = hasMatches && Math.abs(totalMatchedAmount - statementAmount) < 0.01;
+      
+      const debit = parseFloat(line.debitAmount?.toString() || '0');
+      const credit = parseFloat(line.creditAmount?.toString() || '0');
+      const amount = credit - debit;  // Credit increases bank balance
+      
+      bankLines.push({
+        type: 'bank',
+        id: line._id,
+        date: line.transactionDate,
+        description: line.description,
+        amount: Math.abs(amount),
+        isDebit: amount < 0,  // Debit decreases bank balance
+        reconciled: isReconciled,
+        balance: line.balance,  // Bank's reported running balance
+        matchCount: matchesForLine.length,
+        matchedAmount: totalMatchedAmount,
+        difference: statementAmount - totalMatchedAmount
+      });
+    }
+    
+    // Get the ending balance from the last statement line
+    let lastStatementBalance = 0;
+    if (allStatementLines.length > 0) {
+      const lastLine = allStatementLines[allStatementLines.length - 1];
+      bankBalance = parseFloat(lastLine.balance?.toString() || '0');
+      lastStatementBalance = bankBalance;
+    }
+    
+    // Per spec: Compute adjusted balances using unreconciled items
+    // Unreconciled journal items: DR = deposits in transit, CR = outstanding payments
+    const unreconciledJournalDR = journalLines
+      .filter(l => l.isDebit === true)
+      .reduce((sum, l) => sum + l.amount, 0);
+    
+    const unreconciledJournalCR = journalLines
+      .filter(l => l.isDebit === false)
+      .reduce((sum, l) => sum + l.amount, 0);
+    
+    // Unreconciled statement lines: credits = bank credits not in books, debits = bank charges not in books
+    const unreconciledStatementCredits = bankLines
+      .filter(l => !l.reconciled && l.amount > 0)
+      .reduce((sum, l) => sum + l.amount, 0);
+    
+    const unreconciledStatementDebits = bankLines
+      .filter(l => !l.reconciled && l.isDebit)
+      .reduce((sum, l) => sum + l.amount, 0);
+    
+    // Adjusted bank balance = lastStatementBalance + deposits in transit - outstanding payments
+    const adjustedBankBalance = lastStatementBalance + unreconciledJournalDR - unreconciledJournalCR;
+    
+    // Adjusted book balance = bookBalance + bank credits not in books - bank charges not in books
+    const adjustedBookBalance = bookBalance + unreconciledStatementCredits - unreconciledStatementDebits;
+    
+    // Per spec: difference = adjustedBankBalance - adjustedBookBalance (target: 0.00)
+    const difference = adjustedBankBalance - adjustedBookBalance;
+    
+    res.json({
+      success: true,
+      data: {
+        journalLines,  // Unreconciled book items
+        bankLines,    // All bank items (reconciled and unreconciled)
+        summary: {
+          // Raw balances
+          bookBalance,    // System's computed balance (opening + ΣDR - ΣCR)
+          bankBalance,   // Bank's reported balance (last statement line balance)
+          // Adjusted balances (per spec bank reconciliation format)
+          lastStatementBalance,
+          adjustedBankBalance,
+          adjustedBookBalance,
+          // Components
+          depositsInTransit: unreconciledJournalDR,
+          outstandingPayments: unreconciledJournalCR,
+          bankCreditsNotInBooks: unreconciledStatementCredits,
+          bankChargesNotInBooks: unreconciledStatementDebits,
+          // The key health check number
+          difference,    // Per spec: must reach zero on fully reconciled period
+          // Counts
+          journalCount: journalLines.length,
+          bankCount: bankLines.length,
+          reconciledBankCount: bankLines.filter(l => l.reconciled).length,
+          unreconciledBankCount: bankLines.filter(l => !l.reconciled).length
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Match a journal line to a bank statement line (Section 3.4 - Many-to-One)
+// @route   POST /api/bank-accounts/:id/reconciliation/match
+// @access  Private
+exports.matchReconciliation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { journalEntryId, journalLineId, statementLineId } = req.body;
+    
+    if (!journalEntryId || !statementLineId) {
+      return res.status(400).json({ success: false, message: 'journalEntryId and statementLineId are required' });
+    }
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    // Verify journal entry belongs to this bank account
+    const ledgerAccountId = account.ledgerAccountId || account.accountCode || '1100';
+    const journalEntry = await JournalEntry.findOne({
+      _id: journalEntryId,
+      company: companyId,
+      status: 'posted'
+    });
+    
+    if (!journalEntry) {
+      return res.status(404).json({ success: false, message: 'Journal entry not found' });
+    }
+    
+    // Find the specific line (by ID if provided, or by account code)
+    let targetLine = null;
+    let targetLineIndex = -1;
+    let targetLineId = null;
+    
+    if (journalLineId) {
+      // Find by line ID
+      for (let i = 0; i < journalEntry.lines.length; i++) {
+        const lineId = journalEntry.lines[i]._id;
+        if (lineId && lineId.toString() === journalLineId) {
+          targetLine = journalEntry.lines[i];
+          targetLineIndex = i;
+          targetLineId = lineId;
+          break;
+        }
+      }
+    } else {
+      // Fallback: find first line for this bank account
+      for (let i = 0; i < journalEntry.lines.length; i++) {
+        if (journalEntry.lines[i].accountCode === ledgerAccountId) {
+          targetLine = journalEntry.lines[i];
+          targetLineIndex = i;
+          targetLineId = journalEntry.lines[i]._id;
+          break;
+        }
+      }
+    }
+    
+    if (!targetLine || targetLineIndex === -1 || !targetLineId) {
+      return res.status(400).json({ success: false, message: 'Journal entry line not found for this bank account' });
+    }
+    
+    // Verify statement line exists
+    const statementLine = await BankStatementLine.findOne({
+      _id: statementLineId,
+      bankAccount: account._id
+    });
+    
+    if (!statementLine) {
+      return res.status(404).json({ success: false, message: 'Bank statement line not found' });
+    }
+    
+    // Check if match already exists (prevent duplicates)
+    const existingMatch = await BankReconciliationMatch.findOne({
+      bankStatementLine: statementLineId,
+      journalEntryLineId: targetLineId
+    });
+    
+    if (existingMatch) {
+      return res.status(400).json({ success: false, message: 'This match already exists' });
+    }
+    
+    // Get the amount from the statement line
+    const statementAmount = Math.abs(parseFloat(statementLine.creditAmount?.toString() || statementLine.debitAmount?.toString() || '0'));
+    const isDebit = !!statementLine.debitAmount;
+    
+    // Calculate total matched amount for this statement line
+    const existingMatches = await BankReconciliationMatch.find({
+      bankStatementLine: statementLineId
+    }).lean();
+    
+    let totalMatchedAmount = 0;
+    for (const m of existingMatches) {
+      // We need to get the journal line amount
+      const je = await JournalEntry.findById(m.journalEntry).lean();
+      if (je) {
+        const line = je.lines.find(l => l._id && l._id.toString() === m.journalEntryLineId.toString());
+        if (line) {
+          const debit = parseFloat(line.debit?.toString() || '0');
+          const credit = parseFloat(line.credit?.toString() || '0');
+          totalMatchedAmount += Math.abs(debit || credit);
+        }
+      }
+    }
+    
+    // Add the new match amount
+    const newMatchAmount = Math.abs(parseFloat(targetLine.debit?.toString() || targetLine.credit?.toString() || '0'));
+    totalMatchedAmount += newMatchAmount;
+    
+    // Create match in junction table
+    const match = new BankReconciliationMatch({
+      bankStatementLine: statementLineId,
+      journalEntryLineId: targetLineId,
+      journalEntry: journalEntryId,
+      bankAccount: account._id,
+      company: companyId,
+      matchedBy: req.user._id,
+      matchedAmount: mongoose.Types.Decimal128.fromString(newMatchAmount.toString())
+    });
+    
+    await match.save();
+    
+    // Update journal entry line: set reconciled = TRUE (per spec: appears in at least one match)
+    journalEntry.lines[targetLineIndex].reconciled = true;
+    journalEntry.lines[targetLineIndex].matchedStatementLineId = statementLineId;
+    await journalEntry.save();
+    
+    // Per spec: isReconciled = TRUE only when SUM(matched amounts) = statement line amount (exact match)
+    const isFullyReconciled = Math.abs(totalMatchedAmount - statementAmount) < 0.01; // Allow tiny floating point difference
+    statementLine.isReconciled = isFullyReconciled;
+    statementLine.matchedAmount = totalMatchedAmount > 0 
+      ? mongoose.Types.Decimal128.fromString(totalMatchedAmount.toString()) 
+      : null;
+    await statementLine.save();
+    
+    res.json({
+      success: true,
+      message: isFullyReconciled 
+        ? 'Successfully matched and fully reconciled bank statement line'
+        : 'Match created. Statement line partially reconciled (amounts do not match exactly)',
+      data: {
+        matchId: match._id,
+        journalEntryId: journalEntry._id,
+        journalLineId: targetLineId,
+        statementLineId: statementLine._id,
+        isReconciled: statementLine.isReconciled,
+        matchedAmount: totalMatchedAmount,
+        statementAmount: statementAmount,
+        difference: statementAmount - totalMatchedAmount
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Unmatch a reconciliation (remove a match)
+// @route   DELETE /api/bank-accounts/:id/reconciliation/match
+// @access  Private
+exports.unmatchReconciliation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { matchId } = req.params;
+    
+    if (!matchId) {
+      return res.status(400).json({ success: false, message: 'matchId is required' });
+    }
+    
+    // Find the match
+    const match = await BankReconciliationMatch.findOne({
+      _id: matchId,
+      company: companyId
+    });
+    
+    if (!match) {
+      return res.status(404).json({ success: false, message: 'Match not found' });
+    }
+    
+    // Get the statement line and journal entry for updating
+    const statementLine = await BankStatementLine.findById(match.bankStatementLine);
+    const journalEntry = await JournalEntry.findById(match.journalEntry);
+    
+    if (!statementLine || !journalEntry) {
+      return res.status(404).json({ success: false, message: 'Related records not found' });
+    }
+    
+    // Delete the match
+    await BankReconciliationMatch.findByIdAndDelete(matchId);
+    
+    // Update journal entry line: check if other matches exist for this line
+    const otherMatchesForLine = await BankReconciliationMatch.findOne({
+      journalEntryLineId: match.journalEntryLineId
+    });
+    
+    if (!otherMatchesForLine) {
+      // No other matches - mark as unreconciled (per spec: reconciled when appears in at least one match)
+      const lineIndex = journalEntry.lines.findIndex(
+        l => l._id && l._id.toString() === match.journalEntryLineId.toString()
+      );
+      if (lineIndex !== -1) {
+        journalEntry.lines[lineIndex].reconciled = false;
+        journalEntry.lines[lineIndex].matchedStatementLineId = null;
+        await journalEntry.save();
+      }
+    }
+    
+    // Update statement line: Per spec, isReconciled = TRUE only when SUM(matched amounts) = statement line amount
+    const remainingMatches = await BankReconciliationMatch.find({
+      bankStatementLine: statementLine._id
+    }).lean();
+    
+    const statementAmount = Math.abs(parseFloat(statementLine.creditAmount?.toString() || statementLine.debitAmount?.toString() || '0'));
+    
+    let totalMatchedAmount = 0;
+    for (const m of remainingMatches) {
+      const je = await JournalEntry.findById(m.journalEntry).lean();
+      if (je) {
+        const line = je.lines.find(l => l._id && l._id.toString() === m.journalEntryLineId.toString());
+        if (line) {
+          const debit = parseFloat(line.debit?.toString() || '0');
+          const credit = parseFloat(line.credit?.toString() || '0');
+          totalMatchedAmount += Math.abs(debit || credit);
+        }
+      }
+    }
+    
+    // Per spec: isReconciled = TRUE only when exact match
+    const isFullyReconciled = Math.abs(totalMatchedAmount - statementAmount) < 0.01;
+    statementLine.isReconciled = isFullyReconciled;
+    statementLine.matchedAmount = totalMatchedAmount > 0 
+      ? mongoose.Types.Decimal128.fromString(totalMatchedAmount.toString()) 
+      : null;
+    await statementLine.save();
+    
+    res.json({
+      success: true,
+      message: 'Match removed successfully',
+      data: {
+        remainingMatchesForStatementLine: remainingMatches
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Create opening balance journal entry (Section 3.5)
+// @route   POST /api/bank-accounts/:id/opening-balance
+// @access  Private
+exports.createOpeningBalance = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { openingBalance, openingBalanceDate } = req.body;
+    
+    const account = await BankAccount.findOne({
+      _id: req.params.id,
+      company: companyId
+    });
+    
+    if (!account) {
+      return res.status(404).json({ success: false, message: 'Bank account not found' });
+    }
+    
+    // Check if opening balance already posted
+    const existingOpeningEntry = await JournalEntry.findOne({
+      company: companyId,
+      sourceType: 'opening_balance',
+      sourceId: account._id
+    });
+    
+    if (existingOpeningEntry) {
+      return res.status(400).json({ success: false, message: 'Opening balance entry already exists for this account' });
+    }
+    
+    const openingBalNum = parseFloat(openingBalance);
+    if (isNaN(openingBalNum) || openingBalNum === 0) {
+      return res.status(400).json({ success: false, message: 'Valid opening balance is required' });
+    }
+    
+    const ledgerAccountId = account.ledgerAccountId || account.accountCode || '1100';
+    const entryDate = openingBalanceDate ? new Date(openingBalanceDate) : new Date();
+    
+    // Create opening balance journal entry (per spec 3.5):
+    // DR bank_account.ledger_account_id  opening_balance
+    // CR 3200 Retained Earnings          opening_balance
+    const narration = `Opening Balance - ${account.name}`;
+    
+    const journalEntry = await JournalService.createEntry(companyId, req.user._id, {
+      date: entryDate,
+      description: narration,
+      sourceType: 'opening_balance',
+      sourceId: account._id,
+      sourceReference: `OB-${account.name}`,
+      lines: [
+        JournalService.createDebitLine(
+          ledgerAccountId,
+          openingBalNum,
+          narration
+        ),
+        JournalService.createCreditLine(
+          RETAINED_EARNINGS_CODE,
+          openingBalNum,
+          narration
+        )
+      ],
+      isAutoGenerated: false
+    });
+    
+    // Update account with opening balance and initialize cache
+    // Per spec 3.3: Store opening balance, cache it as valid
+    account.openingBalance = mongoose.Types.Decimal128.fromString(String(openingBalNum));
+    account.openingBalanceDate = entryDate;
+    account.cachedBalance = mongoose.Types.Decimal128.fromString(String(openingBalNum));
+    account.cacheValid = true;  // Opening balance is the anchor - cache is valid
+    account.cacheLastComputed = new Date();
+    await account.save();
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        journalEntry,
+        openingBalance: openingBalNum,
+        openingBalanceDate: entryDate,
+        cachedBalance: openingBalNum,
+        cacheValid: true
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};

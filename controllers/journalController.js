@@ -157,6 +157,45 @@ exports.createJournalEntry = async (req, res, next) => {
 
 // @desc    Post (finalize) a journal entry
 // @route   PUT /api/journal-entries/:id/post
+// Update a journal entry (only if not posted)
+exports.updateJournalEntry = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const journalEntry = await JournalEntry.findOne({ _id: req.params.id, company: companyId });
+    
+    if (!journalEntry) {
+      return res.status(404).json({ success: false, message: 'Journal entry not found' });
+    }
+    
+    if (journalEntry.status === 'posted') {
+      return res.status(400).json({ success: false, message: 'Cannot update a posted journal entry' });
+    }
+    
+    const { date, description, lines } = req.body;
+    
+    if (date) journalEntry.date = new Date(date);
+    if (description) journalEntry.description = description;
+    if (lines) {
+      journalEntry.lines = lines;
+      // Recalculate totals
+      let totalDebit = 0;
+      let totalCredit = 0;
+      lines.forEach(line => {
+        if (line.debit) totalDebit += line.debit;
+        if (line.credit) totalCredit += line.credit;
+      });
+      journalEntry.totalDebit = totalDebit;
+      journalEntry.totalCredit = totalCredit;
+    }
+    
+    await journalEntry.save();
+    
+    res.json({ success: true, data: journalEntry });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // @access  Private
 exports.postJournalEntry = async (req, res, next) => {
   try {

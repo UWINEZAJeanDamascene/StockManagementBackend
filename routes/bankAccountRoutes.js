@@ -17,7 +17,10 @@ const {
   getBankStatement,
   importCSV,
   autoMatchTransactions,
-  getReconciliationReport
+  getReconciliationReport,
+  getReconciliation,
+  matchReconciliation,
+  unmatchReconciliation
 } = require('../controllers/bankAccountController');
 
 const { protect } = require('../middleware/auth');
@@ -73,6 +76,15 @@ router.route('/:id/import-csv')
 // Auto-match
 router.route('/:id/auto-match')
   .post(autoMatchTransactions);
+
+// Reconciliation routes
+router.route('/:id/reconciliation')
+  .get(getReconciliation);
+
+// Match/Unmatch reconciliation
+router.route('/:id/reconciliation/match')
+  .post(matchReconciliation)
+  .delete(unmatchReconciliation);
 
 // Reconciliation Report
 router.route('/:id/reconciliation-report')

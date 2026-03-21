@@ -17,14 +17,37 @@ dotenv.config();
 // Connect to MongoDB
 connectDB();
 
+// Register tenant plugin before models are loaded so all models inherit it
+const mongoose = require('mongoose');
+// Determine if running under tests (Jest sets JEST_WORKER_ID, and tests may set NODE_ENV='test')
+const isTestEnv = (process.env.NODE_ENV === 'test') || !!process.env.JEST_WORKER_ID;
+// During tests, disable automatic index creation to avoid long-running index builds
+if (isTestEnv) {
+  try {
+    mongoose.set('autoIndex', false);
+  } catch (e) {
+    console.warn('Could not set mongoose autoIndex:', e && e.message ? e.message : e);
+  }
+}
+try {
+  const tenantPlugin = require('./plugins/tenantPlugin');
+  mongoose.plugin(tenantPlugin);
+} catch (e) {
+  console.warn('Tenant plugin could not be registered:', e && e.message ? e.message : e);
+}
+
 // Load all models to ensure they're registered with mongoose
 require('./models/IPWhitelist');
 require('./models/Role');
+require('./models/SystemSettings');
 require('./models/Backup');
 require('./models/FixedAsset');
+require('./models/AuditLog');
+require('./models/AssetCategory');
 require('./models/Loan');
 require('./models/PrecomputedAggregation');
 require('./models/Expense');
+require('./models/PayrollRun');
 require('./models/PurchaseReturn');
 require('./models/Testimonial');
 require('./models/DeliveryNote');
@@ -34,11 +57,16 @@ require('./models/StockTransfer');
 require('./models/StockTransferLine');
 require('./models/StockBatch');
 require('./models/StockSerialNumber');
+require('./models/CompanyUser');
 
 const app = express();
 
 // Security middleware
 app.use(helmet());
+
+// Tenant context middleware (sets per-request companyId for tenant plugin)
+const tenantContextMiddleware = require('./middleware/tenantContextMiddleware');
+app.use(tenantContextMiddleware);
 
 // Rate limiting with Redis (distributed)
 const rateLimiters = createRateLimiters();
@@ -139,6 +167,9 @@ app.use('/api/backups', require('./routes/backupRoutes'));
 // Fixed Assets
 app.use('/api/fixed-assets', require('./routes/fixedAssetRoutes'));
 
+// Asset Categories
+app.use('/api/asset-categories', require('./routes/assetCategoryRoutes'));
+
 // Loans
 app.use('/api/loans', require('./routes/loanRoutes'));
 
@@ -150,6 +181,9 @@ app.use('/api/taxes', require('./routes/taxRoutes'));
 
 // Payroll Management
 app.use('/api/payroll', require('./routes/payrollRoutes'));
+
+// Payroll Run Management (with journal entries)
+app.use('/api/payroll-runs', require('./routes/payrollRunRoutes'));
 
 // Expenses
 app.use('/api/expenses', require('./routes/expenseRoutes'));
@@ -166,8 +200,11 @@ app.use('/api/purchase-returns', require('./routes/purchaseReturnRoutes'));
 // Accounts Payable Management
 app.use('/api/payables', require('./routes/payableRoutes'));
 
-// Accounts Receivable Management
-app.use('/api/receivables', require('./routes/receivableRoutes'));
+// AR Module - Accounts Receivable per Section 1.6
+app.use('/api/ar', require('./routes/arRoutes'));
+
+// AP Module - Accounts Payable per Section 2
+app.use('/api/ap', require('./routes/apRoutes'));
 
 // Delivery Notes
 app.use('/api/delivery-notes', require('./routes/deliveryNoteRoutes'));
@@ -206,6 +243,18 @@ app.use('/api/batches', require('./routes/stockBatchRoutes'));
 
 // Stock Serial Numbers (Module 4)
 app.use('/api/serial-numbers', require('./routes/stockSerialNumberRoutes'));
+
+// Accounting Periods
+app.use('/api/periods', require('./routes/periodRoutes'));
+
+// System Settings
+app.use('/api/settings', require('./routes/settingsRoutes'));
+
+// Opening Balances
+app.use('/api/opening-balances', require('./routes/openingBalanceRoutes'));
+
+// Audit Log (Module 8)
+app.use('/api/audit-logs', require('./routes/auditRoutes'));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -265,94 +314,147 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-// Start recurring scheduler (non-blocking)
-try {
-  const { startScheduler } = require('./services/recurringService');
-  startScheduler();
-} catch (err) {
-  console.warn('Could not start recurring invoice scheduler', err);
-}
-
-// Start notification scheduler (payment reminders, low-stock, summaries)
-try {
-  const notify = require('./services/notificationScheduler');
-  notify.startScheduler();
-} catch (err) {
-  console.warn('Could not start recurring invoice scheduler', err);
-}
-
-// Start backup scheduler (automated backups, verification)
-try {
-  const backupScheduler = require('./services/backupScheduler');
-  backupScheduler.startBackupScheduler();
-  backupScheduler.startVerificationScheduler();
-} catch (err) {
-  console.warn('Could not start backup scheduler', err);
-}
-
-// Start report scheduler (snapshot generation for weekly/monthly/quarterly/etc.)
-try {
-  const reportScheduler = require('./services/reportSchedulerService');
-  if (reportScheduler && typeof reportScheduler.initializeScheduler === 'function') {
-    reportScheduler.initializeScheduler(app);
-    console.log('Report scheduler initialized');
+// Start background schedulers and workers (skip during tests and in Jest workers)
+// Jest sets NODE_ENV='test' and also sets JEST_WORKER_ID; guard both to be safe.
+if (!(process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
+  // Start recurring scheduler (non-blocking)
+  try {
+    const { startScheduler } = require('./services/recurringService');
+    startScheduler();
+  } catch (err) {
+    console.warn('Could not start recurring invoice scheduler', err);
   }
-} catch (err) {
-  console.warn('Could not initialize report scheduler', err && err.message ? err.message : err);
-}
 
-// Initialize Background Job Queue (BullMQ)
-// Runs nightly aggregations, report generation, email notifications
-try {
-  const { initializeWorkers } = require('./services/jobWorkers');
-  const { setupScheduledJobs } = require('./services/jobQueue');
-  
-  // Initialize workers to process background jobs
-  initializeWorkers();
-  
-  // Setup scheduled jobs (nightly aggregations)
-  setupScheduledJobs();
-  
-  console.log('Background job system initialized');
-} catch (err) {
-  console.warn('Could not initialize job queue:', err.message || err);
+  // Start notification scheduler (payment reminders, low-stock, summaries)
+  try {
+    const notify = require('./services/notificationScheduler');
+    notify.startScheduler();
+  } catch (err) {
+    console.warn('Could not start recurring invoice scheduler', err);
+  }
+
+  // Start backup scheduler (automated backups, verification)
+  try {
+    const backupScheduler = require('./services/backupScheduler');
+    backupScheduler.startBackupScheduler();
+    backupScheduler.startVerificationScheduler();
+  } catch (err) {
+    console.warn('Could not start backup scheduler', err);
+  }
+
+  // Start report scheduler (snapshot generation for weekly/monthly/quarterly/etc.)
+  try {
+    const reportScheduler = require('./services/reportSchedulerService');
+    if (reportScheduler && typeof reportScheduler.initializeScheduler === 'function') {
+      reportScheduler.initializeScheduler(app);
+      console.log('Report scheduler initialized');
+    }
+  } catch (err) {
+    console.warn('Could not initialize report scheduler', err && err.message ? err.message : err);
+  }
+
+  // Initialize Background Job Queue (BullMQ)
+  // Runs nightly aggregations, report generation, email notifications
+  try {
+    const { initializeWorkers } = require('./services/jobWorkers');
+    const { setupScheduledJobs } = require('./services/jobQueue');
+    
+    // Initialize workers to process background jobs
+    initializeWorkers();
+    
+    // Setup scheduled jobs (nightly aggregations)
+    setupScheduledJobs();
+    
+    console.log('Background job system initialized');
+  } catch (err) {
+    console.warn('Could not initialize job queue:', err.message || err);
+  }
 }
 
 // Verify email server connection (non-blocking)
 try {
-  const { testConnection } = require('./config/email');
-  testConnection();
+  // Skip verifying external email connection during tests to avoid hangs
+  if (!isTestEnv) {
+    const { testConnection } = require('./config/email');
+    testConnection();
+  }
 } catch (err) {
   console.warn('Could not verify email server:', err.message || err);
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
-});
+let server;
+if (process.env.NODE_ENV !== 'test') {
+  server = app.listen(PORT, () => {
+    console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+  });
 
-server.on('error', (err) => {
-  if (err && err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use.`);
-    // Try next port once
-    const fallbackPort = Number(PORT) + 1;
-    console.log(`Attempting to listen on port ${fallbackPort} instead...`);
-    server.close();
-    app.listen(fallbackPort, () => {
-      console.log(`Server running in ${process.env.NODE_ENV} mode on port ${fallbackPort}`);
-    }).on('error', (e) => {
-      console.error('Failed to bind to fallback port:', e.message);
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`);
+      // Try next port once
+      const fallbackPort = Number(PORT) + 1;
+      console.log(`Attempting to listen on port ${fallbackPort} instead...`);
+      server.close();
+      app.listen(fallbackPort, () => {
+        console.log(`Server running in ${process.env.NODE_ENV} mode on port ${fallbackPort}`);
+      }).on('error', (e) => {
+        console.error('Failed to bind to fallback port:', e.message);
+        process.exit(1);
+      });
+    } else {
+      console.error('Server error:', err);
       process.exit(1);
-    });
-  } else {
-    console.error('Server error:', err);
-    process.exit(1);
-  }
-});
+    }
+  });
+}
 
+// Attach server reference to app for test teardown
+if (server) {
+  app._server = server;
+}
+
+// Provide a graceful shutdown helper for tests and runtime
+app.shutdown = async () => {
+  try {
+    // Close HTTP server if running
+    if (app._server && typeof app._server.close === 'function') {
+      await new Promise((resolve, reject) => {
+        app._server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+
+    // Close mongoose connection
+    try {
+      const mongoose = require('mongoose');
+      if (mongoose && mongoose.connection && mongoose.connection.readyState) {
+        await mongoose.connection.close();
+      }
+    } catch (e) {
+      console.warn('Error closing mongoose connection during shutdown', e && e.message ? e.message : e);
+    }
+
+    // Close Redis client if available
+    try {
+      const { redisClient } = require('./config/redis');
+      if (redisClient) {
+        if (typeof redisClient.quit === 'function') await redisClient.quit();
+        else if (typeof redisClient.disconnect === 'function') await redisClient.disconnect();
+        else if (typeof redisClient.close === 'function') await redisClient.close();
+      }
+    } catch (e) {
+      console.warn('Error closing Redis client during shutdown', e && e.message ? e.message : e);
+    }
+  } catch (err) {
+    console.error('Error during app.shutdown()', err && err.message ? err.message : err);
+  }
+};
 // Initialize Socket.io for real-time notifications
 try {
-  const socketService = require('./services/socketService');
-  socketService.init(server);
+  // Avoid initializing socket.io during tests (it can create listeners/handles)
+  if (!isTestEnv) {
+    const socketService = require('./services/socketService');
+    socketService.init(server);
+  }
 } catch (err) {
   console.warn('Could not initialize socket service', err.message || err);
 }

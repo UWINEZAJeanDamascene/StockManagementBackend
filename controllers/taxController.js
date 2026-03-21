@@ -1,9 +1,154 @@
 const Tax = require('../models/Tax');
+const TaxRate = require('../models/TaxRate');
 const Invoice = require('../models/Invoice');
 const Expense = require('../models/Expense');
 const Payroll = require('../models/Payroll');
 const mongoose = require('mongoose');
 const JournalService = require('../services/journalService');
+const TaxService = require('../services/taxService');
+
+// =====================================================
+// TAX RATE CONFIGURATION (Module 9: Taxes)
+// =====================================================
+
+// Get all tax rates for company
+exports.getTaxRates = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const { is_active, type, code } = req.query;
+    
+    const filters = {};
+    if (is_active !== undefined) filters.is_active = is_active === 'true';
+    if (type) filters.type = type;
+    if (code) filters.code = code;
+    
+    const taxRates = await TaxService.getTaxRates(companyId, filters);
+    
+    res.json({
+      success: true,
+      data: taxRates,
+      count: taxRates.length
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Create a new tax rate
+exports.createTaxRate = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const taxRate = await TaxService.createTaxRate(companyId, req.body);
+    
+    res.status(201).json({
+      success: true,
+      data: taxRate
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Get tax rate by ID
+exports.getTaxRateById = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const taxRate = await TaxService.getTaxRateById(companyId, req.params.id);
+    
+    if (!taxRate) {
+      return res.status(404).json({ success: false, message: 'Tax rate not found' });
+    }
+    
+    res.json({ success: true, data: taxRate });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Update a tax rate
+exports.updateTaxRate = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const taxRate = await TaxService.updateTaxRate(companyId, req.params.id, req.body);
+    
+    if (!taxRate) {
+      return res.status(404).json({ success: false, message: 'Tax rate not found' });
+    }
+    
+    res.json({ success: true, data: taxRate });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Delete (deactivate) a tax rate
+exports.deleteTaxRate = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const taxRate = await TaxService.deleteTaxRate(companyId, req.params.id);
+    
+    if (!taxRate) {
+      return res.status(404).json({ success: false, message: 'Tax rate not found' });
+    }
+    
+    res.json({ success: true, message: 'Tax rate deactivated' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Get tax liability report - computed from journal entries
+exports.getLiabilityReport = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const { periodStart, periodEnd, taxCode } = req.query;
+    
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'periodStart and periodEnd are required' 
+      });
+    }
+    
+    const report = await TaxService.getLiabilityReport(companyId, {
+      periodStart,
+      periodEnd,
+      taxCode
+    });
+    
+    res.json({
+      success: true,
+      data: report
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Post tax settlement - pay tax to authorities
+exports.postSettlement = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    
+    const result = await TaxService.postSettlement(companyId, req.body, userId);
+    
+    res.status(201).json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// =====================================================
+// TAX TRACKING (existing)
+// =====================================================
 
 // Get all tax records for company
 exports.getTaxRecords = async (req, res) => {

@@ -19,13 +19,44 @@ const {
   rejectReplenishment,
   getReport,
   getSummary,
-  getTransactions
+  getTransactions,
+  // New endpoints per Module 4 spec
+  getFunds,
+  createFund,
+  topUp,
+  recordExpense,
+  getFundTransactions
 } = require('../controllers/pettyCashController');
 
 const { protect } = require('../middleware/auth');
 
 // All routes require authentication
 router.use(protect);
+
+// =====================================================
+// NEW API ENDPOINTS PER MODULE 4 SPEC
+// =====================================================
+
+// Fund routes (new endpoints per spec)
+router.route('/funds')
+  .get(getFunds)
+  .post(createFund);
+
+router.route('/funds/:id')
+  .get(getFloat);
+
+router.route('/funds/:id/top-up')
+  .post(topUp);
+
+router.route('/funds/:id/expense')
+  .post(recordExpense);
+
+router.route('/funds/:id/transactions')
+  .get(getFundTransactions);
+
+// =====================================================
+// LEGACY/EXISTING ROUTES
+// =====================================================
 
 // Float routes
 router.route('/floats')

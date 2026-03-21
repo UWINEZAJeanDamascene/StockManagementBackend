@@ -1,67 +1,35 @@
 const express = require('express');
 const router = express.Router();
-const {
-  getBudgets,
-  getBudgetById,
-  createBudget,
-  updateBudget,
-  deleteBudget,
-  approveBudget,
-  rejectBudget,
-  getBudgetComparison,
-  getAllBudgetsComparison,
-  getBudgetSummary,
-  cloneBudget,
-  closeBudget,
-  getRevenueForecast,
-  getExpenseForecast,
-  getCashFlowForecast
-} = require('../controllers/budgetController');
-const { protect, authorize } = require('../middleware/auth');
-const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
+const budgetController = require('../controllers/budgetController');
+const { protect, authorize } = require('../middleware/authMiddleware');
 
+// All routes require authentication
 router.use(protect);
-router.use(sessionMiddleware);
 
-// CRUD routes
-router.route('/')
-  .get(cacheMiddleware({ type: 'budget', ttl: 300 }), getBudgets)
-  .post(createBudget);
+/**
+ * Budget CRUD
+ */
+router.post('/', authorize(['admin', 'accountant']), budgetController.createBudget);
+router.get('/', budgetController.getBudgets);
+router.get('/:id', budgetController.getBudgetById);
+router.put('/:id', authorize(['admin', 'accountant']), budgetController.updateBudget);
+router.delete('/:id', authorize(['admin']), budgetController.deleteBudget);
 
-router.route('/summary')
-  .get(getBudgetSummary);
+/**
+ * Budget Lines
+ */
+router.post('/:id/lines', authorize(['admin', 'accountant']), budgetController.upsertLines);
+router.get('/:id/lines', budgetController.getLines);
 
-router.route('/compare/all')
-  .get(getAllBudgetsComparison);
+/**
+ * Budget Actions
+ */
+router.post('/:id/approve', authorize(['admin']), budgetController.approveBudget);
+router.post('/:id/lock', authorize(['admin']), budgetController.lockBudget);
 
-// Forecast routes
-router.route('/forecast/revenue')
-  .get(getRevenueForecast);
-
-router.route('/forecast/expense')
-  .get(getExpenseForecast);
-
-router.route('/forecast/cashflow')
-  .get(getCashFlowForecast);
-
-router.route('/:id')
-  .get(getBudgetById)
-  .put(updateBudget)
-  .delete(deleteBudget);
-
-router.route('/:id/compare')
-  .get(getBudgetComparison);
-
-router.route('/:id/approve')
-  .post(authorize('admin', 'manager'), approveBudget);
-
-router.route('/:id/reject')
-  .post(authorize('admin', 'manager'), rejectBudget);
-
-router.route('/:id/clone')
-  .post(cloneBudget);
-
-router.route('/:id/close')
-  .post(closeBudget);
+/**
+ * Variance Report
+ */
+router.get('/:id/variance-report', budgetController.getVarianceReport);
 
 module.exports = router;

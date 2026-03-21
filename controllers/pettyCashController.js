@@ -1,7 +1,41 @@
 const { PettyCashFloat, PettyCashExpense, PettyCashReplenishment, PettyCashTransaction } = require('../models/PettyCash');
+const { BankAccount } = require('../models/BankAccount');
 const JournalService = require('../services/journalService');
-const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS, getAccount, canPostToAccount } = require('../constants/chartOfAccounts');
 const mongoose = require('mongoose');
+
+// Helper to get current balance (computed from transactions)
+async function getCurrentBalance(floatId) {
+  const float = await PettyCashFloat.findById(floatId);
+  if (!float) return 0;
+  
+  // Check if cache is valid
+  if (float.cacheValid) {
+    return float.cachedBalance;
+  }
+  
+  // Compute from transactions
+  const transactions = await PettyCashTransaction.find({ float: floatId })
+    .sort({ transactionDate: 1, createdAt: 1 });
+  
+  let balance = float.openingBalance;
+  for (const tx of transactions) {
+    balance += tx.amount;
+  }
+  
+  // Update cache
+  float.cachedBalance = balance;
+  float.cacheValid = true;
+  float.cacheLastComputed = new Date();
+  await float.save();
+  
+  return balance;
+}
+
+// Helper to invalidate cache
+async function invalidateCache(floatId) {
+  await PettyCashFloat.findByIdAndUpdate(floatId, { cacheValid: false });
+}
 
 // @desc    Get all petty cash floats for a company
 // @route   GET /api/petty-cash/floats
@@ -982,6 +1016,483 @@ exports.getTransactions = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       data: transactions
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// =====================================================
+// NEW API ENDPOINTS PER MODULE 4 SPEC
+// =====================================================
+
+// @desc    Get all petty cash funds (new endpoint per spec)
+// @route   GET /api/petty-cash/funds
+// @access  Private
+exports.getFunds = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { isActive } = req.query;
+    
+    const query = { company: companyId };
+    if (isActive !== undefined) {
+      query.isActive = isActive === 'true';
+    }
+    
+    const floats = await PettyCashFloat.find(query)
+      .populate('custodian', 'name email')
+      .sort({ createdAt: -1 });
+    
+    // Calculate current balance for each float
+    const floatsWithBalance = await Promise.all(
+      floats.map(async (float) => {
+        const currentBalance = await getCurrentBalance(float._id);
+        const replenishmentNeeded = float.floatAmount - currentBalance;
+        
+        return {
+          _id: float._id,
+          name: float.name,
+          ledgerAccountId: float.ledgerAccountId,
+          custodian: float.custodian,
+          floatAmount: float.floatAmount,
+          currentBalance,
+          replenishmentNeeded: Math.max(0, replenishmentNeeded),
+          isActive: float.isActive,
+          createdAt: float.createdAt
+        };
+      })
+    );
+    
+    res.json({
+      success: true,
+      count: floatsWithBalance.length,
+      data: floatsWithBalance
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Create petty cash fund (new endpoint per spec)
+// @route   POST /api/petty-cash/funds
+// @access  Private
+exports.createFund = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { name, ledgerAccountId, custodianId, floatAmount, openingBalance, notes } = req.body;
+    
+    // Validate required fields
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'Name is required' });
+    }
+    if (!floatAmount && floatAmount !== 0) {
+      return res.status(400).json({ success: false, message: 'Float amount is required' });
+    }
+    
+    const pettyCashFloat = new PettyCashFloat({
+      company: companyId,
+      name,
+      ledgerAccountId: ledgerAccountId || '1050',
+      custodian: custodianId || req.user._id,
+      openingBalance: openingBalance || 0,
+      floatAmount: floatAmount,
+      currentBalance: openingBalance || 0,
+      isActive: true,
+      notes
+    });
+    
+    await pettyCashFloat.save();
+    
+    // Create opening transaction if opening balance > 0
+    if (openingBalance && openingBalance > 0) {
+      const float = await PettyCashFloat.findById(pettyCashFloat._id);
+      await PettyCashTransaction.create({
+        company: companyId,
+        float: pettyCashFloat._id,
+        type: 'opening',
+        amount: openingBalance,
+        balanceAfter: openingBalance,
+        description: 'Opening balance',
+        createdBy: req.user._id
+      });
+      
+      // Create journal entry for opening float
+      // Debit: Petty Cash (1050), Credit: Cash in Hand (1000)
+      try {
+        await JournalService.createEntry(companyId, req.user._id, {
+          date: new Date(),
+          description: `Petty Cash Float Opening: ${name}`,
+          sourceType: 'petty_cash_opening',
+          sourceId: pettyCashFloat._id,
+          sourceReference: 'Float Opening',
+          lines: [
+            JournalService.createDebitLine(
+              DEFAULT_ACCOUNTS.pettyCash,
+              openingBalance,
+              `Opening petty cash float: ${name}`
+            ),
+            JournalService.createCreditLine(
+              DEFAULT_ACCOUNTS.cashInHand,
+              openingBalance,
+              `Opening petty cash float: ${name}`
+            )
+          ],
+          isAutoGenerated: true
+        });
+      } catch (journalError) {
+        console.error('Failed to create journal entry for petty cash float:', journalError);
+      }
+    }
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        _id: pettyCashFloat._id,
+        name: pettyCashFloat.name,
+        ledgerAccountId: pettyCashFloat.ledgerAccountId,
+        floatAmount: pettyCashFloat.floatAmount,
+        currentBalance: pettyCashFloat.currentBalance,
+        isActive: pettyCashFloat.isActive
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Record top-up (cash transferred from bank to petty cash)
+// @route   POST /api/petty-cash/funds/:id/top-up
+// @access  Private
+// Journal Entry: DR Petty Cash (float's ledgerAccountId), CR Bank (bank account's ledgerAccountId)
+exports.topUp = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { amount, bank_account_id, description, transactionDate } = req.body;
+    
+    // Validate required fields
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Valid amount is required' });
+    }
+    
+    // Validate bank_account_id is required
+    if (!bank_account_id) {
+      return res.status(422).json({ 
+        success: false, 
+        code: 'BANK_ACCOUNT_REQUIRED',
+        message: 'bank_account_id is required for top-up' 
+      });
+    }
+    
+    // Find the bank account and validate it exists and is active
+    const bankAccount = await BankAccount.findOne({ 
+      _id: bank_account_id, 
+      company: companyId 
+    });
+    
+    if (!bankAccount) {
+      return res.status(404).json({ 
+        success: false, 
+        code: 'BANK_ACCOUNT_NOT_FOUND',
+        message: 'Bank account not found' 
+      });
+    }
+    
+    if (!bankAccount.isActive) {
+      return res.status(400).json({ 
+        success: false, 
+        code: 'BANK_ACCOUNT_INACTIVE',
+        message: 'Cannot use inactive bank account' 
+      });
+    }
+    
+    // Find the float
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res.status(404).json({ success: false, message: 'Petty cash fund not found' });
+    }
+    
+    if (!float.isActive) {
+      return res.status(400).json({ success: false, message: 'Cannot add to inactive petty cash fund' });
+    }
+    
+    const txDate = transactionDate ? new Date(transactionDate) : new Date();
+    
+    // Get current balance
+    const currentBalance = await getCurrentBalance(float._id);
+    const newBalance = currentBalance + amount;
+    
+    // Create transaction record
+    const transaction = await PettyCashTransaction.create({
+      company: companyId,
+      float: float._id,
+      type: 'top_up',
+      amount: amount,
+      balanceAfter: newBalance,
+      description: description || `Top-up from bank`,
+      transactionDate: txDate,
+      createdBy: req.user._id
+    });
+    
+    // Invalidate cache
+    await invalidateCache(float._id);
+    
+    // Get accounts
+    const pettyCashAccount = float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash;
+    const bankLedgerAccount = bankAccount.ledgerAccountId || DEFAULT_ACCOUNTS.cashAtBank;
+    
+    // Create journal entry
+    // Debit: Petty Cash (from float's ledgerAccountId)
+    // Credit: Bank (from bank account's ledgerAccountId)
+    try {
+      const journalEntry = await JournalService.createEntry(companyId, req.user._id, {
+        date: txDate,
+        description: `Petty Cash Top-up - ${float.name} - ${transaction.referenceNo}`,
+        sourceType: 'petty_cash_topup',
+        sourceId: transaction._id,
+        sourceReference: transaction.referenceNo,
+        lines: [
+          JournalService.createDebitLine(
+            pettyCashAccount,
+            amount,
+            `Petty cash top-up: ${transaction.referenceNo}`
+          ),
+          JournalService.createCreditLine(
+            bankLedgerAccount,
+            amount,
+            `Petty cash top-up from ${bankAccount.name}: ${transaction.referenceNo}`
+          )
+        ],
+        isAutoGenerated: true
+      });
+      
+      // Update transaction with journal entry ID
+      transaction.journalEntryId = journalEntry._id;
+      await transaction.save();
+    } catch (journalError) {
+      console.error('Failed to create journal entry for petty cash top-up:', journalError);
+    }
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        _id: transaction._id,
+        referenceNo: transaction.referenceNo,
+        type: 'top_up',
+        amount,
+        balanceAfter: newBalance,
+        description: transaction.description,
+        bankAccountId: bank_account_id,
+        bankAccountName: bankAccount.name,
+        transactionDate: transaction.transactionDate,
+        createdAt: transaction.createdAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Record expense (cash paid out for an expense)
+// @route   POST /api/petty-cash/funds/:id/expense
+// @access  Private
+// Journal Entry: DR expense_account_id, CR 1050 Petty Cash
+exports.recordExpense = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { amount, expenseAccountId, description, receiptRef, transactionDate } = req.body;
+    
+    // Validate required fields
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Valid amount is required' });
+    }
+    
+    // Validate expense_account_id (required for expense)
+    if (!expenseAccountId) {
+      return res.status(400).json({ success: false, message: 'expenseAccountId is required for expense' });
+    }
+    
+    // Validate expense account exists and allows direct posting
+    const accountCheck = canPostToAccount(expenseAccountId);
+    if (!accountCheck.valid) {
+      return res.status(400).json({ 
+        success: false, 
+        code: accountCheck.reason,
+        message: `Cannot post to account ${expenseAccountId}: ${accountCheck.reason === 'ACCOUNT_NO_POSTING' ? 'This is a header/summary account and cannot be posted to directly' : 'Account not found'}` 
+      });
+    }
+    
+    // Find the float
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res.status(404).json({ success: false, message: 'Petty cash fund not found' });
+    }
+    
+    if (!float.isActive) {
+      return res.status(400).json({ success: false, message: 'Cannot record expense on inactive petty cash fund' });
+    }
+    
+    const txDate = transactionDate ? new Date(transactionDate) : new Date();
+    
+    // Get current balance
+    const currentBalance = await getCurrentBalance(float._id);
+    const newBalance = currentBalance - amount;
+    
+    // Business Rule: current_balance cannot go below zero
+    if (newBalance < 0) {
+      return res.status(409).json({
+        success: false,
+        code: 'INSUFFICIENT_PETTY_CASH',
+        message: 'Insufficient petty cash balance',
+        currentBalance,
+        requestedAmount: amount,
+        shortfall: amount - currentBalance
+      });
+    }
+    
+    // Create transaction record
+    const transaction = await PettyCashTransaction.create({
+      company: companyId,
+      float: float._id,
+      type: 'expense',
+      amount: -amount, // Negative for expense
+      balanceAfter: newBalance,
+      description: description || 'Petty cash expense',
+      expenseAccountId,
+      receiptRef,
+      transactionDate: txDate,
+      createdBy: req.user._id
+    });
+    
+    // Invalidate cache
+    await invalidateCache(float._id);
+    
+    // Create journal entry
+    // Debit: expense_account_id, Credit: Petty Cash (from float's ledgerAccountId)
+    const pettyCashAccount = float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash;
+    try {
+      const journalEntry = await JournalService.createEntry(companyId, req.user._id, {
+        date: txDate,
+        description: `Petty Cash Expense - ${description || 'Expense'} - ${transaction.referenceNo}`,
+        sourceType: 'petty_cash_expense',
+        sourceId: transaction._id,
+        sourceReference: transaction.referenceNo,
+        lines: [
+          JournalService.createDebitLine(
+            expenseAccountId,
+            amount,
+            `Petty cash expense: ${transaction.referenceNo}`
+          ),
+          JournalService.createCreditLine(
+            pettyCashAccount,
+            amount,
+            `Petty cash expense: ${transaction.referenceNo}`
+          )
+        ],
+        isAutoGenerated: true
+      });
+      
+      // Update transaction with journal entry ID
+      transaction.journalEntryId = journalEntry._id;
+      await transaction.save();
+    } catch (journalError) {
+      console.error('Failed to create journal entry for petty cash expense:', journalError);
+    }
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        _id: transaction._id,
+        referenceNo: transaction.referenceNo,
+        type: 'expense',
+        amount,
+        balanceAfter: newBalance,
+        description: transaction.description,
+        expenseAccountId,
+        receiptRef,
+        transactionDate: transaction.transactionDate,
+        createdAt: transaction.createdAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get transaction history with running balance for a fund
+// @route   GET /api/petty-cash/funds/:id/transactions
+// @access  Private
+exports.getFundTransactions = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { startDate, endDate, type, page = 1, limit = 50 } = req.query;
+    
+    // Find the float
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res.status(404).json({ success: false, message: 'Petty cash fund not found' });
+    }
+    
+    // Build query
+    const query = { company: companyId, float: id };
+    
+    if (type) query.type = type;
+    
+    if (startDate || endDate) {
+      query.transactionDate = {};
+      if (startDate) query.transactionDate.$gte = new Date(startDate);
+      if (endDate) query.transactionDate.$lte = new Date(endDate);
+    }
+    
+    // Get transactions sorted by date
+    const transactions = await PettyCashTransaction.find(query)
+      .populate('createdBy', 'name email')
+      .sort({ transactionDate: 1, createdAt: 1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+    
+    const total = await PettyCashTransaction.countDocuments(query);
+    
+    // Calculate running balance for each transaction
+    let runningBalance = float.openingBalance;
+    const transactionsWithRunningBalance = transactions.map(tx => {
+      runningBalance += tx.amount;
+      return {
+        _id: tx._id,
+        referenceNo: tx.referenceNo,
+        type: tx.type,
+        amount: Math.abs(tx.amount),
+        runningBalance,
+        description: tx.description,
+        expenseAccountId: tx.expenseAccountId,
+        receiptRef: tx.receiptRef,
+        transactionDate: tx.transactionDate,
+        createdAt: tx.createdAt
+      };
+    });
+    
+    // Get current balance
+    const currentBalance = await getCurrentBalance(float._id);
+    const replenishmentNeeded = float.floatAmount - currentBalance;
+    
+    res.json({
+      success: true,
+      count: transactionsWithRunningBalance.length,
+      total,
+      pages: Math.ceil(total / limit),
+      data: {
+        fund: {
+          _id: float._id,
+          name: float.name,
+          ledgerAccountId: float.ledgerAccountId,
+          floatAmount: float.floatAmount,
+          currentBalance,
+          replenishmentNeeded: Math.max(0, replenishmentNeeded)
+        },
+        transactions: transactionsWithRunningBalance
+      }
     });
   } catch (error) {
     next(error);

@@ -1,6 +1,18 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+// Error codes for user operations
+const USER_ERRORS = {
+  EMAIL_ALREADY_REGISTERED: 'EMAIL_ALREADY_REGISTERED',
+  INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
+  ACCOUNT_LOCKED: 'ACCOUNT_LOCKED',
+  INVALID_REFRESH_TOKEN: 'INVALID_REFRESH_TOKEN',
+  CURRENT_PASSWORD_INCORRECT: 'CURRENT_PASSWORD_INCORRECT',
+  PASSWORD_TOO_SHORT: 'PASSWORD_TOO_SHORT',
+  INVALID_OR_EXPIRED_TOKEN: 'INVALID_OR_EXPIRED_TOKEN',
+  USER_ALREADY_MEMBER: 'USER_ALREADY_MEMBER'
+};
+
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -20,6 +32,12 @@ const userSchema = new mongoose.Schema({
     minlength: 6,
     select: false
   },
+  // Refresh token for JWT refresh
+  refresh_token: {
+    type: String,
+    select: false,
+    default: null
+  },
   // Multi-tenancy: company reference
   company: {
     type: mongoose.Schema.Types.ObjectId,
@@ -32,7 +50,7 @@ const userSchema = new mongoose.Schema({
   role: {
     // Legacy single-role kept for backward compatibility. Prefer `roles` array of Role refs.
     type: String,
-    enum: ['platform_admin', 'admin', 'stock_manager', 'sales', 'viewer'],
+    enum: ['platform_admin', 'admin', 'stock_manager', 'sales', 'viewer', 'accountant', 'manager', 'purchaser', 'warehouse_manager'],
     default: 'viewer'
   },
   roles: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Role' }],
@@ -61,20 +79,41 @@ const userSchema = new mongoose.Schema({
   tempPassword: {
     type: Boolean,
     default: false
-  }
-  ,
+  },
   // Two-factor authentication (TOTP)
   twoFAEnabled: { type: Boolean, default: false },
   twoFASecret: { type: String, select: false, default: null },
   twoFAConfirmed: { type: Boolean, default: false },
   // Optional per-user IP whitelist (array of IP strings)
-  ipWhitelist: [{ type: String }]
+  ipWhitelist: [{ type: String }],
+  // Login security fields
+  failed_login_attempts: {
+    type: Number,
+    default: 0
+  },
+  locked_until: {
+    type: Date,
+    default: null
+  },
+  // Password reset token
+  passwordResetToken: {
+    type: String,
+    select: false,
+    default: null
+  },
+  passwordResetExpires: {
+    type: Date,
+    default: null
+  }
 }, {
   timestamps: true
 });
 
 // Compound index for company + email uniqueness
 userSchema.index({ company: 1, email: 1 }, { unique: true });
+
+// Index for password reset token
+userSchema.index({ passwordResetToken: 1 });
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {
@@ -90,11 +129,51 @@ userSchema.methods.comparePassword = async function(enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
+// Check if account is locked
+userSchema.methods.isLocked = function() {
+  if (!this.locked_until) return false;
+  return new Date() < this.locked_until;
+};
+
+// Increment failed login attempts and optionally lock
+userSchema.methods.incrementFailedLoginAttempts = async function(maxAttempts = 5, lockDurationMinutes = 30) {
+  this.failed_login_attempts += 1;
+  
+  if (this.failed_login_attempts >= maxAttempts) {
+    // Lock the account
+    this.locked_until = new Date(Date.now() + lockDurationMinutes * 60 * 1000);
+  }
+  
+  return this.save();
+};
+
+// Reset failed login attempts on successful login
+userSchema.methods.resetFailedLoginAttempts = function() {
+  this.failed_login_attempts = 0;
+  this.locked_until = null;
+};
+
 // Remove password from JSON output
 userSchema.methods.toJSON = function() {
   const obj = this.toObject();
   delete obj.password;
+  delete obj.refresh_token;
+  delete obj.passwordResetToken;
+  delete obj.passwordResetExpires;
+  delete obj.twoFASecret;
   return obj;
 };
+
+// Static method to find by email (case-insensitive)
+userSchema.statics.findByEmail = function(email, companyId = null) {
+  const query = { email: email.toLowerCase() };
+  if (companyId) {
+    query.company = companyId;
+  }
+  return this.findOne(query);
+};
+
+// Export error codes
+userSchema.statics.ERRORS = USER_ERRORS;
 
 module.exports = mongoose.model('User', userSchema);

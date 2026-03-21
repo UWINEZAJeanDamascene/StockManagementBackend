@@ -21,7 +21,16 @@ exports.healthCheck = async (req, res, next) => {
     const totalDebit = coerce(totals.totalDebit);
     const totalCredit = coerce(totals.totalCredit);
 
-    res.json({ success: true, healthy: report.healthy, totalDebit, totalCredit, journal: report.journal, stock: report.stock });
+    res.json({ 
+      success: true, 
+      healthy: report.healthy, 
+      totalDebit, 
+      totalCredit, 
+      journal_balanced: report.journal && report.journal.healthy === true, 
+      stock_reconciled: report.stock && report.stock.healthy === true,
+      journal: report.journal, 
+      stock: report.stock 
+    });
   } catch (err) {
     next(err);
   }

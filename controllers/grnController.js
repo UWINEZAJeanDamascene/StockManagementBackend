@@ -26,6 +26,7 @@ exports.createGRN = async (req, res, next) => {
       referenceNo,
       purchaseOrder: po._id,
       warehouse,
+      supplier: po.supplier,
       lines,
       createdBy: req.user.id
     });

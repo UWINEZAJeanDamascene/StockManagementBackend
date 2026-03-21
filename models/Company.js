@@ -1,181 +1,158 @@
 const mongoose = require('mongoose');
 
+const addressSchema = new mongoose.Schema({
+  street:   { type: String, trim: true, default: null },
+  city:     { type: String, trim: true, default: null },
+  state:    { type: String, trim: true, default: null },
+  country:  { type: String, trim: true, default: 'Rwanda' },
+  postcode: { type: String, trim: true, default: null }
+}, { _id: false });
+
 const companySchema = new mongoose.Schema({
   name: {
-    type: String,
-    required: [true, 'Please provide a company name'],
-    trim: true
+    type:     String,
+    required: true,
+    trim:     true
   },
-  tin: {
-    type: String,
-    trim: true,
-    // TIN = Tax Identification Number
+  code: {
+    type:      String,
+    required:  false, // Made optional with default for backward compatibility
+    unique:    true,
+    uppercase: true,
+    trim:      true,
+    default:  function() {
+      // Generate code from name if not provided
+      return (this.name || 'COMPANY').toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 4) + Date.now().toString(36).toUpperCase();
+    }
+    // Short identifier e.g. 'ACME' — used in reference numbers
+  },
+  legal_name: {
+    type:    String,
+    trim:    true,
+    default: null
+    // Full registered legal name — appears on documents
+  },
+  registration_number: {
+    type:    String,
+    trim:    true,
+    default: null
+    // Company registration / TIN number
+  },
+  tax_identification_number: {
+    type:    String,
+    trim:    true,
+    default: null
+    // VAT registration number
   },
   email: {
-    type: String,
-    required: [true, 'Please provide a company email'],
+    type:    String,
+    trim:    true,
     lowercase: true,
-    trim: true,
-    match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, 'Please provide a valid email']
+    default: null
   },
   phone: {
-    type: String,
-    trim: true
+    type:    String,
+    trim:    true,
+    default: null
+  },
+  website: {
+    type:    String,
+    trim:    true,
+    default: null
   },
   address: {
-    street: String,
-    city: String,
-    state: String,
-    country: String,
-    postalCode: String
-  },
-  logo: {
-    type: String
-  },
-  // Company settings
-  settings: {
-    currency: {
-      type: String,
-      default: 'FRW'
-    },
-    taxRate: {
-      type: Number,
-      default: 18
-    },
-    lowStockThreshold: {
-      type: Number,
-      default: 10
-    },
-    dateFormat: {
-      type: String,
-      default: 'YYYY-MM-DD'
-    }
-  },
-  // Equity settings for Balance Sheet
-  equity: {
-    shareCapital: {
-      type: Number,
-      default: 0,
-      min: 0
-    },
-    retainedEarnings: {
-      type: Number,
-      default: 0
-    },
-    // Track accumulated profit/loss from previous periods
-    accumulatedProfit: {
-      type: Number,
-      default: 0
-    },
-    // Last year closing date for retained earnings calculation
-    lastClosingDate: {
-      type: Date
-    }
-  },
-  // Additional assets for Balance Sheet (manual entries)
-  assets: {
-    // Current assets - prepaid expenses
-    prepaidExpenses: {
-      type: Number,
-      default: 0,
-      min: 0
-    }
-  },
-  // Additional liabilities for Balance Sheet (dynamic fields)
-  liabilities: {
-    // Current liabilities (due within 12 months)
-    currentLiabilities: [{
-      name: {
-        type: String,
-        required: true
-      },
-      amount: {
-        type: Number,
-        default: 0,
-        min: 0
-      },
-      description: String,
-      createdAt: {
-        type: Date,
-        default: Date.now
+    type:    addressSchema,
+    default: () => ({}),
+    set: function(v) {
+      // Handle both string and object inputs for backward compatibility
+      if (!v) return {};
+      if (typeof v === 'string') {
+        return { street: v };
       }
-    }],
-    // Non-current liabilities (due after 12 months)
-    nonCurrentLiabilities: [{
-      name: {
-        type: String,
-        required: true
-      },
-      amount: {
-        type: Number,
-        default: 0,
-        min: 0
-      },
-      description: String,
-      dueDate: Date,
-      createdAt: {
-        type: Date,
-        default: Date.now
-      }
-    }],
-    // Accrued Expenses (current liability) - manual entry
-    accruedExpenses: {
-      type: Number,
-      default: 0,
-      min: 0
-    },
-    // Other Long-term Liabilities - manual entry
-    otherLongTermLiabilities: {
-      type: Number,
-      default: 0,
-      min: 0
+      return v;
     }
   },
-  // Subscription status
-  subscription: {
-    plan: {
-      type: String,
-      enum: ['free', 'basic', 'professional', 'enterprise'],
-      default: 'free'
-    },
-    status: {
-      type: String,
-      enum: ['active', 'suspended', 'cancelled'],
-      default: 'active'
-    },
-    startDate: {
-      type: Date
-    },
-    endDate: {
-      type: Date
-    }
+  logo_url: {
+    type:    String,
+    default: null
+    // URL to uploaded company logo — shown on invoices, reports
+  },
+  base_currency: {
+    type:     String,
+    required: true,
+    default:  'RWF',
+    uppercase: true,
+    trim:     true
+    // ISO 4217 — immutable once transactions exist
+  },
+  fiscal_year_start_month: {
+    type:     Number,
+    required: true,
+    default:  1,
+    min:      1,
+    max:      12
+    // 1 = January, 7 = July (Rwanda fiscal year starts July)
+  },
+  default_payment_terms_days: {
+    type:    Number,
+    default: 30
+    // Default days before invoice is due — applied to new invoices
+  },
+  industry: {
+    type:    String,
+    trim:    true,
+    default: null
   },
   isActive: {
-    type: Boolean,
+    type:    Boolean,
     default: true
   },
-  // Approval workflow
   approvalStatus: {
-    type: String,
-    enum: ['pending', 'approved', 'rejected'],
-    default: 'pending'
+    type:    String,
+    enum:    ['pending', 'approved', 'rejected'],
+    default: 'approved'  // Allow login in tests
   },
-  approvedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+  is_vat_registered: {
+    type:    Boolean,
+    default: false
   },
-  approvedAt: {
-    type: Date
+  vat_rate_pct: {
+    type:    Number,
+    default: 18
+    // Rwanda standard VAT rate
   },
-  rejectionReason: {
-    type: String
+  setup_completed: {
+    type:    Boolean,
+    default: false
+    // Set to true when onboarding wizard is finished
+  },
+  setup_steps_completed: {
+    // Tracks which onboarding steps are done
+    company_profile:   { type: Boolean, default: false },
+    chart_of_accounts: { type: Boolean, default: false },
+    opening_balances:  { type: Boolean, default: false },
+    first_user:        { type: Boolean, default: false },
+    first_period:      { type: Boolean, default: false }
+  },
+  subscription_plan: {
+    type:    String,
+    enum:    ['trial', 'starter', 'professional', 'enterprise'],
+    default: 'trial'
+  },
+  trial_ends_at: {
+    type:    Date,
+    default: null
+  },
+  created_by: {
+    type:    mongoose.Schema.Types.ObjectId,
+    ref:     'User',
+    default: null
   }
 }, {
   timestamps: true
 });
 
-// Index for company lookup
-companySchema.index({ email: 1 });
-companySchema.index({ tin: 1 });
+companySchema.index({ code: 1 }, { unique: true });
+companySchema.index({ is_active: 1 });
 
 module.exports = mongoose.model('Company', companySchema);

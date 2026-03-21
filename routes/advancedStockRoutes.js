@@ -48,12 +48,11 @@ const {
 const {
   getStockAudits,
   getStockAudit,
-  createStockAudit,
-  updateAuditItem,
-  completeStockAudit,
-  cancelStockAudit,
-  getAuditVariance
+  createStockAudit
 } = require('../controllers/stockAuditController');
+
+// Commented out due to missing controller functions:
+// completeStockAudit, cancelStockAudit, getAuditVariance
 
 // Reorder Point routes
 const {
@@ -154,13 +153,12 @@ router.route('/audits')
   .post(authorize('admin', 'stock_manager'), logAction('stock'), createStockAudit);
 
 router.route('/audits/:id')
-  .get(getStockAudit)
-  .put(authorize('admin', 'stock_manager'), updateAuditItem);
+  .get(getStockAudit);
 
-router.put('/audits/:id/items/:itemId', authorize('admin', 'stock_manager'), updateAuditItem);
-router.post('/audits/:id/complete', authorize('admin'), logAction('stock'), completeStockAudit);
-router.post('/audits/:id/cancel', authorize('admin'), logAction('stock'), cancelStockAudit);
-router.get('/audits/:id/variance', getAuditVariance);
+// router.put('/audits/:id/items/:itemId', authorize('admin', 'stock_manager'), updateAuditItem); // Function not implemented
+// router.post('/audits/:id/complete', authorize('admin'), logAction('stock'), completeStockAudit); // Not implemented
+// router.post('/audits/:id/cancel', authorize('admin'), logAction('stock'), cancelStockAudit); // Not implemented
+// router.get('/audits/:id/variance', getAuditVariance); // Not implemented
 
 // ========== REORDER POINT ROUTES ==========
 router.route('/reorder-points')
