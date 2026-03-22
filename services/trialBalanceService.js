@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 /**
  * Trial Balance Service
@@ -26,7 +27,7 @@ class TrialBalanceService {
 
     // Step 1 — Aggregate all posted journal lines by account in period
     // Using embedded lines approach with $unwind
-    const lineAggregation = await JournalEntry.aggregate([
+    const lineAggregation = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),

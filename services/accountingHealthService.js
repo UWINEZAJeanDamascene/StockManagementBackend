@@ -1,9 +1,10 @@
 const JournalEntry = require('../models/JournalEntry');
 const InventoryBatch = require('../models/InventoryBatch');
 const Product = require('../models/Product');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 async function getJournalTotals(companyId) {
-  const jeAgg = await JournalEntry.aggregate([
+  const jeAgg = await aggregateWithTimeout(JournalEntry, [
     { $match: { company: companyId, status: 'posted' } },
     { $group: { _id: null, totalDebit: { $sum: '$totalDebit' }, totalCredit: { $sum: '$totalCredit' }, count: { $sum: 1 } } }
   ]);
@@ -13,7 +14,7 @@ async function getJournalTotals(companyId) {
 }
 
 async function getStockDiscrepancies(companyId) {
-  const batchAgg = await InventoryBatch.aggregate([
+  const batchAgg = await aggregateWithTimeout(InventoryBatch, [
     { $match: { company: companyId } },
     { $group: { _id: '$product', totalAvailable: { $sum: '$availableQuantity' }, batches: { $sum: 1 } } },
     { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'product' } },

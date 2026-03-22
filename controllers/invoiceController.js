@@ -925,7 +925,7 @@ exports.confirmInvoice = async (req, res, next) => {
 
     // Invalidate report cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -1132,7 +1132,7 @@ exports.recordPayment = async (req, res, next) => {
 
     // Invalidate report cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -1259,7 +1259,7 @@ exports.cancelInvoice = async (req, res, next) => {
 
     // Invalidate report cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }

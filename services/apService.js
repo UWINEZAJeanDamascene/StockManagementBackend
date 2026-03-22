@@ -9,6 +9,7 @@ const periodService = require('./periodService');
 const cacheService = require('./cacheService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { nextSequence } = require('./sequenceService');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 /**
  * AP Service - Handles Accounts Payable operations
@@ -120,7 +121,7 @@ class APService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -159,7 +160,7 @@ class APService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -271,7 +272,7 @@ class APService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -348,7 +349,7 @@ class APService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -395,7 +396,7 @@ class APService {
     }
 
     // Check available amount to allocate
-    const allocatedSum = await APPaymentAllocation.aggregate([
+    const allocatedSum = await aggregateWithTimeout(APPaymentAllocation, [
       { $match: { payment: payment._id } },
       { $group: { _id: null, total: { $sum: '$amountAllocated' } } }
     ]);
@@ -429,7 +430,7 @@ class APService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }

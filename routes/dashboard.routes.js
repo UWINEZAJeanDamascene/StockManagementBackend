@@ -1,0 +1,108 @@
+/**
+ * Phase 3 dashboard API — seven read endpoints + manual cache clear.
+ * Each GET requires reports:read; POST /cache/clear requires settings:update.
+ * Responses are the raw service payloads (no { success, data } wrapper).
+ */
+const express = require('express')
+const router = express.Router()
+
+const { protect } = require('../middleware/auth')
+const { authorize } = require('../middleware/authorize')
+const { attachCompanyId } = require('../middleware/companyContext')
+const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware')
+
+const ExecutiveDashboardService = require('../services/dashboards/ExecutiveDashboardService')
+const InventoryDashboardService = require('../services/dashboards/InventoryDashboardService')
+const SalesDashboardService = require('../services/dashboards/SalesDashboardService')
+const PurchaseDashboardService = require('../services/dashboards/PurchaseDashboardService')
+const FinanceDashboardService = require('../services/dashboards/FinanceDashboardService')
+const RatiosWidgetService = require('../services/dashboards/RatiosWidgetService')
+const PeriodComparisonService = require('../services/dashboards/PeriodComparisonService')
+const dashboardCache = require('../services/DashboardCacheService')
+
+router.use(protect)
+router.use(sessionMiddleware)
+
+function asyncHandler (fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+}
+
+// attachCompanyId only on Phase 3 routes so legacy /stats etc. still fall through to dashboardRoutes.js
+// Order matches Phase 3 spec listing
+router.get('/executive',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await ExecutiveDashboardService.get(req.companyId))
+  })
+)
+
+router.get('/inventory',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await InventoryDashboardService.get(req.companyId))
+  })
+)
+
+router.get('/sales',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await SalesDashboardService.get(req.companyId))
+  })
+)
+
+router.get('/purchase',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await PurchaseDashboardService.get(req.companyId))
+  })
+)
+
+router.get('/finance',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await FinanceDashboardService.get(req.companyId))
+  })
+)
+
+router.get('/ratios',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 300 }),
+  asyncHandler(async (req, res) => {
+    res.json(await RatiosWidgetService.get(req.companyId))
+  })
+)
+
+router.get('/period-comparison',
+  attachCompanyId,
+  authorize('reports', 'read'),
+  cacheMiddleware({ type: 'dashboard', ttl: 60 }),
+  asyncHandler(async (req, res) => {
+    res.json(await PeriodComparisonService.get(req.companyId))
+  })
+)
+
+router.post('/cache/clear',
+  attachCompanyId,
+  authorize('settings', 'update'),
+  (req, res) => {
+    try {
+      dashboardCache.invalidate(req.companyId)
+      res.json({ success: true, message: 'Dashboard cache cleared' })
+    } catch (err) {
+      res.status(500).json({ error: err.message })
+    }
+  }
+)
+
+module.exports = router

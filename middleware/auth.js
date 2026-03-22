@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Company = require('../models/Company');
+const { recordUserSessionActivity } = require('../services/userSessionActivity');
 
 const protect = async (req, res, next) => {
   let token;
@@ -34,6 +35,7 @@ const protect = async (req, res, next) => {
       if (req.user.role === 'platform_admin') {
         req.isPlatformAdmin = true;
         req.company = null;
+        recordUserSessionActivity(req.user._id);
         return next();
       }
 
@@ -64,6 +66,7 @@ const protect = async (req, res, next) => {
         });
       }
 
+      recordUserSessionActivity(req.user._id);
       next();
     } catch (error) {
       console.error(error);
@@ -74,6 +77,7 @@ const protect = async (req, res, next) => {
           if (decoded && decoded.id) {
             req.user = await User.findById(decoded.id).select('-password');
             req.company = decoded.companyId ? await Company.findById(decoded.companyId) : null;
+            if (req.user) recordUserSessionActivity(req.user._id);
             return next();
           }
         } catch (e) {

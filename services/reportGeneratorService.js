@@ -16,6 +16,7 @@ const InventoryBatch = require('../models/InventoryBatch');
 const SerialNumber = require('../models/SerialNumber');
 const Warehouse = require('../models/Warehouse');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 // Helper function to get date range for different periods
 const getPeriodDates = (periodType, year, periodNumber) => {
@@ -116,7 +117,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   };
 
   // Revenue from paid invoices
-  const invoiceRevenue = await Invoice.aggregate([
+  const invoiceRevenue = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     {
       $group: {
@@ -131,7 +132,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Sales returns from CreditNote collection
-  const creditNotesData = await CreditNote.aggregate([
+  const creditNotesData = await aggregateWithTimeout(CreditNote, [
     {
       $match: {
         company: companyId,
@@ -151,7 +152,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Purchases
-  const purchases = await Purchase.aggregate([
+  const purchases = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -171,7 +172,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Purchase returns from PurchaseReturn collection
-  const purchaseReturnsData = await PurchaseReturn.aggregate([
+  const purchaseReturnsData = await aggregateWithTimeout(PurchaseReturn, [
     {
       $match: {
         company: companyId,
@@ -191,7 +192,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Expenses by category
-  const expenses = await Expense.aggregate([
+  const expenses = await aggregateWithTimeout(Expense, [
     {
       $match: {
         company: companyId,
@@ -251,7 +252,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
 
   // Other income/expenses
   const interestIncome = 0; // Could be calculated from bank accounts
-  const interestExpense = await Loan.aggregate([
+  const interestExpense = await aggregateWithTimeout(Loan, [
     {
       $match: {
         company: companyId,
@@ -344,7 +345,7 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
   const startOfYear = new Date(asOf.getFullYear(), 0, 1);
 
   // Current Assets
-  const accountsReceivable = await Invoice.aggregate([
+  const accountsReceivable = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -360,7 +361,7 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
     }
   ]);
 
-  const inventoryValue = await Product.aggregate([
+  const inventoryValue = await aggregateWithTimeout(Product, [
     {
       $match: {
         company: companyId,
@@ -402,7 +403,7 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
   const totalAssets = currentAssets.total + nonCurrentAssets.total;
 
   // Liabilities
-  const accountsPayable = await Purchase.aggregate([
+  const accountsPayable = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -417,7 +418,7 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
     }
   ]);
 
-  const loans = await Loan.aggregate([
+  const loans = await aggregateWithTimeout(Loan, [
     {
       $match: {
         company: companyId,
@@ -494,7 +495,7 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
 // Generate VAT Summary Report
 const generateVATSummaryReport = async (companyId, startDate, endDate) => {
   // Output VAT (from invoices)
-  const outputVAT = await Invoice.aggregate([
+  const outputVAT = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -513,7 +514,7 @@ const generateVATSummaryReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Input VAT (from purchases)
-  const inputVAT = await Purchase.aggregate([
+  const inputVAT = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -553,7 +554,7 @@ const generateVATSummaryReport = async (companyId, startDate, endDate) => {
 
 // Generate Product Performance Report
 const generateProductPerformanceReport = async (companyId, startDate, endDate, limit = 10) => {
-  const productPerformance = await Invoice.aggregate([
+  const productPerformance = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -592,7 +593,7 @@ const generateProductPerformanceReport = async (companyId, startDate, endDate, l
 
 // Generate Top Customers Report
 const generateTopCustomersReport = async (companyId, startDate, endDate, limit = 10) => {
-  const topCustomers = await Invoice.aggregate([
+  const topCustomers = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -839,7 +840,7 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
 
 // Generate Top Clients by Revenue Report
 const generateTopClientsByRevenueReport = async (companyId, startDate, endDate, limit = 20) => {
-  const topClients = await Invoice.aggregate([
+  const topClients = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -874,7 +875,7 @@ const generateTopClientsByRevenueReport = async (companyId, startDate, endDate, 
 
 // Generate Top Suppliers by Purchase Report
 const generateTopSuppliersByPurchaseReport = async (companyId, startDate, endDate, limit = 20) => {
-  const topSuppliers = await Purchase.aggregate([
+  const topSuppliers = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -1838,7 +1839,7 @@ const generateSalesByCategoryReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesByCategory = await Invoice.aggregate([
+  const salesByCategory = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     { $unwind: '$items' },
     {
@@ -1902,7 +1903,7 @@ const generateSalesByClientReport = async (companyId, startDate, endDate, limit 
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesByClient = await Invoice.aggregate([
+  const salesByClient = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     {
       $group: {
@@ -1956,7 +1957,7 @@ const generateSalesBySalespersonReport = async (companyId, startDate, endDate, l
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesBySalesperson = await Invoice.aggregate([
+  const salesBySalesperson = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     {
       $group: {
@@ -2354,7 +2355,7 @@ const generateDailySalesSummaryReport = async (companyId, startDate, endDate) =>
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const dailySales = await Invoice.aggregate([
+  const dailySales = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     {
       $group: {
@@ -2420,7 +2421,7 @@ const generateExpenseByCategoryReport = async (companyId, startDate, endDate) =>
     if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
   }
 
-  const expensesByCategory = await Expense.aggregate([
+  const expensesByCategory = await aggregateWithTimeout(Expense, [
     { $match: matchStage },
     {
       $group: {
@@ -2493,7 +2494,7 @@ const generateExpenseByPeriodReport = async (companyId, startDate, endDate, peri
       dateFormat = '%Y-%m';
   }
 
-  const expensesByPeriod = await Expense.aggregate([
+  const expensesByPeriod = await aggregateWithTimeout(Expense, [
     { $match: matchStage },
     {
       $group: {
@@ -2555,7 +2556,7 @@ const generateExpenseVsBudgetReport = async (companyId, startDate, endDate) => {
   }).lean();
 
   // Get actual expenses
-  const actualExpenses = await Expense.aggregate([
+  const actualExpenses = await aggregateWithTimeout(Expense, [
     {
       $match: {
         company: companyId,
@@ -2692,7 +2693,7 @@ const generateEmployeeExpenseReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
   }
 
-  const expensesByEmployee = await Expense.aggregate([
+  const expensesByEmployee = await aggregateWithTimeout(Expense, [
     { $match: matchStage },
     {
       $lookup: {
@@ -2804,13 +2805,13 @@ const generateVATReturnReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Output VAT (from sales invoices)
-  const salesVAT = await Invoice.aggregate([
+  const salesVAT = await aggregateWithTimeout(Invoice, [
     { $match: { company: companyId, status: { $in: ['paid', 'partial', 'confirmed'] }, invoiceDate: { $gte: start, $lte: end } } },
     { $group: { _id: null, totalOutputVAT: { $sum: '$totalTax' }, totalSales: { $sum: '$grandTotal' }, totalExclVAT: { $sum: '$subtotal' } } }
   ]);
 
   // Input VAT (from purchases)
-  const purchasesVAT = await Purchase.aggregate([
+  const purchasesVAT = await aggregateWithTimeout(Purchase, [
     { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: start, $lte: end } } },
     { $group: { _id: null, totalInputVAT: { $sum: '$totalTax' }, totalPurchases: { $sum: '$grandTotal' }, totalExclVAT: { $sum: '$subtotal' } } }
   ]);
@@ -2850,7 +2851,7 @@ const generatePAYEReport = async (companyId, startDate, endDate) => {
   const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
   const end = endDate ? new Date(endDate) : new Date();
 
-  const payrollData = await Payroll.aggregate([
+  const payrollData = await aggregateWithTimeout(Payroll, [
     { $match: { company: companyId, paymentDate: { $gte: start, $lte: end } } },
     { $unwind: '$employees' },
     { $group: { 
@@ -2889,13 +2890,13 @@ const generateWithholdingTaxReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Withholding tax on sales (domestic sales subject to WHT)
-  const salesWHT = await Invoice.aggregate([
+  const salesWHT = await aggregateWithTimeout(Invoice, [
     { $match: { company: companyId, status: { $in: ['paid', 'partial', 'confirmed'] }, invoiceDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
     { $group: { _id: null, totalWHT: { $sum: '$withholdingTax' }, invoiceCount: { $sum: 1 } } }
   ]);
 
   // Withholding tax on purchases
-  const purchasesWHT = await Purchase.aggregate([
+  const purchasesWHT = await aggregateWithTimeout(Purchase, [
     { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
     { $group: { _id: null, totalWHT: { $sum: '$withholdingTax' }, purchaseCount: { $sum: 1 } } }
   ]);
@@ -2934,13 +2935,13 @@ const generateCorporateTaxReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Calculate gross income (Revenue)
-  const sales = await Invoice.aggregate([
+  const sales = await aggregateWithTimeout(Invoice, [
     { $match: { company: companyId, status: 'paid', paidDate: { $gte: start, $lte: end } } },
     { $group: { _id: null, totalRevenue: { $sum: '$subtotal' }, totalTax: { $sum: '$totalTax' }, totalDiscount: { $sum: '$totalDiscount' } } }
   ]);
 
   // Calculate deductible expenses
-  const expenses = await Expense.aggregate([
+  const expenses = await aggregateWithTimeout(Expense, [
     { $match: { company: companyId, status: { $ne: 'cancelled' }, expenseDate: { $gte: start, $lte: end } } },
     { $group: { _id: '$type', total: { $sum: '$amount' } } }
   ]);
@@ -3670,7 +3671,7 @@ const generateDeadStockReport = async (companyId, days = 90) => {
   cutoffDate.setDate(cutoffDate.getDate() - days);
 
   // Get all products with their last movement
-  const lastMovementAgg = await StockMovement.aggregate([
+  const lastMovementAgg = await aggregateWithTimeout(StockMovement, [
     { $match: { company: companyId, movementDate: { $gte: cutoffDate } } },
     { $sort: { product: 1, movementDate: -1 } },
     {
@@ -3796,7 +3797,7 @@ const generateStockAgingReport = async (companyId) => {
 // Generate Inventory Turnover Report
 const generateInventoryTurnoverReport = async (companyId, startDate, endDate) => {
   // Get COGS from sales in the period
-  const cogsData = await Invoice.aggregate([
+  const cogsData = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -3996,7 +3997,7 @@ const generateWarehouseStockReport = async (companyId, warehouseId = null) => {
     .sort({ name: 1 });
 
   // Get batch-level stock per warehouse
-  const stockByWarehouse = await InventoryBatch.aggregate([
+  const stockByWarehouse = await aggregateWithTimeout(InventoryBatch, [
     { $match: { company: companyId, status: { $ne: 'exhausted' } } },
     {
       $group: {
@@ -4185,7 +4186,7 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesSummary = await Invoice.aggregate([
+  const salesSummary = await aggregateWithTimeout(Invoice, [
     { $match: matchStage },
     {
       $group: {
@@ -4219,7 +4220,7 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
     : 0;
 
   // Get sales by status
-  const salesByStatus = await Invoice.aggregate([
+  const salesByStatus = await aggregateWithTimeout(Invoice, [
     { $match: { company: companyId, invoiceDate: { $gte: startDate, $lte: endDate } } },
     {
       $group: {
@@ -4256,7 +4257,7 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
 // Generate Cash Flow Report
 const generateCashFlowReport = async (companyId, startDate, endDate) => {
   // Cash inflows from paid invoices
-  const cashInflows = await Invoice.aggregate([
+  const cashInflows = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -4273,7 +4274,7 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Cash outflows from purchases
-  const cashOutflowsPurchases = await Purchase.aggregate([
+  const cashOutflowsPurchases = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -4290,7 +4291,7 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Cash outflows from expenses
-  const cashOutflowsExpenses = await Expense.aggregate([
+  const cashOutflowsExpenses = await aggregateWithTimeout(Expense, [
     {
       $match: {
         company: companyId,
@@ -4307,7 +4308,7 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Credit notes issued (cash outflows)
-  const creditNotesIssued = await CreditNote.aggregate([
+  const creditNotesIssued = await aggregateWithTimeout(CreditNote, [
     {
       $match: {
         company: companyId,
@@ -4324,7 +4325,7 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Purchase returns (cash inflows)
-  const purchaseReturns = await PurchaseReturn.aggregate([
+  const purchaseReturns = await aggregateWithTimeout(PurchaseReturn, [
     {
       $match: {
         company: companyId,
@@ -4370,7 +4371,7 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
 // Generate Financial Ratios Report
 const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
   // Get basic financial data
-  const invoices = await Invoice.aggregate([
+  const invoices = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -4387,7 +4388,7 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
     }
   ]);
 
-  const purchases = await Purchase.aggregate([
+  const purchases = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -4403,7 +4404,7 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
     }
   ]);
 
-  const expenses = await Expense.aggregate([
+  const expenses = await aggregateWithTimeout(Expense, [
     {
       $match: {
         company: companyId,
@@ -4420,7 +4421,7 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Get current assets and liabilities for ratio calculations
-  const currentAssets = await Invoice.aggregate([
+  const currentAssets = await aggregateWithTimeout(Invoice, [
     {
       $match: {
         company: companyId,
@@ -4436,7 +4437,7 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
     }
   ]);
 
-  const currentLiabilities = await Purchase.aggregate([
+  const currentLiabilities = await aggregateWithTimeout(Purchase, [
     {
       $match: {
         company: companyId,
@@ -4453,7 +4454,7 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
   ]);
 
   // Get inventory value
-  const inventory = await Product.aggregate([
+  const inventory = await aggregateWithTimeout(Product, [
     {
       $match: {
         company: companyId,

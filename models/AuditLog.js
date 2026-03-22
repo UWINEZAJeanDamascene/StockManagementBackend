@@ -5,18 +5,15 @@ const auditLogSchema = new mongoose.Schema({
   company_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Company',
-    index: true
     // null for system-level actions (login, company creation)
   },
   user_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    index: true
   },
   action: {
     type: String,
     required: true,
-    index: true
     // Format: 'resource.verb' e.g. 'invoice.confirm', 'period.close'
   },
   entity_type: {
@@ -27,7 +24,6 @@ const auditLogSchema = new mongoose.Schema({
   entity_id: {
     type: Schema.Types.Mixed,  // Can be ObjectId or string for flexible entity tracking
     default: null,
-    index: true
   },
   changes: {
     type: mongoose.Schema.Types.Mixed,

@@ -203,7 +203,11 @@ journalEntrySchema.set('toJSON', {
 });
 
 // Compound index for company + date
+journalEntrySchema.index({ company: 1 });
 journalEntrySchema.index({ company: 1, date: -1 });
+journalEntrySchema.index({ company: 1, status: 1 });
+journalEntrySchema.index({ company: 1, status: 1, date: 1 });
+journalEntrySchema.index({ company: 1, sourceType: 1, date: 1 });
 journalEntrySchema.index({ company: 1, entryNumber: 1 }, { unique: true });
 
 // Index on embedded lines.accountCode for report queries (performance optimization)
@@ -213,7 +217,11 @@ journalEntrySchema.index({ company: 1, date: 1, 'lines.accountCode': 1 });
 // Enforce only when sourceId is present (manual entries without sourceId are excluded)
 journalEntrySchema.index(
   { company: 1, sourceType: 1, sourceId: 1 },
-  { unique: true, partialFilterExpression: { sourceId: { $exists: true, $ne: null } } }
+  {
+    unique: true,
+    // Use $type (not $ne: null) so partial indexes work on MongoDB versions used by mongodb-memory-server
+    partialFilterExpression: { sourceId: { $type: 'string' } },
+  },
 );
 
 // Pre-save middleware to calculate totals

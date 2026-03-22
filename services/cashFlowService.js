@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 const { BankAccount } = require('../models/BankAccount');
 const { PettyCashFloat } = require('../models/PettyCash');
 const { CASH_FLOW_CLASSIFICATION, VERIFY_RECONCILIATION, RECONCILIATION_TOLERANCE } = require('../config/cashFlowConfig');
@@ -50,7 +51,7 @@ class CashFlowService {
 
     // Get all cash-affecting journal entries in period classified by source_type
     // Using embedded lines approach with $unwind
-    const cashMovements = await JournalEntry.aggregate([
+    const cashMovements = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
@@ -178,7 +179,7 @@ class CashFlowService {
   static async _getTotalCashBalance(companyId, cashAccountIds, dateFrom, dateTo) {
     if (!cashAccountIds.length) return 0;
 
-    const result = await JournalEntry.aggregate([
+    const result = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),

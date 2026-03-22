@@ -8,6 +8,7 @@ const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const { runInTransaction } = require('./transactionService');
 const WarehouseInventoryCost = require('../models/WarehouseInventoryCost');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 async function _ensureActiveAndStockable(productIds) {
   const prods = await Product.find({ _id: { $in: productIds } });
@@ -22,7 +23,7 @@ async function _checkAvailability(companyId, fromWarehouse, lines) {
   for (const line of lines) {
     const prod = await Product.findById(line.product);
     if (!prod) throw { code: 'PRODUCT_NOT_FOUND', product: line.product };
-    const agg = await InventoryBatch.aggregate([
+    const agg = await aggregateWithTimeout(InventoryBatch, [
       { $match: { company: companyId, product: prod._id, warehouse: fromWarehouse } },
       { $group: { _id: null, reserved: { $sum: { $ifNull: ['$reservedQuantity', 0] } }, onHand: { $sum: { $ifNull: ['$quantity', 0] } } } }
     ]);

@@ -10,6 +10,7 @@
  */
 
 const Role = require('../models/Role');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 /**
  * List all roles (system roles + company custom roles)
@@ -34,15 +35,20 @@ exports.getRoles = async (req, res, next) => {
       query = { company_id: null };
     }
 
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
+    const total = await Role.countDocuments(query);
     const roles = await Role.find(query)
       .select('-__v')
       .lean()
-      .sort({ is_system_role: -1, name: 1 });
+      .sort({ is_system_role: -1, name: 1 })
+      .skip(skip)
+      .limit(limit);
 
     res.json({
       success: true,
       data: roles,
-      count: roles.length
+      count: roles.length,
+      pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
     next(error);

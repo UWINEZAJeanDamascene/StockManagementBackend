@@ -6,6 +6,7 @@
  */
 
 const mongoose = require('mongoose');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 const { FixedAsset, DepreciationEntry } = require('../models/FixedAsset');
 const JournalEntry = require('../models/JournalEntry');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -15,7 +16,7 @@ const { canPostToAccount, DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS } = require('../co
 exports.getAssets = async (req, res) => {
   try {
     const companyId = req.user.company._id;
-    const { status, purchase_date_from, purchase_date_to, page = 1, limit = 50 } = req.query;
+    const { status, purchase_date_from, purchase_date_to } = req.query;
 
     const query = { company: companyId, isDeleted: false };
     if (status) query.status = status;
@@ -25,6 +26,8 @@ exports.getAssets = async (req, res) => {
       if (purchase_date_to) query.purchaseDate.$lte = new Date(purchase_date_to);
     }
 
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50 });
+    const total = await FixedAsset.countDocuments(query);
     const assets = await FixedAsset.find(query)
       .populate('assetAccountId', 'code name')
       .populate('accumDepreciationAccountId', 'code name')
@@ -33,20 +36,13 @@ exports.getAssets = async (req, res) => {
       .populate('createdBy', 'name')
       .populate('categoryId', 'name description defaultUsefulLifeMonths defaultDepreciationMethod')
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
-
-    const total = await FixedAsset.countDocuments(query);
+      .skip(skip)
+      .limit(limit);
 
     res.json({
       success: true,
       data: assets,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit)
-      }
+      pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
     console.error('Error getting fixed assets:', error);

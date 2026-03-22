@@ -31,5 +31,7 @@ const purchaseOrderSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 purchaseOrderSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
+purchaseOrderSchema.index({ company: 1, status: 1 });
+purchaseOrderSchema.index({ company: 1, status: 1, orderDate: 1 });
 
 module.exports = mongoose.model('PurchaseOrder', purchaseOrderSchema);

@@ -11,6 +11,7 @@ const smsService = require('./smsService');
 const { notifyLowStock, notifyOutOfStock } = require('./notificationHelper');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const JournalService = require('./journalService');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 // ============================================
 // HELPER FUNCTIONS
@@ -289,18 +290,18 @@ async function sendWeeklySummaryReports() {
         categoryBreakdown
       ] = await Promise.all([
         Invoice.countDocuments({ company: company._id, createdAt: { $gte: since } }),
-        Invoice.aggregate([
+        aggregateWithTimeout(Invoice, [
           { $match: { company: company._id, status: 'confirmed', createdAt: { $gte: since } } },
           { $group: { _id: null, total: { $sum: '$total' } } }
-        ]),
+        ], 'report'),
         require('../models/Purchase').countDocuments({ company: company._id, createdAt: { $gte: since } }),
         Product.countDocuments({ company: company._id, currentStock: { $lte: Number(process.env.LOW_STOCK_THRESHOLD || 5) } }),
         // Category breakdown (simplified)
-        Product.aggregate([
+        aggregateWithTimeout(Product, [
           { $match: { company: company._id } },
           { $group: { _id: '$category', revenue: { $sum: '$currentStock' } } },
           { $limit: 5 }
-        ])
+        ], 'report')
       ]);
 
       const stats = {

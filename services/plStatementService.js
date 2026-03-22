@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 /**
  * P&L Statement Service
@@ -45,7 +46,7 @@ class PLStatementService {
   static async _buildPeriodData(companyId, dateFrom, dateTo) {
     // Get all revenue and expense account balances in one aggregation
     // Using embedded lines approach with $unwind
-    const accountBalances = await JournalEntry.aggregate([
+    const accountBalances = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),

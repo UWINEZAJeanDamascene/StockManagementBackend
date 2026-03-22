@@ -2,7 +2,6 @@ const mongoose = require('mongoose');
 const JournalEntry = require('../models/JournalEntry');
 const AccountBalance = require('../models/AccountBalance');
 const cacheService = require('../services/cacheService');
-const dashboardCache = require('./DashboardCacheService');
 const { CHART_OF_ACCOUNTS, getAccount, DEFAULT_ACCOUNTS, canPostToAccount } = require('../constants/chartOfAccounts');
 const accountMappingService = require('./accountMappingService');
 const periodService = require('./periodService');
@@ -154,16 +153,9 @@ class JournalService {
       // If no session provided (non-transactional create), invalidate caches (best-effort)
       if (!sess) {
         try {
-          await cacheService.invalidateByCompany(doc.company, 'report');
+          await cacheService.bumpCompanyFinancialCaches(doc.company);
         } catch (e) {
-          console.error('Failed to invalidate report cache after createEntry', e);
-        }
-        
-        // Per spec Module 9: Invalidate dashboard cache when journal entries are posted
-        try {
-          dashboardCache.invalidate(doc.company);
-        } catch (e) {
-          console.error('Failed to invalidate dashboard cache after createEntry', e);
+          console.error('Failed to invalidate caches after createEntry', e);
         }
         
         // Per spec 3.3: Invalidate bank account cache when journal entries are posted
@@ -336,9 +328,9 @@ class JournalService {
 
       // Invalidate cache once for the company after successful creation
       if (!sess) {
-        try { await cacheService.invalidateByCompany(companyId, 'report'); } catch (e) {}
-        // Per spec Module 9: Invalidate dashboard cache when journal entries are posted
-        try { dashboardCache.invalidate(companyId); } catch (e) {}
+        try {
+          await cacheService.bumpCompanyFinancialCaches(companyId);
+        } catch (e) {}
       }
 
       return results;

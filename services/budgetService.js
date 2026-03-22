@@ -3,6 +3,7 @@ const Budget = require('../models/Budget');
 const BudgetLine = require('../models/BudgetLine');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 class BudgetService {
 
@@ -236,7 +237,7 @@ class BudgetService {
 
     // Get actual totals from journal for each account in period
     // scoped to this company only
-    const actualTotals = await JournalEntry.aggregate([
+    const actualTotals = await aggregateWithTimeout(JournalEntry, [
       { $unwind: '$lines' },
       {
         $match: {

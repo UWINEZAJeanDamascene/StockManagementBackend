@@ -1,59 +1,53 @@
 const mongoose = require('mongoose');
 
 const exchangeRateSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
-  company: {
+  company_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Company',
     required: true,
     index: true
   },
-  baseCurrency: {
+  from_currency: {
     type: String,
     required: true,
-    default: 'USD',
-    uppercase: true,
-    enum: ['USD', 'EUR', 'GBP', 'FRW', 'LBP', 'SAR', 'AED', 'TZS', 'UGX', 'KES', 'BIF', 'ZMW', 'MWK', 'AOA']
+    uppercase: true
+    // The foreign currency
   },
-  targetCurrency: {
+  to_currency: {
     type: String,
     required: true,
-    uppercase: true,
-    enum: ['USD', 'EUR', 'GBP', 'FRW', 'LBP', 'SAR', 'AED', 'TZS', 'UGX', 'KES', 'BIF', 'ZMW', 'MWK', 'AOA']
+    uppercase: true
+    // Always the company base currency (e.g. RWF)
   },
   rate: {
     type: Number,
     required: true,
-    min: 0
+    min: 0.000001
+    // 1 unit of from_currency = rate units of to_currency
+    // e.g. 1 USD = 1285.50 RWF
   },
-  // For tracking historical rates
-  effectiveDate: {
+  effective_date: {
     type: Date,
-    default: Date.now
+    required: true
+    // Rate is valid from this date until a newer rate is set
   },
   source: {
     type: String,
-    enum: ['coingecko', 'manual', 'fallback'],
-    default: 'coingecko'
+    enum: ['manual', 'api', 'import'],
+    default: 'manual'
   },
-  isActive: {
-    type: Boolean,
-    default: true
+  created_by: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
   }
 }, {
   timestamps: true
 });
 
-// Compound index for fast lookups
-exchangeRateSchema.index({ baseCurrency: 1, targetCurrency: 1, effectiveDate: -1 });
-
-// Virtual for current rate (most recent)
-exchangeRateSchema.virtual('isCurrent').get(function() {
-  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  return this.effectiveDate >= oneDayAgo;
-});
-
-exchangeRateSchema.set('toJSON', { virtuals: true });
-exchangeRateSchema.set('toObject', { virtuals: true });
+// One rate per currency pair per date per company — fast lookup for getRate
+exchangeRateSchema.index(
+  { company_id: 1, from_currency: 1, effective_date: -1 }
+);
 
 module.exports = mongoose.model('ExchangeRate', exchangeRateSchema);

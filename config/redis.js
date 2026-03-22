@@ -40,6 +40,13 @@ const createNoOpClient = () => {
     incrby: async () => 1,
     getdel: async () => null,
     info: async () => '',
+    rpush: async () => 1,
+    lpush: async () => 1,
+    lpop: async () => null,
+    rpop: async () => null,
+    llen: async () => 0,
+    lrem: async () => 0,
+    lrange: async () => [],
     
     // Event emitter methods (no-ops)
     on: () => {},

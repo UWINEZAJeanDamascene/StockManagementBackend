@@ -1,7 +1,9 @@
 const express = require('express');
+const compression = require('compression');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const helmet = require('helmet');
+const hpp = require('hpp');
 const morgan = require('morgan');
 const connectDB = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
@@ -43,6 +45,9 @@ require('./models/SystemSettings');
 require('./models/Backup');
 require('./models/FixedAsset');
 require('./models/AuditLog');
+require('./models/JournalEntryLine');
+require('./models/RefreshToken');
+require('./models/UserSession');
 require('./models/AssetCategory');
 require('./models/Loan');
 require('./models/PrecomputedAggregation');
@@ -61,41 +66,56 @@ require('./models/CompanyUser');
 
 const app = express();
 
-// Security middleware
-app.use(helmet());
+// Security middleware — XSS, clickjacking, MIME sniffing protection
+app.use(helmet({
+  contentSecurityPolicy: process.env.NODE_ENV === 'production',
+  crossOriginEmbedderPolicy: false
+}));
 
 // Tenant context middleware (sets per-request companyId for tenant plugin)
 const tenantContextMiddleware = require('./middleware/tenantContextMiddleware');
 app.use(tenantContextMiddleware);
 
+// Health checks — mounted before /api rate limits (must stay unthrottled)
+const healthController = require('./controllers/healthController');
+const { protect } = require('./middleware/auth');
+const requireCompanyHeader = require('./middleware/requireCompanyHeader');
+app.get('/api/health', healthController.systemHealth);
+app.get('/health', healthController.systemHealth);
+app.get('/api/health/accounting', protect, requireCompanyHeader, healthController.accountingHealth);
+
 // Rate limiting with Redis (distributed)
 const rateLimiters = createRateLimiters();
 app.use('/api/auth', rateLimiters.auth);
+app.use('/api/v1/auth', rateLimiters.auth);
 app.use('/api/', rateLimiters.api);
 
-// CORS - Allow Vercel frontend and localhost for development
+// CORS - Production: use CORS_ORIGINS env (comma-separated). Dev: allow localhost/vercel/render.
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    // Allow localhost for development
-    if (origin.includes('localhost')) {
+    if (!origin) return callback(null, true); // Allow no-origin (server-to-server)
+
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const isTest = process.env.NODE_ENV === 'test';
+
+    // In development/test mode, allow common dev origins
+    if (isDevelopment || isTest) {
+      if (origin.includes('localhost')) return callback(null, true);
+      if (origin.includes('vercel.app')) return callback(null, true);
+      if (origin.includes('render.com')) return callback(null, true);
+    }
+
+    // Check environment variable whitelist (production only)
+    const explicitOrigins = process.env.CORS_ORIGINS
+      ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+      : [];
+
+    if (explicitOrigins.length > 0 && explicitOrigins.includes(origin)) {
       return callback(null, true);
     }
-    
-    // Allow all Vercel deployments (most common frontend hosting platform)
-    if (origin.includes('vercel.app')) {
-      return callback(null, true);
-    }
-    
-    // Allow all Render deployments (for self-hosted backends)
-    if (origin.includes('render.com')) {
-      return callback(null, true);
-    }
-    
-    // Allow specific domains
-    const allowedOrigins = [
+
+    // Hardcoded production whitelist (exact matches only in production)
+    const hardcoded = [
       'https://stock-management-frontend.vercel.app',
       'https://your-frontend.vercel.app',
       'https://stock-frontend-topaz-alpha.vercel.app',
@@ -103,25 +123,34 @@ const corsOptions = {
       'https://stock-tenancy-bnd.vercel.app',
       'https://stock-tenancy-system.onrender.com'
     ];
-    
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    
-    // For development, allow all (remove in production)
-    if (process.env.NODE_ENV === 'development') {
-      return callback(null, true);
-    }
-    
+    if (hardcoded.includes(origin)) return callback(null, true);
+
+    // Block all other origins
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true
 };
 app.use(cors(corsOptions));
 
+// Response compression (gzip/deflate); skip tiny payloads and health checks
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.path === '/health' || req.path === '/api/health') return false;
+    return compression.filter(req, res);
+  }
+}));
+
 // Body parser - increased limit for CSV imports
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// HTTP Parameter Pollution — last duplicate query key wins (single scalar)
+app.use(hpp());
+
+// Input sanitisation — strip dangerous chars (after body parsed)
+const sanitizeInput = require('./middleware/sanitizeInput');
+app.use(sanitizeInput);
 
 // Session management with Redis
 app.use(sessionMiddleware);
@@ -131,139 +160,69 @@ if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
 
-// Routes
-app.use('/api/auth', require('./routes/authRoutes'));
-app.use('/api/companies', require('./routes/companyRoutes'));
-app.use('/api/users', require('./routes/userRoutes'));
-app.use('/api/products', require('./routes/productRoutes'));
-app.use('/api/categories', require('./routes/categoryRoutes'));
-app.use('/api/suppliers', require('./routes/supplierRoutes'));
-app.use('/api/clients', require('./routes/clientRoutes'));
-app.use('/api/stock', require('./routes/stockRoutes'));
-app.use('/api/stock/advanced', require('./routes/advancedStockRoutes'));
-app.use('/api/quotations', require('./routes/quotationRoutes'));
-app.use('/api/sales-invoices', require('./routes/invoiceRoutes'));
-app.use('/api/purchases', require('./routes/purchaseRoutes'));
-app.use('/api/pos', require('./routes/posRoutes'));
-app.use('/api/reports', require('./routes/reportRoutes'));
-app.use('/api/dashboard', require('./routes/dashboardRoutes'));
-app.use('/api/exchange-rates', require('./routes/exchangeRateRoutes'));
-// Advanced access control & security routes
-app.use('/api/access', require('./routes/advancedAccessRoutes'));
-// Recurring invoices & subscriptions
-app.use('/api/recurring-templates', require('./routes/recurringInvoiceRoutes'));
-// Backwards compatibility alias
-app.use('/api/recurring-invoices', require('./routes/recurringInvoiceRoutes'));
-app.use('/api/subscriptions', require('./routes/subscriptionRoutes'));
-// Credit notes
-app.use('/api/credit-notes', require('./routes/creditNoteRoutes'));
+// API versioning — mount at /api/v1 (primary) and /api (backward compat)
+const apiRouter = express.Router();
 
-// Notification settings
-app.use('/api/notifications', require('./routes/notificationRoutes'));
+apiRouter.use('/auth', require('./routes/authRoutes'));
+apiRouter.use('/companies', require('./routes/companyRoutes'));
+apiRouter.use('/users', require('./routes/userRoutes'));
+apiRouter.use('/products', require('./routes/productRoutes'));
+apiRouter.use('/categories', require('./routes/categoryRoutes'));
+apiRouter.use('/suppliers', require('./routes/supplierRoutes'));
+apiRouter.use('/clients', require('./routes/clientRoutes'));
+apiRouter.use('/stock', require('./routes/stockRoutes'));
+apiRouter.use('/stock/advanced', require('./routes/advancedStockRoutes'));
+apiRouter.use('/quotations', require('./routes/quotationRoutes'));
+apiRouter.use('/sales-invoices', require('./routes/invoiceRoutes'));
+apiRouter.use('/purchases', require('./routes/purchaseRoutes'));
+apiRouter.use('/pos', require('./routes/posRoutes'));
+apiRouter.use('/reports', require('./routes/reportRoutes'));
+apiRouter.use('/dashboard', require('./routes/dashboard.routes'));
+apiRouter.use('/dashboard', require('./routes/dashboardRoutes'));
+apiRouter.use('/currencies', require('./routes/currencyRoutes'));
+apiRouter.use('/exchange-rates', require('./routes/exchangeRateRoutes'));
+apiRouter.use('/access', require('./routes/advancedAccessRoutes'));
+apiRouter.use('/recurring-templates', require('./routes/recurringInvoiceRoutes'));
+apiRouter.use('/recurring-invoices', require('./routes/recurringInvoiceRoutes'));
+apiRouter.use('/subscriptions', require('./routes/subscriptionRoutes'));
+apiRouter.use('/credit-notes', require('./routes/creditNoteRoutes'));
+apiRouter.use('/notifications', require('./routes/notificationRoutes'));
+apiRouter.use('/backups', require('./routes/backupRoutes'));
+apiRouter.use('/fixed-assets', require('./routes/fixedAssetRoutes'));
+apiRouter.use('/asset-categories', require('./routes/assetCategoryRoutes'));
+apiRouter.use('/loans', require('./routes/loanRoutes'));
+apiRouter.use('/budgets', require('./routes/budgetRoutes'));
+apiRouter.use('/taxes', require('./routes/taxRoutes'));
+apiRouter.use('/payroll', require('./routes/payrollRoutes'));
+apiRouter.use('/payroll-runs', require('./routes/payrollRunRoutes'));
+apiRouter.use('/expenses', require('./routes/expenseRoutes'));
+apiRouter.use('/petty-cash', require('./routes/pettyCashRoutes'));
+apiRouter.use('/bank-accounts', require('./routes/bankAccountRoutes'));
+apiRouter.use('/purchase-returns', require('./routes/purchaseReturnRoutes'));
+apiRouter.use('/payables', require('./routes/payableRoutes'));
+apiRouter.use('/ar', require('./routes/arRoutes'));
+apiRouter.use('/ap', require('./routes/apRoutes'));
+apiRouter.use('/delivery-notes', require('./routes/deliveryNoteRoutes'));
+apiRouter.use('/departments', require('./routes/departmentRoutes'));
+apiRouter.use('/bulk', require('./routes/bulkDataRoutes'));
+apiRouter.use('/audit-trail', require('./routes/auditTrailRoutes'));
+apiRouter.use('/chat', require('./routes/chatRoutes'));
+apiRouter.use('/journal-entries', require('./routes/journalRoutes'));
+apiRouter.use('/accounting', require('./routes/accountingRoutes'));
+apiRouter.use('/account-mappings', require('./routes/accountMappingRoutes'));
+apiRouter.use('/reconciliation', require('./routes/reconciliationRoutes'));
+apiRouter.use('/gl-financials', require('./routes/glFinancialRoutes'));
+apiRouter.use('/stock-transfers', require('./routes/stockTransferRoutes'));
+apiRouter.use('/stock-audits', require('./routes/stockAuditRoutes'));
+apiRouter.use('/batches', require('./routes/stockBatchRoutes'));
+apiRouter.use('/serial-numbers', require('./routes/stockSerialNumberRoutes'));
+apiRouter.use('/periods', require('./routes/periodRoutes'));
+apiRouter.use('/settings', require('./routes/settingsRoutes'));
+apiRouter.use('/opening-balances', require('./routes/openingBalanceRoutes'));
+apiRouter.use('/audit-logs', require('./routes/auditRoutes'));
 
-// Backup & Restore
-app.use('/api/backups', require('./routes/backupRoutes'));
-
-// Fixed Assets
-app.use('/api/fixed-assets', require('./routes/fixedAssetRoutes'));
-
-// Asset Categories
-app.use('/api/asset-categories', require('./routes/assetCategoryRoutes'));
-
-// Loans
-app.use('/api/loans', require('./routes/loanRoutes'));
-
-// Budget Management
-app.use('/api/budgets', require('./routes/budgetRoutes'));
-
-// Tax Management
-app.use('/api/taxes', require('./routes/taxRoutes'));
-
-// Payroll Management
-app.use('/api/payroll', require('./routes/payrollRoutes'));
-
-// Payroll Run Management (with journal entries)
-app.use('/api/payroll-runs', require('./routes/payrollRunRoutes'));
-
-// Expenses
-app.use('/api/expenses', require('./routes/expenseRoutes'));
-
-// Petty Cash
-app.use('/api/petty-cash', require('./routes/pettyCashRoutes'));
-
-// Bank Accounts & Cash Management
-app.use('/api/bank-accounts', require('./routes/bankAccountRoutes'));
-
-// Purchase Returns
-app.use('/api/purchase-returns', require('./routes/purchaseReturnRoutes'));
-
-// Accounts Payable Management
-app.use('/api/payables', require('./routes/payableRoutes'));
-
-// AR Module - Accounts Receivable per Section 1.6
-app.use('/api/ar', require('./routes/arRoutes'));
-
-// AP Module - Accounts Payable per Section 2
-app.use('/api/ap', require('./routes/apRoutes'));
-
-// Delivery Notes
-app.use('/api/delivery-notes', require('./routes/deliveryNoteRoutes'));
-
-// Departments
-app.use('/api/departments', require('./routes/departmentRoutes'));
-
-// Bulk Data Import/Export
-app.use('/api/bulk', require('./routes/bulkDataRoutes'));
-
-// Audit Trail
-app.use('/api/audit-trail', require('./routes/auditTrailRoutes'));
-
-// AI Chatbot (Gemini)
-app.use('/api/chat', require('./routes/chatRoutes'));
-
-// Journal Entries & Accounting
-app.use('/api/journal-entries', require('./routes/journalRoutes'));
-// Accounting health and core checks
-app.use('/api/accounting', require('./routes/accountingRoutes'));
-// Account mapping CRUD (company-scoped)
-app.use('/api/account-mappings', require('./routes/accountMappingRoutes'));
-// Reconciliation endpoints (compare GL trial balance vs AccountBalance snapshot)
-app.use('/api/reconciliation', require('./routes/reconciliationRoutes'));
-// GL-driven financial statements (P&L, Balance Sheet) derived from ledger snapshot
-app.use('/api/gl-financials', require('./routes/glFinancialRoutes'));
-
-// Stock transfers
-app.use('/api/stock-transfers', require('./routes/stockTransferRoutes'));
-
-// Stock Audits
-app.use('/api/stock-audits', require('./routes/stockAuditRoutes'));
-
-// Stock Batches (Module 4)
-app.use('/api/batches', require('./routes/stockBatchRoutes'));
-
-// Stock Serial Numbers (Module 4)
-app.use('/api/serial-numbers', require('./routes/stockSerialNumberRoutes'));
-
-// Accounting Periods
-app.use('/api/periods', require('./routes/periodRoutes'));
-
-// System Settings
-app.use('/api/settings', require('./routes/settingsRoutes'));
-
-// Opening Balances
-app.use('/api/opening-balances', require('./routes/openingBalanceRoutes'));
-
-// Audit Log (Module 8)
-app.use('/api/audit-logs', require('./routes/auditRoutes'));
-
-// Health check
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
-    message: 'Stock Management System API is running',
-    timestamp: new Date().toISOString()
-  });
-});
+app.use('/api', apiRouter);
+app.use('/api/v1', apiRouter);
 
 // Admin: Reset rate limit for IP (for testing)
 app.post('/admin/reset-rate-limit', async (req, res) => {
@@ -296,7 +255,8 @@ app.get('/', (req, res) => {
       '/api/reports',
       '/api/dashboard',
       '/api/exchange-rates',
-      '/health'
+      '/health',
+      '/api/health'
     ]
   });
 });

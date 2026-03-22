@@ -288,7 +288,8 @@ const invoiceSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true
+    required: false,
+    default: null
   },
   paidDate: Date,
   confirmedDate: {
@@ -411,16 +412,28 @@ const invoiceSchema = new mongoose.Schema({
 
 // Compound index for company + unique invoice number
 invoiceSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
-invoiceSchema.index({ company: 1 });
 
 // Performance indexes for reports
 invoiceSchema.index({ company: 1, status: 1 });
+invoiceSchema.index({ company: 1, status: 1, dueDate: 1 });
 invoiceSchema.index({ company: 1, paidDate: 1 });
 invoiceSchema.index({ company: 1, invoiceDate: 1 });
+invoiceSchema.index({ company: 1, client: 1, status: 1 });
 invoiceSchema.index({ 'payments.paidDate': 1 });
 invoiceSchema.index({ client: 1 });
 invoiceSchema.index({ createdBy: 1 });
 invoiceSchema.index({ quotation: 1 });
+
+invoiceSchema.pre('validate', function(next) {
+  if (this.dueDate && this.invoiceDate) {
+    const due = this.dueDate instanceof Date ? this.dueDate : new Date(this.dueDate);
+    const inv = this.invoiceDate instanceof Date ? this.invoiceDate : new Date(this.invoiceDate);
+    if (due.getTime() < inv.getTime()) {
+      this.invalidate('dueDate', 'Due date must be on or after invoice date');
+    }
+  }
+  next();
+});
 
 // Auto-generate invoice number - Module 6 format INV-YYYY-NNNNN
 invoiceSchema.pre('save', async function(next) {

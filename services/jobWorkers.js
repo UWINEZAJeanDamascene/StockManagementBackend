@@ -12,8 +12,9 @@ const Product = require('../models/Product');
 const Company = require('../models/Company');
 const RecurringInvoice = require('../models/RecurringInvoice');
 const emailService = require('./emailService');
-const reportController = require('../controllers/reportController');
+
 const { JOB_TYPES, isQueueAvailable } = require('./jobQueue');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 // Store worker references
 const workers = {};
@@ -101,7 +102,7 @@ async function precomputeBalanceSheet(companyId) {
     }}
   ];
   
-  const results = await Invoice.aggregate(pipeline);
+  const results = await aggregateWithTimeout(Invoice, pipeline, 'report');
   
   // Store pre-computed data in cache or dedicated collection
   // This can be used by reports instead of running full aggregation
@@ -130,7 +131,7 @@ async function precomputeProfitAndLoss(companyId) {
     }}
   ];
   
-  const results = await Invoice.aggregate(pipeline);
+  const results = await aggregateWithTimeout(Invoice, pipeline, 'report');
   return results[0];
 }
 
@@ -151,7 +152,7 @@ async function precomputeInventoryValuation(companyId) {
     }}
   ];
   
-  const results = await Product.aggregate(pipeline);
+  const results = await aggregateWithTimeout(Product, pipeline, 'report');
   return results[0] || { totalValue: 0, totalProducts: 0, totalStock: 0 };
 }
 
@@ -215,10 +216,10 @@ const monthlySummaryProcessor = async (job) => {
             company: company._id,
             createdAt: { $gte: monthStart }
           }),
-          totalRevenue: await Invoice.aggregate([
+          totalRevenue: await aggregateWithTimeout(Invoice, [
             { $match: { company: company._id, status: 'paid', paidDate: { $gte: monthStart } } },
             { $group: { _id: null, total: { $sum: '$grandTotal' } } }
-          ]),
+          ], 'report'),
           totalPurchases: await precomputeInventoryValuation(company._id)
         }
       };
@@ -298,44 +299,6 @@ const recurringInvoiceProcessor = async (job) => {
   return { success: true, invoiceId: invoice._id };
 };
 
-/**
- * Report Generation Worker
- */
-const reportGenerationProcessor = async (job) => {
-  const { companyId, reportType, params } = job.data;
-  console.log(`Generating report ${reportType} for company ${companyId}`);
-  
-  let result;
-  
-  switch (reportType) {
-    case 'balance-sheet':
-      result = await reportController.getBalanceSheet({ 
-        user: { company: { _id: companyId } },
-        query: params,
-        params: {}
-      }, { json: (r) => r }, (err) => { throw err; });
-      break;
-      
-    case 'profit-and-loss':
-      result = await reportController.getProfitAndLossReport({ 
-        user: { company: { _id: companyId } },
-        query: params
-      }, { json: (r) => r }, (err) => { throw err; });
-      break;
-      
-    case 'stock-valuation':
-      result = await reportController.getStockValuationReport({ 
-        user: { company: { _id: companyId } },
-        query: params
-      }, { json: (r) => r }, (err) => { throw err; });
-      break;
-      
-    default:
-      return { success: false, reason: 'Unknown report type' };
-  }
-  
-  return { success: true, reportType, generatedAt: new Date() };
-};
 
 /**
  * Email Worker
@@ -388,7 +351,6 @@ function initializeWorkers() {
           console.log(`Unknown background job: ${job.name}`);
       }
     });
-    workers.reports = createWorker('reports', reportGenerationProcessor);
     
     console.log('✅ All job workers initialized');
   } catch (error) {
@@ -423,6 +385,5 @@ module.exports = {
   dailySummaryProcessor,
   monthlySummaryProcessor,
   recurringInvoiceProcessor,
-  reportGenerationProcessor,
   emailProcessor
 };

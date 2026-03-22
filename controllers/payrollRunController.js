@@ -1,6 +1,7 @@
 const PayrollRunService = require('../services/payrollRunService');
 const PayrollRun = require('../models/PayrollRun');
 const Payroll = require('../models/Payroll');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // @desc    Get all payroll runs for company
 // @route   GET /api/payroll-runs
@@ -18,17 +19,22 @@ const getPayrollRuns = async (req, res, next) => {
       if (endDate) filter.payment_date.$lte = new Date(endDate);
     }
 
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await PayrollRun.countDocuments(filter);
     const payrollRuns = await PayrollRun.find(filter)
       .populate('bank_account_id', 'name accountCode')
       .populate('salary_account_id', 'name code')
       .populate('tax_payable_account_id', 'name code')
       .populate('posted_by', 'name')
-      .sort({ payment_date: -1 });
+      .sort({ payment_date: -1 })
+      .skip(skip)
+      .limit(limit);
 
     res.status(200).json({
       success: true,
       count: payrollRuns.length,
-      data: payrollRuns
+      data: payrollRuns,
+      pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
     next(error);

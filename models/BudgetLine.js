@@ -5,13 +5,11 @@ const budgetLineSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Company',
     required: true,
-    index: true
   },
   budget_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Budget',
     required: true,
-    index: true
   },
   account_id: {
     type: mongoose.Schema.Types.ObjectId,

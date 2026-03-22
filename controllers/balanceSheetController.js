@@ -1,4 +1,5 @@
 const BalanceSheetService = require('../services/balanceSheetService');
+const cacheService = require('../services/cacheService');
 
 /**
  * Balance Sheet Controller
@@ -22,12 +23,16 @@ const getBalanceSheet = async (req, res) => {
       });
     }
 
-    const report = await BalanceSheetService.generate(
-      req.companyId,
-      { asOfDate: as_of_date }
+    const cacheKey = { companyId: req.companyId, as_of_date };
+    const cfg = cacheService.getCacheConfig('report');
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () => BalanceSheetService.generate(req.companyId, { asOfDate: as_of_date }),
+      cacheKey,
+      { ttl: cfg.ttl, useCompanyPrefix: true }
     );
+    const report = { ...cached.data, from_cache: cached.fromCache };
 
-    // If not balanced — surface as warning not error
     if (!report.is_balanced) {
       report.warning = `Balance sheet is out of balance by ${report.difference}. ` +
         `Assets must equal Liabilities + Equity.`;

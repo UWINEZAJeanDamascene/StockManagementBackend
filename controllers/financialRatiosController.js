@@ -1,4 +1,5 @@
 const FinancialRatiosService = require('../services/financialRatiosService');
+const cacheService = require('../services/cacheService');
 
 /**
  * Financial Ratios Controller
@@ -24,13 +25,21 @@ const getFinancialRatios = async (req, res) => {
       });
     }
 
-    const ratios = await FinancialRatiosService.compute(companyId, {
-      asOfDate: as_of_date,
-      dateFrom: date_from,
-      dateTo: date_to
-    });
+    const cacheKey = { companyId, as_of_date, date_from, date_to };
+    const cfg = cacheService.getCacheConfig('financial_ratios');
+    const cached = await cacheService.fetchOrExecute(
+      'financial_ratios',
+      async () =>
+        FinancialRatiosService.compute(companyId, {
+          asOfDate: as_of_date,
+          dateFrom: date_from,
+          dateTo: date_to,
+        }),
+      cacheKey,
+      { ttl: cfg.ttl, useCompanyPrefix: true }
+    );
 
-    res.json(ratios);
+    res.json({ ...cached.data, from_cache: cached.fromCache });
   } catch (error) {
     console.error('Error computing financial ratios:', error);
     res.status(500).json({ 

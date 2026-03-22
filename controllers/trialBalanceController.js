@@ -1,4 +1,5 @@
 const TrialBalanceService = require('../services/trialBalanceService');
+const cacheService = require('../services/cacheService');
 
 /**
  * Trial Balance Controller
@@ -24,13 +25,17 @@ const getTrialBalance = async (req, res) => {
       });
     }
 
-    const report = await TrialBalanceService.generate(
-      req.companyId,
-      { dateFrom: date_from, dateTo: date_to }
+    const cacheKey = { companyId: req.companyId, date_from, date_to };
+    const cfg = cacheService.getCacheConfig('report');
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () =>
+        TrialBalanceService.generate(req.companyId, { dateFrom: date_from, dateTo: date_to }),
+      cacheKey,
+      { ttl: cfg.ttl, useCompanyPrefix: true }
     );
+    const report = { ...cached.data, from_cache: cached.fromCache };
 
-    // If not balanced — surface as warning not error
-    // The report still returns but flags the problem
     if (!report.is_balanced) {
       report.warning = `Trial balance is out of balance by ${report.difference}. ` +
         `Run GET /api/health/accounting to diagnose.`;

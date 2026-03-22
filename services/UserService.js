@@ -5,12 +5,13 @@
  * as per acceptance test specifications
  */
 
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const CompanyUser = require('../models/CompanyUser');
 const Company = require('../models/Company');
 const SessionService = require('./sessionService');
+const TokenService = require('./tokenService');
 const { notifyUserCreated, notifyPasswordChanged, notifyAccountLocked } = require('./notificationHelper');
 const ActionLog = require('../models/ActionLog');
 
@@ -18,46 +19,18 @@ const ActionLog = require('../models/ActionLog');
 if (!process.env.JWT_SECRET) {
   throw new Error('FATAL: JWT_SECRET environment variable is required. Please set it in your .env file.');
 }
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRE = process.env.JWT_EXPIRE || '1h';
-const REFRESH_TOKEN_EXPIRE = process.env.REFRESH_TOKEN_EXPIRE || '7d';
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOCK_DURATION_MINUTES = 30;
 const MIN_PASSWORD_LENGTH = 8;
 
-/**
- * Generate access token
- * Uses 'id' for backward compatibility with auth middleware
- */
-const generateAccessToken = (userId, memberships) => {
-  return jwt.sign(
-    { id: userId, userId, memberships },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRE }
-  );
-};
-
-/**
- * Generate refresh token
- */
-const generateRefreshToken = (userId) => {
-  return jwt.sign(
-    { userId, type: 'refresh' },
-    JWT_SECRET,
-    { expiresIn: REFRESH_TOKEN_EXPIRE }
-  );
-};
-
-/**
- * Verify refresh token
- */
-const verifyRefreshToken = (token) => {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch (err) {
-    return null;
+/** Bcrypt work comparable to real logins, so unknown-email failures do not return much faster than wrong-password. */
+let loginTimingDummyHash;
+function getLoginTimingDummyHash() {
+  if (!loginTimingDummyHash) {
+    loginTimingDummyHash = bcrypt.hashSync('__login_unknown_user_timing__', 12);
   }
-};
+  return loginTimingDummyHash;
+}
 
 /**
  * Generate password reset token
@@ -117,6 +90,7 @@ class UserService {
     const user = await User.findByEmail(email, companyId).select('+password');
     
     if (!user) {
+      await bcrypt.compare(password, getLoginTimingDummyHash());
       const error = new Error('INVALID_CREDENTIALS');
       error.code = 'INVALID_CREDENTIALS';
       throw error;
@@ -170,16 +144,25 @@ class UserService {
     // Update last login
     user.lastLogin = new Date();
     
-    // Generate tokens
-    const accessToken = generateAccessToken(user._id.toString(), [{
+    const memberships = [{
       companyId: user.company?.toString(),
       role: user.role
-    }]);
-    const refreshToken = generateRefreshToken(user._id.toString());
-    
-    // Save refresh token
-    user.refresh_token = refreshToken;
+    }];
+    const { access_token: accessToken, refresh_token: refreshToken } = TokenService.buildTokenPair(user, memberships);
     await user.save();
+
+    const companyIdStr = user.company?.toString() || null;
+    try {
+      await SessionService.createSession(
+        user._id.toString(),
+        companyIdStr,
+        user.role,
+        accessToken,
+        { email: user.email, name: user.name }
+      );
+    } catch (e) {
+      console.error('Session creation on login failed (tokens still issued):', e);
+    }
 
     return {
       access_token: accessToken,
@@ -197,31 +180,14 @@ class UserService {
    * @throws INVALID_REFRESH_TOKEN for expired or tampered token
    */
   static async refresh(refreshToken) {
-    // Verify refresh token
-    const decoded = verifyRefreshToken(refreshToken);
-    
-    if (!decoded || decoded.type !== 'refresh') {
-      const error = new Error('INVALID_REFRESH_TOKEN');
-      error.code = 'INVALID_REFRESH_TOKEN';
-      throw error;
-    }
+    return TokenService.refreshWithRotation(refreshToken);
+  }
 
-    // Find user and verify refresh token matches
-    const user = await User.findById(decoded.userId).select('+refresh_token');
-    
-    if (!user || user.refresh_token !== refreshToken) {
-      const error = new Error('INVALID_REFRESH_TOKEN');
-      error.code = 'INVALID_REFRESH_TOKEN';
-      throw error;
-    }
-
-    // Generate new access token
-    const accessToken = generateAccessToken(user._id.toString(), [{
-      companyId: user.company?.toString(),
-      role: user.role
-    }]);
-
-    return { access_token: accessToken };
+  /**
+   * Force logout from all devices — clears refresh token and all sessions for user.
+   */
+  static async forceLogoutAllSessions(userId) {
+    await TokenService.revokeAllForUser(userId);
   }
 
   /**
@@ -436,6 +402,7 @@ class UserService {
     // Don't allow password update through this method
     delete updateData.password;
     delete updateData.refresh_token;
+    delete updateData.refresh_token_hash;
     delete updateData.failed_login_attempts;
     delete updateData.locked_until;
 

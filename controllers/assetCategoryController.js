@@ -5,6 +5,7 @@
  */
 
 const AssetCategory = require('../models/AssetCategory');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // Get all categories for a company
 exports.getCategories = async (req, res) => {
@@ -17,12 +18,17 @@ exports.getCategories = async (req, res) => {
       query.isDeleted = false;
     }
 
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await AssetCategory.countDocuments(query);
     const categories = await AssetCategory.find(query)
-      .sort({ isSystem: -1, name: 1 });
+      .sort({ isSystem: -1, name: 1 })
+      .skip(skip)
+      .limit(limit);
 
     res.json({
       success: true,
-      data: categories
+      data: categories,
+      pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
     console.error('Error getting asset categories:', error);

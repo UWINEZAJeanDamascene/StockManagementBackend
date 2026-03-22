@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 const Company = require('../models/Company');
 const PLStatementService = require('./plStatementService');
 
@@ -27,7 +28,7 @@ class BalanceSheetService {
 
     // Get all account balances up to asOfDate
     // Using embedded lines approach with $unwind
-    const accountBalances = await JournalEntry.aggregate([
+    const accountBalances = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),

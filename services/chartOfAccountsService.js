@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 /**
  * Chart of Accounts Service
@@ -25,7 +26,7 @@ class ChartOfAccountsService {
     if (!account) throw new Error('ACCOUNT_NOT_FOUND');
 
     // Aggregate using embedded lines
-    const result = await JournalEntry.aggregate([
+    const result = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),

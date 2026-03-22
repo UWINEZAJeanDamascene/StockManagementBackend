@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 const ChartOfAccountsService = require('./chartOfAccountsService');
 
 /**
@@ -41,7 +42,7 @@ class GeneralLedgerService {
 
     // Get all posted journal lines for this account in the period
     // Using embedded lines approach with $unwind
-    const lines = await JournalEntry.aggregate([
+    const lines = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
@@ -266,7 +267,7 @@ class GeneralLedgerService {
       }
     );
 
-    return JournalEntry.aggregate(pipeline);
+    return aggregateWithTimeout(JournalEntry, pipeline, 'report');
   }
 }
 

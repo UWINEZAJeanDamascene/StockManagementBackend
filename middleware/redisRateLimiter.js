@@ -152,20 +152,24 @@ const createRateLimiter = (options = {}) => {
 
       // Check if rate limit exceeded
       if (current > effectiveMax) {
-        // Call custom handler if provided
+        const meta = {
+          retryAfter: ttl,
+          limit: effectiveMax,
+          reset: Math.ceil(Date.now() / 1000 + ttl),
+        };
         if (handler) {
-          return handler(req, res);
+          return handler(req, res, meta);
         }
 
-        // Default handler
         return res.status(429).json({
           success: false,
           message: 'Too many requests, please try again later',
-          retryAfter: ttl,
+          code: 'RATE_LIMIT_EXCEEDED',
+          retry_after: ttl,
           rateLimit: {
             limit: effectiveMax,
             remaining: 0,
-            reset: Math.ceil(Date.now() / 1000 + ttl),
+            reset: meta.reset,
           },
         });
       }
@@ -201,16 +205,24 @@ const createRateLimiter = (options = {}) => {
  */
 const createRateLimiters = () => {
   return {
-    // Strict limiter for authentication routes
+    // Strict limiter for authentication routes (IP + login email so shared IPs are not over-throttled)
     auth: createRateLimiter({
       windowMs: 15 * 60 * 1000, // 15 minutes
       max: 10, // 10 attempts
       keyPrefix: 'ratelimit:auth',
-      limitBy: 'ip',
-      handler: (req, res) => {
+      keyGenerator: (req) => {
+        const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+        const raw =
+          req.body && typeof req.body.email === 'string' ? req.body.email : '';
+        const email = raw.toLowerCase().trim();
+        return `${ip}:${email}`;
+      },
+      handler: (req, res, meta = {}) => {
         res.status(429).json({
           success: false,
+          code: 'RATE_LIMIT_EXCEEDED',
           message: 'Too many authentication attempts, please try again later',
+          retry_after: meta.retryAfter ?? 0,
         });
       },
     }),

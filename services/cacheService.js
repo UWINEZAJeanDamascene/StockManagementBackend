@@ -18,8 +18,12 @@ const CACHE_CONFIGS = {
   dashboard: { ttl: 60, prefix: 'dashboard' },
   // Stock levels - 1 minute
   stock: { ttl: 60, prefix: 'stock' },
-  // Reports - 15 minutes (expensive queries)
+  // Reports - 15 minutes (expensive queries); override with FINANCIAL_REPORT_CACHE_TTL_SECONDS
   report: { ttl: 900, prefix: 'report' },
+  // Financial ratios API — 5 minutes (dashboard widget uses in-memory cache separately)
+  financial_ratios: { ttl: 300, prefix: 'financial_ratios' },
+  general_ledger: { ttl: 60, prefix: 'general_ledger' },
+  general_ledger_summary: { ttl: 60, prefix: 'general_ledger_summary' },
   // Default
   default: { ttl: DEFAULT_TTL, prefix: 'default' },
 };
@@ -74,9 +78,21 @@ class CacheService {
    * @param {string} prefix - Cache key prefix
    * @param {Object} params - Query parameters
    */
-  generateKey(prefix, params) {
+  /**
+   * Keys include company id so invalidateByCompany can delete `prefix:companyId:*` without scanning hashes.
+   */
+  generateKey(prefix, params = {}) {
     const paramString = JSON.stringify(params);
     const hash = this.hashString(paramString);
+    const cid =
+      params.companyId != null
+        ? String(params.companyId)
+        : params.company != null
+          ? String(params.company)
+          : null;
+    if (cid && cid !== 'undefined') {
+      return `${CACHE_PREFIX}${prefix}:${cid}:${hash}`;
+    }
     return `${CACHE_PREFIX}${prefix}:${hash}`;
   }
 
@@ -99,7 +115,25 @@ class CacheService {
    * @param {string} type - Model type
    */
   getCacheConfig(type) {
-    return CACHE_CONFIGS[type] || CACHE_CONFIGS.default;
+    const base = CACHE_CONFIGS[type] || CACHE_CONFIGS.default;
+    if (type === 'report') {
+      const ttl = parseInt(
+        process.env.FINANCIAL_REPORT_CACHE_TTL_SECONDS || String(CACHE_CONFIGS.report.ttl),
+        10
+      );
+      return { ...base, ttl: Number.isFinite(ttl) && ttl > 0 ? ttl : CACHE_CONFIGS.report.ttl };
+    }
+    if (type === 'financial_ratios') {
+      const ttl = parseInt(
+        process.env.FINANCIAL_RATIOS_CACHE_TTL_SECONDS || String(CACHE_CONFIGS.financial_ratios.ttl),
+        10
+      );
+      return {
+        ...base,
+        ttl: Number.isFinite(ttl) && ttl > 0 ? ttl : CACHE_CONFIGS.financial_ratios.ttl,
+      };
+    }
+    return base;
   }
 
   /**
@@ -236,23 +270,46 @@ class CacheService {
    * @param {string} type - Cache type
    */
   async invalidateByCompany(companyId, type = null) {
+    const cid = String(companyId);
     if (type) {
-      // Invalidate specific type for company
       const config = this.getCacheConfig(type);
-      const pattern = `*${companyId}*`;
-      return await this.deletePattern(`${CACHE_PREFIX}${config.prefix}:*${pattern}`);
+      return await this.deletePattern(`${CACHE_PREFIX}${config.prefix}:${cid}:*`);
     }
 
-    // Invalidate all cache for company
-    const patterns = Object.values(CACHE_CONFIGS).map(c => 
-      `${CACHE_PREFIX}${c.prefix}:*${companyId}*`
-    );
-    
+    const seen = new Set();
     let totalDeleted = 0;
-    for (const pattern of patterns) {
-      totalDeleted += await this.deletePattern(pattern);
+    for (const c of Object.values(CACHE_CONFIGS)) {
+      if (!c || !c.prefix || seen.has(c.prefix)) continue;
+      seen.add(c.prefix);
+      totalDeleted += await this.deletePattern(`${CACHE_PREFIX}${c.prefix}:${cid}:*`);
     }
     return totalDeleted;
+  }
+
+  /** Trial balance, P&L, GL, ratios, etc. — Redis keys invalidated after journal post */
+  async invalidateFinancialReportCaches(companyId) {
+    let total = 0;
+    for (const t of ['report', 'financial_ratios', 'general_ledger', 'general_ledger_summary']) {
+      total += await this.invalidateByCompany(companyId, t);
+    }
+    return total;
+  }
+
+  /**
+   * Redis financial/report keys + in-memory dashboard cache (executive, sales, inventory, …)
+   */
+  async bumpCompanyFinancialCaches(companyId) {
+    try {
+      await this.invalidateFinancialReportCaches(companyId);
+    } catch (e) {
+      console.error('Financial cache invalidation failed:', e);
+    }
+    try {
+      const dashboardCache = require('./DashboardCacheService');
+      dashboardCache.invalidate(companyId);
+    } catch (e) {
+      console.error('Dashboard cache invalidation failed:', e);
+    }
   }
 
   /**

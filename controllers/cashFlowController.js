@@ -1,4 +1,5 @@
 const CashFlowService = require('../services/cashFlowService');
+const cacheService = require('../services/cacheService');
 
 /**
  * Cash Flow Controller
@@ -22,12 +23,17 @@ const getCashFlow = async (req, res) => {
       });
     }
 
-    const report = await CashFlowService.generate(
-      req.companyId,
-      { dateFrom: date_from, dateTo: date_to }
+    const cacheKey = { companyId: req.companyId, date_from, date_to };
+    const cfg = cacheService.getCacheConfig('report');
+    const cached = await cacheService.fetchOrExecute(
+      'report',
+      async () =>
+        CashFlowService.generate(req.companyId, { dateFrom: date_from, dateTo: date_to }),
+      cacheKey,
+      { ttl: cfg.ttl, useCompanyPrefix: true }
     );
+    const report = { ...cached.data, from_cache: cached.fromCache };
 
-    // If not reconciled — surface as warning
     if (!report.is_reconciled) {
       report.warning = `Cash flow is not reconciled. Difference: ${report.reconciliation_diff}.`;
     }

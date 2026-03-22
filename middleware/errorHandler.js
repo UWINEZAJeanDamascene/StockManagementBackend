@@ -1,45 +1,76 @@
 const errorHandler = (err, req, res, next) => {
-  let error = { ...err };
-  error.message = err.message;
+  const isProd = process.env.NODE_ENV === 'production';
+  const exposeStack = process.env.NODE_ENV !== 'production';
 
-  // Log to console for dev
-  console.error(err);
+  if (exposeStack) {
+    console.error(err);
+  }
 
-  // Mongoose bad ObjectId
+  let statusCode = err.statusCode || err.status || 500;
+  let message = err.message || 'Server Error';
+  let code = err.code;
+
   if (err.name === 'CastError') {
-    const message = 'Resource not found';
-    error = { message, statusCode: 404 };
+    statusCode = 422;
+    message = 'Invalid id';
+    code = 'INVALID_ID';
+  } else if (err.code === 11000) {
+    const field = Object.keys(err.keyValue || {})[0] || 'field';
+    statusCode = 409;
+    message = `Duplicate field value: ${field}. Please use another value`;
+    code = 'DUPLICATE_KEY';
+  } else if (err.name === 'ValidationError') {
+    statusCode = 400;
+    message = Object.values(err.errors || {}).map((v) => v.message).join(', ');
+    code = 'VALIDATION_ERROR';
+  } else if (err.name === 'JsonWebTokenError') {
+    statusCode = 401;
+    message = 'Invalid token';
+    code = 'INVALID_TOKEN';
+  } else if (err.name === 'TokenExpiredError') {
+    statusCode = 401;
+    message = 'Token expired';
+    code = 'TOKEN_EXPIRED';
+  } else if (err.code === 'PERIOD_CLOSED') {
+    statusCode = 409;
+    code = 'PERIOD_CLOSED';
+    message = err.message || 'Accounting period is closed';
+  } else if (err.code === 'INSUFFICIENT_STOCK') {
+    statusCode = 409;
+    code = 'INSUFFICIENT_STOCK';
+    message = err.message || 'Insufficient stock';
+  } else if (err.code === 'NOT_FOUND') {
+    statusCode = 404;
+    code = 'NOT_FOUND';
+    message = err.message || 'Resource not found';
+  } else if (err.code === 50 || err.codeName === 'MaxTimeMSExpired') {
+    statusCode = 503;
+    code = 'QUERY_TIMEOUT';
+    message = err.message || 'Query timed out';
+    if (req && req.method && req.path) {
+      console.warn(`[QUERY_TIMEOUT] ${req.method} ${req.path}`);
+    }
   }
 
-  // Mongoose duplicate key
-  if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    const message = `Duplicate field value: ${field}. Please use another value`;
-    error = { message, statusCode: 400 };
+  if (!code) {
+    code = statusCode === 404 ? 'NOT_FOUND' : 'INTERNAL_ERROR';
   }
 
-  // Mongoose validation error
-  if (err.name === 'ValidationError') {
-    const message = Object.values(err.errors).map(val => val.message).join(', ');
-    error = { message, statusCode: 400 };
+  if (isProd && statusCode === 500 && code === 'INTERNAL_ERROR') {
+    message = 'An unexpected error occurred';
   }
 
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    const message = 'Invalid token';
-    error = { message, statusCode: 401 };
-  }
-
-  if (err.name === 'TokenExpiredError') {
-    const message = 'Token expired';
-    error = { message, statusCode: 401 };
-  }
-
-  res.status(error.statusCode || 500).json({
+  const payload = {
     success: false,
-    message: error.message || 'Server Error',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
-  });
+    message,
+    code,
+  };
+
+  if (exposeStack && err.stack) {
+    payload.stack = err.stack;
+  }
+
+  res.status(statusCode).json(payload);
 };
 
 module.exports = errorHandler;

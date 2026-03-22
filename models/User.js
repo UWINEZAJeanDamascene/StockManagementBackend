@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const passwordUtils = require('../utils/passwordUtils');
 
 // Error codes for user operations
 const USER_ERRORS = {
@@ -32,8 +33,13 @@ const userSchema = new mongoose.Schema({
     minlength: 6,
     select: false
   },
-  // Refresh token for JWT refresh
+  // Legacy plain refresh (migrated to refresh_token_hash only)
   refresh_token: {
+    type: String,
+    select: false,
+    default: null
+  },
+  refresh_token_hash: {
     type: String,
     select: false,
     default: null
@@ -118,10 +124,14 @@ userSchema.index({ passwordResetToken: 1 });
 // Hash password before saving
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) {
-    next();
+    return next();
   }
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+  try {
+    this.password = await passwordUtils.hash(this.password);
+    return next();
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // Compare password
@@ -137,6 +147,12 @@ userSchema.methods.isLocked = function() {
 
 // Increment failed login attempts and optionally lock
 userSchema.methods.incrementFailedLoginAttempts = async function(maxAttempts = 5, lockDurationMinutes = 30) {
+  // Check if lock has expired - reset counter if so
+  if (this.locked_until && new Date() >= this.locked_until) {
+    this.failed_login_attempts = 0;
+    this.locked_until = null;
+  }
+  
   this.failed_login_attempts += 1;
   
   if (this.failed_login_attempts >= maxAttempts) {
@@ -158,6 +174,7 @@ userSchema.methods.toJSON = function() {
   const obj = this.toObject();
   delete obj.password;
   delete obj.refresh_token;
+  delete obj.refresh_token_hash;
   delete obj.passwordResetToken;
   delete obj.passwordResetExpires;
   delete obj.twoFASecret;

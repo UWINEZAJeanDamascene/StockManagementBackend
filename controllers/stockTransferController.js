@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 const StockTransfer = require('../models/StockTransfer');
 const StockTransferLine = require('../models/StockTransferLine');
 const stockTransferService = require('../services/stockTransferService');
@@ -55,8 +56,19 @@ exports.list = async (req, res, next) => {
     if (req.query.date_from || req.query.date_to) q.transferDate = {};
     if (req.query.date_from) q.transferDate.$gte = new Date(req.query.date_from);
     if (req.query.date_to) q.transferDate.$lte = new Date(req.query.date_to);
-    const transfers = await StockTransfer.find(q).populate('items').sort({ transferDate: -1 }).limit(200);
-    res.json({ success: true, count: transfers.length, data: transfers });
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await StockTransfer.countDocuments(q);
+    const transfers = await StockTransfer.find(q)
+      .populate('items')
+      .sort({ transferDate: -1 })
+      .skip(skip)
+      .limit(limit);
+    res.json({
+      success: true,
+      count: transfers.length,
+      data: transfers,
+      pagination: paginationMeta(page, limit, total),
+    });
   } catch (err) { next(err); }
 };
 
@@ -82,14 +94,7 @@ const { runInTransaction } = require('../services/transactionService');
 exports.getStockTransfers = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      page = 1, 
-      limit = 20, 
-      status, 
-      fromWarehouse, 
-      toWarehouse,
-      search 
-    } = req.query;
+    const { status, fromWarehouse, toWarehouse, search } = req.query;
 
     const query = { company: companyId };
 
@@ -97,6 +102,7 @@ exports.getStockTransfers = async (req, res, next) => {
     if (fromWarehouse) query.fromWarehouse = fromWarehouse;
     if (toWarehouse) query.toWarehouse = toWarehouse;
 
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });
     const total = await StockTransfer.countDocuments(query);
     const transfers = await StockTransfer.find(query)
       .populate('fromWarehouse', 'name code')
@@ -105,14 +111,15 @@ exports.getStockTransfers = async (req, res, next) => {
       .populate('approvedBy', 'name')
       .populate('receivedBy', 'name')
       .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .skip(skip)
+      .limit(limit);
 
     res.json({
       success: true,
       count: transfers.length,
       total,
-      pages: Math.ceil(total / limit),
+      pagination: paginationMeta(page, limit, total),
+      pages: Math.ceil(total / limit) || 0,
       currentPage: page,
       data: transfers
     });

@@ -1,23 +1,21 @@
 const express = require('express');
 const router = express.Router();
 const {
-  getExchangeRates,
-  getCurrencies,
-  convertCurrency,
-  getExchangeRateHistory,
-  manualUpdateRate
+  addRate,
+  listRates,
+  getCurrentRate,
+  convert
 } = require('../controllers/exchangeRateController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 
-// Public routes - no authentication required for exchange rates
-router.get('/', getExchangeRates);
-router.get('/currencies', getCurrencies);
-router.post('/convert', convertCurrency);
+router.use(protect);
 
-// Protected routes
-router.get('/history', protect, getExchangeRateHistory);
+// Spec endpoints
+router.get('/', listRates);
+router.post('/', addRate);
+router.get('/current/:currency', getCurrentRate);
 
-// Admin only routes
-router.put('/manual', protect, authorize('admin'), manualUpdateRate);
+// Internal / convert
+router.post('/convert', convert);
 
 module.exports = router;

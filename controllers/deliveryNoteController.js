@@ -804,6 +804,13 @@ exports.confirmDelivery = async (req, res, next) => {
 
     await deliveryNote.populate('lines.product warehouse createdBy confirmedBy invoice');
 
+    try {
+      const cacheService = require('../services/cacheService');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+    } catch (e) {
+      console.error('Cache bump after delivery confirm failed:', e);
+    }
+
     res.json({
       success: true,
       message: 'Delivery note confirmed successfully',

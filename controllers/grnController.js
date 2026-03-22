@@ -9,6 +9,7 @@ const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const JournalService = require('../services/journalService');
 const transactionService = require('../services/transactionService');
+const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 
 // Create GRN (simple create against approved PO)
@@ -323,6 +324,11 @@ exports.confirmGRN = async (req, res, next) => {
 
   try {
     const result = await transactionService.runInTransaction(async (trx) => await runConfirm(trx));
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+    } catch (e) {
+      console.error('Cache bump after GRN confirm failed:', e);
+    }
     res.json({ success: true, message: 'GRN confirmed', data: await GoodsReceivedNote.findById(result._id) });
   } catch (err) {
     if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });

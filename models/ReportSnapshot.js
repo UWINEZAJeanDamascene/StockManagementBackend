@@ -173,8 +173,8 @@ const reportSnapshotSchema = new mongoose.Schema({
   // Snapshot metadata
   generatedAt: {
     type: Date,
-    default: Date.now,
-    index: true
+    default: Date.now
+    // Index removed - defined separately below with TTL
   },
   generatedBy: {
     type: mongoose.Schema.Types.ObjectId,

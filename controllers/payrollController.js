@@ -1,6 +1,7 @@
 const Payroll = require('../models/Payroll');
 const User = require('../models/User');
 const JournalService = require('../services/journalService');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // @desc    Get all payroll records for a company
 // @route   GET /api/payroll
@@ -28,29 +29,52 @@ exports.getPayrollRecords = async (req, res, next) => {
         { 'employee.employeeId': { $regex: search, $options: 'i' } }
       ];
     }
-    
-    const payrollRecords = await Payroll.find(query)
-      .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email')
-      .sort({ 'period.year': -1, 'period.month': -1, 'employee.lastName': 1 });
-    
-    // Calculate summary
-    const totalGross = payrollRecords.reduce((sum, p) => sum + (p.salary.grossSalary || 0), 0);
-    const totalNet = payrollRecords.reduce((sum, p) => sum + (p.netPay || 0), 0);
-    const totalPAYE = payrollRecords.reduce((sum, p) => sum + (p.deductions.paye || 0), 0);
-    const totalRSSBEmployee = payrollRecords.reduce((sum, p) => sum + ((p.deductions.rssbEmployeePension || 0) + (p.deductions.rssbEmployeeMaternity || 0)), 0);
-    
+
+    const { page, limit, skip } = parsePagination(req.query);
+    const [total, summaryAgg, payrollRecords] = await Promise.all([
+      Payroll.countDocuments(query),
+      Payroll.aggregate([
+        { $match: query },
+        {
+          $group: {
+            _id: null,
+            totalGrossSalary: { $sum: { $ifNull: ['$salary.grossSalary', 0] } },
+            totalNetPay: { $sum: { $ifNull: ['$netPay', 0] } },
+            totalPAYE: { $sum: { $ifNull: ['$deductions.paye', 0] } },
+            totalRSSB: {
+              $sum: {
+                $add: [
+                  { $ifNull: ['$deductions.rssbEmployeePension', 0] },
+                  { $ifNull: ['$deductions.rssbEmployeeMaternity', 0] },
+                ],
+              },
+            },
+            employeeCount: { $sum: 1 },
+          },
+        },
+      ]),
+      Payroll.find(query)
+        .populate('createdBy', 'name email')
+        .populate('approvedBy', 'name email')
+        .sort({ 'period.year': -1, 'period.month': -1, 'employee.lastName': 1 })
+        .skip(skip)
+        .limit(limit),
+    ]);
+
+    const s = summaryAgg[0] || {};
+
     res.json({
       success: true,
       count: payrollRecords.length,
       data: payrollRecords,
+      pagination: paginationMeta(page, limit, total),
       summary: {
-        totalGrossSalary: Math.round(totalGross * 100) / 100,
-        totalNetPay: Math.round(totalNet * 100) / 100,
-        totalPAYE: Math.round(totalPAYE * 100) / 100,
-        totalRSSB: Math.round(totalRSSBEmployee * 100) / 100,
-        employeeCount: payrollRecords.length
-      }
+        totalGrossSalary: Math.round((s.totalGrossSalary || 0) * 100) / 100,
+        totalNetPay: Math.round((s.totalNetPay || 0) * 100) / 100,
+        totalPAYE: Math.round((s.totalPAYE || 0) * 100) / 100,
+        totalRSSB: Math.round((s.totalRSSB || 0) * 100) / 100,
+        employeeCount: s.employeeCount || 0,
+      },
     });
   } catch (error) {
     next(error);

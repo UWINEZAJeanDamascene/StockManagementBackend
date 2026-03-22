@@ -17,7 +17,6 @@ const companySchema = new mongoose.Schema({
   code: {
     type:      String,
     required:  false, // Made optional with default for backward compatibility
-    unique:    true,
     uppercase: true,
     trim:      true,
     default:  function() {
@@ -153,6 +152,6 @@ const companySchema = new mongoose.Schema({
 });
 
 companySchema.index({ code: 1 }, { unique: true });
-companySchema.index({ is_active: 1 });
+companySchema.index({ isActive: 1 });
 
 module.exports = mongoose.model('Company', companySchema);

@@ -7,6 +7,7 @@ const bwipjs = require('bwip-js');
 const QRCode = require('qrcode');
 const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
 const cacheService = require('../services/cacheService');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // @desc    Get all products
 // @route   GET /api/products
@@ -14,8 +15,6 @@ const cacheService = require('../services/cacheService');
 exports.getProducts = async (req, res, next) => {
   try {
     const { 
-      page = 1, 
-      limit = 20, 
       search, 
       category, 
       supplier,
@@ -24,6 +23,8 @@ exports.getProducts = async (req, res, next) => {
       sortBy = 'createdAt',
       order = 'desc'
     } = req.query;
+
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });
 
     // Multi-tenancy: Filter by company
     const companyId = req.user.company._id;
@@ -72,14 +73,15 @@ exports.getProducts = async (req, res, next) => {
       .populate('supplier', 'name code')
       .populate('createdBy', 'name email')
       .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .skip(skip)
+      .limit(limit);
 
     res.json({
       success: true,
       count: products.length,
       total,
-      pages: Math.ceil(total / limit),
+      pagination: paginationMeta(page, limit, total),
+      pages: Math.ceil(total / limit) || 0,
       currentPage: page,
       data: products
     });

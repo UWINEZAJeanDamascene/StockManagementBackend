@@ -111,8 +111,9 @@ exports.login = async (req, res, next) => {
 };
 
 /**
- * Refresh token
+ * Refresh access token (refresh token rotation)
  * POST /api/auth/refresh
+ * Returns new access_token and new refresh_token; previous refresh_token is invalidated server-side.
  */
 exports.refresh = async (req, res, next) => {
   try {
@@ -129,14 +130,22 @@ exports.refresh = async (req, res, next) => {
 
     res.json({
       success: true,
-      access_token: result.access_token
+      access_token: result.access_token,
+      refresh_token: result.refresh_token,
     });
   } catch (error) {
+    if (error.code === 'REFRESH_TOKEN_EXPIRED') {
+      return res.status(401).json({
+        success: false,
+        message: 'Refresh token expired',
+        code: 'REFRESH_TOKEN_EXPIRED',
+      });
+    }
     if (error.code === 'INVALID_REFRESH_TOKEN') {
       return res.status(401).json({
         success: false,
         message: 'Invalid or expired refresh token',
-        code: 'INVALID_REFRESH_TOKEN'
+        code: 'INVALID_REFRESH_TOKEN',
       });
     }
     next(error);
@@ -317,7 +326,7 @@ exports.getMe = async (req, res, next) => {
 exports.logout = async (req, res, next) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
-    
+
     if (req.user) {
       await sessionService.deleteSession(req.user.id, token);
       if (token) {
@@ -328,6 +337,23 @@ exports.logout = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Logged out successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Force logout from all devices
+ * POST /api/auth/logout-all
+ */
+exports.logoutAll = async (req, res, next) => {
+  try {
+    await UserService.forceLogoutAllSessions(req.user.id);
+
+    res.json({
+      success: true,
+      message: 'Logged out from all devices'
     });
   } catch (error) {
     next(error);

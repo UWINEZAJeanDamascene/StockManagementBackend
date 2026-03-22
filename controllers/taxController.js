@@ -6,6 +6,7 @@ const Payroll = require('../models/Payroll');
 const mongoose = require('mongoose');
 const JournalService = require('../services/journalService');
 const TaxService = require('../services/taxService');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // =====================================================
 // TAX RATE CONFIGURATION (Module 9: Taxes)
@@ -160,14 +161,19 @@ exports.getTaxRecords = async (req, res) => {
     if (taxType) query.taxType = taxType;
     if (status) query.status = status;
     
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await Tax.countDocuments(query);
     const taxes = await Tax.find(query)
       .sort({ createdAt: -1 })
-      .populate('createdBy', 'name email');
+      .populate('createdBy', 'name email')
+      .skip(skip)
+      .limit(limit);
     
     res.json({
       success: true,
       data: taxes,
-      count: taxes.length
+      count: taxes.length,
+      pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 // Bank Statement Line Schema (for reconciliation)
 const bankStatementLineSchema = new mongoose.Schema({
@@ -285,7 +286,8 @@ const bankAccountSchema = new mongoose.Schema({
   // Opening balance date
   openingBalanceDate: {
     type: Date,
-    required: true
+    required: true,
+    default: Date.now
   },
   
   // Is active
@@ -560,7 +562,7 @@ bankAccountSchema.methods.getBalance = async function(JournalEntry, asOfDate) {
     date: dateQuery
   };
 
-  const agg = await JournalEntry.aggregate([
+  const agg = await aggregateWithTimeout(JournalEntry, [
     { $match: matchStage },
     { $unwind: '$lines' },
     { $match: { 'lines.accountCode': ledgerAccountId } },
@@ -570,7 +572,7 @@ bankAccountSchema.methods.getBalance = async function(JournalEntry, asOfDate) {
       totalCredits: { $sum: { $toDouble: { $ifNull: [ '$lines.credit', 0 ] } } },
       journalCount: { $sum: 1 }
     } }
-  ]).allowDiskUse(true);
+  ], 'report').allowDiskUse(true);
 
   let totalDebits = 0;
   let totalCredits = 0;
@@ -605,14 +607,15 @@ bankAccountSchema.methods.getBalance = async function(JournalEntry, asOfDate) {
 
 // Create models
 const BankAccount = mongoose.model('BankAccount', bankAccountSchema);
-const BankTransaction = mongoose.model('BankTransaction', bankTransactionSchema);
-const BankStatementLine = mongoose.model('BankStatementLine', bankStatementLineSchema);
-const BankReconciliationMatch = mongoose.model('BankReconciliationMatch', bankReconciliationMatchSchema);
+mongoose.model('BankTransaction', bankTransactionSchema);
+mongoose.model('BankStatementLine', bankStatementLineSchema);
+mongoose.model('BankReconciliationMatch', bankReconciliationMatchSchema);
 
-// Export all models
-module.exports = {
-  BankAccount,
-  BankTransaction,
-  BankStatementLine,
-  BankReconciliationMatch
-};
+// Export BankAccount as the module default (consistent with other models)
+// Also attach related models as properties so callers can destructure:
+// const { BankAccount, BankTransaction, BankStatementLine, BankReconciliationMatch } = require('../models/BankAccount')
+module.exports = BankAccount;
+module.exports.BankAccount = BankAccount;
+module.exports.BankTransaction = mongoose.model('BankTransaction');
+module.exports.BankStatementLine = mongoose.model('BankStatementLine');
+module.exports.BankReconciliationMatch = mongoose.model('BankReconciliationMatch');

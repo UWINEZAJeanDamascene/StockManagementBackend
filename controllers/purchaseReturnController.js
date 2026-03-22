@@ -8,6 +8,7 @@ const JournalService = require('../services/journalService');
 const transactionService = require('../services/transactionService');
 const PurchaseOrder = require('../models/PurchaseOrder');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 exports.createPurchaseReturn = async (req, res, next) => {
   try {
@@ -238,8 +239,18 @@ exports.listPurchaseReturns = async (req, res, next) => {
     if (date_from) q.returnDate.$gte = new Date(date_from);
     if (date_to) q.returnDate.$lte = new Date(date_to);
 
-    const list = await PurchaseReturn.find(q).sort({ createdAt: -1 }).limit(200);
-    res.json({ success: true, data: list });
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await PurchaseReturn.countDocuments(q);
+    const list = await PurchaseReturn.find(q)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      data: list,
+      pagination: paginationMeta(page, limit, total),
+    });
   } catch (err) { next(err); }
 };
 

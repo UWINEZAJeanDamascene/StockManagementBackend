@@ -5,6 +5,15 @@ const StockMovement = require('../models/StockMovement');
 const Client = require('../models/Client');
 const ActionLog = require('../models/ActionLog');
 const CreditNote = require('../models/CreditNote');
+const InventoryDashboardService = require('../services/dashboards/InventoryDashboardService');
+const PeriodComparisonService = require('../services/dashboards/PeriodComparisonService');
+const RatiosWidgetService = require('../services/dashboards/RatiosWidgetService');
+const FinanceDashboardService = require('../services/dashboards/FinanceDashboardService');
+const PurchaseDashboardService = require('../services/dashboards/PurchaseDashboardService');
+const SalesDashboardService = require('../services/dashboards/SalesDashboardService');
+const ExecutiveDashboardService = require('../services/dashboards/ExecutiveDashboardService');
+const mongoose = require('mongoose');
+const { parsePagination, paginationMeta, MAX_LIMIT } = require('../utils/pagination');
 
 // @desc    Get dashboard statistics
 // @route   GET /api/dashboard/stats
@@ -20,17 +29,36 @@ exports.getDashboardStats = async (req, res, next) => {
     }
 
     const companyId = req.user.company._id;
+    const companyOid = mongoose.Types.ObjectId.isValid(companyId)
+      ? new mongoose.Types.ObjectId(companyId)
+      : companyId;
     const today = new Date();
     const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
     const startOfYear = new Date(today.getFullYear(), 0, 1);
 
     // Product stats
     const totalProducts = await Product.countDocuments({ company: companyId, isArchived: false });
-    
-    // Get all non-archived products and calculate low stock in JavaScript
-    const allProducts = await Product.find({ company: companyId, isArchived: false });
-    const lowStockProducts = allProducts.filter(p => p.currentStock <= p.lowStockThreshold).length;
-    const outOfStockProducts = allProducts.filter(p => p.currentStock === 0).length;
+
+    const [lowStockProducts, outOfStockProducts, stockValAgg] = await Promise.all([
+      Product.countDocuments({
+        company: companyId,
+        isArchived: false,
+        currentStock: { $gt: 0 },
+        $expr: { $lte: ['$currentStock', '$lowStockThreshold'] },
+      }),
+      Product.countDocuments({ company: companyId, isArchived: false, currentStock: 0 }),
+      Product.aggregate([
+        { $match: { company: companyOid, isArchived: false } },
+        {
+          $group: {
+            _id: null,
+            totalValue: { $sum: { $multiply: [{ $ifNull: ['$currentStock', 0] }, { $ifNull: ['$averageCost', 0] }] } },
+          },
+        },
+      ]),
+    ]);
+
+    const totalStockValue = stockValAgg[0]?.totalValue || 0;
 
     // Previous month product stats for comparison
     const startOfLastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
@@ -47,12 +75,6 @@ exports.getDashboardStats = async (req, res, next) => {
       isActive: true,
       createdAt: { $lte: endOfLastMonth }
     });
-
-    // Calculate total stock value (reuse allProducts)
-    const totalStockValue = allProducts.reduce(
-      (sum, product) => sum + (product.currentStock * product.averageCost),
-      0
-    );
 
     // Invoice stats
     const totalInvoices = await Invoice.countDocuments({ company: companyId });
@@ -431,6 +453,175 @@ exports.getStockMovementChart = async (req, res, next) => {
     res.json({
       success: true,
       data: formattedStockData
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get inventory dashboard data
+// @route   GET /api/dashboard/inventory
+// @access  Private
+exports.getInventoryDashboard = async (req, res, next) => {
+  try {
+    // Check if user is platform admin
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const inventoryData = await InventoryDashboardService.get(companyId);
+    
+    res.json({
+      success: true,
+      data: inventoryData
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Period comparison (this month vs last month vs same month last year)
+// @route   GET /api/dashboard/period-comparison
+// @access  Private
+exports.getPeriodComparison = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await PeriodComparisonService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Executive dashboard (revenue, expenses, profit, cash, AR, recent journals)
+// @route   GET /api/dashboard/executive
+// @access  Private
+exports.getExecutiveDashboard = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await ExecutiveDashboardService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Finance dashboard (banks, AP due, budget vs actual, tax, cash flow)
+// @route   GET /api/dashboard/finance
+// @access  Private
+exports.getFinanceDashboard = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await FinanceDashboardService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Sales dashboard (invoices, AR, clients, credit notes)
+// @route   GET /api/dashboard/sales
+// @access  Private
+exports.getSalesDashboard = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await SalesDashboardService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Purchase dashboard (POs, GRN, AP, suppliers)
+// @route   GET /api/dashboard/purchase
+// @access  Private
+exports.getPurchaseDashboard = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await PurchaseDashboardService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Financial ratios widget (9 ratios + status styling)
+// @route   GET /api/dashboard/ratios
+// @access  Private
+exports.getRatiosWidget = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use platform-specific endpoints'
+      });
+    }
+
+    const companyId = req.user.company._id;
+    const data = await RatiosWidgetService.get(companyId.toString());
+
+    res.json({
+      success: true,
+      data
     });
   } catch (error) {
     next(error);

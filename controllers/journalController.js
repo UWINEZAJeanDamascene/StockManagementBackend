@@ -230,7 +230,7 @@ exports.postJournalEntry = async (req, res, next) => {
       }
 
       try {
-        await cacheService.invalidateByCompany(companyId, 'report');
+        await cacheService.bumpCompanyFinancialCaches(companyId);
       } catch (cacheErr) {
         console.error('Failed to invalidate report cache after posting entry', cacheErr);
       }
@@ -323,7 +323,7 @@ exports.reverseJournalEntry = async (req, res, next) => {
       await orig.save(opts);
 
       try {
-        await cacheService.invalidateByCompany(companyId, 'report');
+        await cacheService.bumpCompanyFinancialCaches(companyId);
       } catch (cacheErr) {
         console.error('Failed to invalidate report cache after reversal', cacheErr);
       }

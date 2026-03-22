@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Backup = require('../models/Backup');
 const Company = require('../models/Company');
+const Currency = require('../models/Currency');
 const User = require('../models/User');
 const fs = require('fs');
 const path = require('path');
@@ -14,7 +15,7 @@ const { notifyBackupSuccess, notifyBackupFailed } = require('../services/notific
 const getBackupableCollections = () => {
   return [
     'ActionLog', 'Budget', 'CashDrawer', 'Category', 'Client', 
-    'Company', 'CreditNote', 'Department', 'ExchangeRate', 
+    'Company', 'CreditNote', 'Currency', 'Department', 'ExchangeRate', 
     'InventoryBatch', 'Invoice', 'InvoiceReceiptMetadata', 'IPWhitelist',
     'Notification', 'NotificationSettings', 'Product', 'Purchase', 
     'Quotation', 'RecurringInvoice', 'ReorderPoint', 'Role',

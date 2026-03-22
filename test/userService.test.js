@@ -231,24 +231,47 @@ describe('UserService', () => {
       const result = await UserService.refresh(loginResult.refresh_token);
 
       expect(result.access_token).toBeDefined();
-      
+      expect(result.refresh_token).toBeDefined();
+      expect(result.refresh_token).not.toBe(loginResult.refresh_token);
+
       // Verify new token is valid
       const jwt = require('jsonwebtoken');
       const decoded = jwt.verify(result.access_token, process.env.JWT_SECRET || 'your-jwt-secret-key');
       expect(decoded.userId).toBeDefined();
     });
 
-    it('throws INVALID_REFRESH_TOKEN for expired token', async () => {
-      // Create an expired refresh token
+    it('invalidates previous refresh_token after rotation', async () => {
+      const loginResult = await UserService.login('admin@test.com', 'admin123', testCompany._id);
+      const firstRefresh = await UserService.refresh(loginResult.refresh_token);
+
+      await expect(UserService.refresh(loginResult.refresh_token)).rejects.toMatchObject({
+        code: 'INVALID_REFRESH_TOKEN',
+      });
+
+      await expect(UserService.refresh(firstRefresh.refresh_token)).rejects.toMatchObject({
+        code: 'INVALID_REFRESH_TOKEN',
+      });
+    });
+
+    it('refresh chain works when old refresh is never replayed', async () => {
+      const loginResult = await UserService.login('admin@test.com', 'admin123', testCompany._id);
+      const a = await UserService.refresh(loginResult.refresh_token);
+      const b = await UserService.refresh(a.refresh_token);
+      expect(b.access_token).toBeDefined();
+      expect(b.refresh_token).toBeDefined();
+    });
+
+    it('throws REFRESH_TOKEN_EXPIRED for expired token', async () => {
       const jwt = require('jsonwebtoken');
       const expiredToken = jwt.sign(
         { userId: testUser._id, type: 'refresh' },
         process.env.JWT_SECRET || 'your-jwt-secret-key',
-        { expiresIn: '-1s' }
+        { expiresIn: '-1s' },
       );
 
-      await expect(UserService.refresh(expiredToken))
-        .rejects.toThrow('INVALID_REFRESH_TOKEN');
+      await expect(UserService.refresh(expiredToken)).rejects.toMatchObject({
+        code: 'REFRESH_TOKEN_EXPIRED',
+      });
     });
 
     it('throws INVALID_REFRESH_TOKEN for tampered token', async () => {
@@ -258,8 +281,9 @@ describe('UserService', () => {
       // Tamper with the token
       const tamperedToken = loginResult.refresh_token.slice(0, -5) + 'xxxxx';
 
-      await expect(UserService.refresh(tamperedToken))
-        .rejects.toThrow('INVALID_REFRESH_TOKEN');
+      await expect(UserService.refresh(tamperedToken)).rejects.toMatchObject({
+        code: 'INVALID_REFRESH_TOKEN',
+      });
     });
   });
 

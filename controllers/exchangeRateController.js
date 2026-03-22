@@ -1,170 +1,173 @@
 const ExchangeRate = require('../models/ExchangeRate');
-const exchangeRateService = require('../services/exchangeRateService');
+const CurrencyService = require('../services/CurrencyService');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
-// @desc    Get all current exchange rates
-// @route   GET /api/exchange-rates
-// @access  Public
-exports.getExchangeRates = async (req, res, next) => {
-  try {
-    const { forceRefresh } = req.query;
-    const result = await exchangeRateService.getExchangeRates(forceRefresh === 'true');
-
-    // Save rates to database for historical tracking
-    if (result.success && result.source !== 'cache') {
-      const currencies = ['USD', 'EUR', 'GBP', 'FRW', 'LBP', 'SAR', 'AED'];
-      
-      for (const currency of currencies) {
-        if (result.rates[currency]) {
-          await ExchangeRate.findOneAndUpdate(
-            { baseCurrency: 'USD', targetCurrency: currency },
-            {
-              baseCurrency: 'USD',
-              targetCurrency: currency,
-              rate: result.rates[currency],
-              effectiveDate: new Date(),
-              source: result.source
-            },
-            { upsert: true, new: true }
-          );
-        }
-      }
-    }
-
-    res.json({
-      success: true,
-      data: {
-        rates: result.rates,
-        source: result.source,
-        timestamp: result.timestamp || new Date(),
-        cached: result.cached || false
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Get supported currencies
-// @route   GET /api/exchange-rates/currencies
-// @access  Public
-exports.getCurrencies = async (req, res, next) => {
-  try {
-    const currencies = exchangeRateService.getSupportedCurrencies();
-    
-    res.json({
-      success: true,
-      data: currencies
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Convert amount between currencies
-// @route   POST /api/exchange-rates/convert
-// @access  Public
-exports.convertCurrency = async (req, res, next) => {
-  try {
-    const { amount, from, to } = req.body;
-
-    if (!amount || !from || !to) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide amount, from, and to currencies'
-      });
-    }
-
-    const convertedAmount = await exchangeRateService.convertCurrency(
-      parseFloat(amount),
-      from.toUpperCase(),
-      to.toUpperCase()
-    );
-
-    const rate = await exchangeRateService.getRate(
-      from.toUpperCase(),
-      to.toUpperCase()
-    );
-
-    res.json({
-      success: true,
-      data: {
-        originalAmount: parseFloat(amount),
-        convertedAmount: Math.round(convertedAmount * 100) / 100,
-        from: from.toUpperCase(),
-        to: to.toUpperCase(),
-        rate: Math.round(rate * 10000) / 10000
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Get exchange rate history
-// @route   GET /api/exchange-rates/history
+// @desc    Add exchange rate for company
+// @route   POST /api/exchange-rates
 // @access  Private
-exports.getExchangeRateHistory = async (req, res, next) => {
+exports.addRate = async (req, res, next) => {
   try {
-    const { baseCurrency = 'USD', targetCurrency, startDate, endDate, limit = 30 } = req.query;
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use a company context for exchange rates'
+      });
+    }
+    const companyId = req.user.company._id || req.user.company;
+    const userId = req.user._id;
 
-    const query = { baseCurrency: baseCurrency.toUpperCase() };
-    
-    if (targetCurrency) {
-      query.targetCurrency = targetCurrency.toUpperCase();
+    const { from_currency, rate, effective_date } = req.body;
+    if (!from_currency || rate == null || rate === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide from_currency and rate'
+      });
     }
 
-    if (startDate || endDate) {
-      query.effectiveDate = {};
-      if (startDate) query.effectiveDate.$gte = new Date(startDate);
-      if (endDate) query.effectiveDate.$lte = new Date(endDate);
-    }
+    const data = {
+      from_currency,
+      rate: parseFloat(rate),
+      effective_date: effective_date ? new Date(effective_date) : new Date()
+    };
 
-    const history = await ExchangeRate.find(query)
-      .sort({ effectiveDate: -1 })
-      .limit(parseInt(limit));
+    const rateDoc = await CurrencyService.addRate(
+      companyId.toString(),
+      data,
+      userId
+    );
 
-    res.json({
+    res.status(201).json({
       success: true,
-      count: history.length,
-      data: history
+      data: rateDoc
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Manual update exchange rate (admin)
-// @route   PUT /api/exchange-rates/manual
-// @access  Private/Admin
-exports.manualUpdateRate = async (req, res, next) => {
+// @desc    List exchange rates. Filter: from_currency, date
+// @route   GET /api/exchange-rates
+// @access  Private
+exports.listRates = async (req, res, next) => {
   try {
-    const { baseCurrency, targetCurrency, rate } = req.body;
-
-    if (!baseCurrency || !targetCurrency || !rate) {
+    if (req.isPlatformAdmin) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide baseCurrency, targetCurrency, and rate'
+        message: 'Platform admin should use a company context for exchange rates'
       });
     }
+    const companyId = req.user.company._id || req.user.company;
+    const { from_currency, date } = req.query;
 
-    const exchangeRate = await ExchangeRate.findOneAndUpdate(
-      { 
-        baseCurrency: baseCurrency.toUpperCase(), 
-        targetCurrency: targetCurrency.toUpperCase() 
-      },
-      {
-        baseCurrency: baseCurrency.toUpperCase(),
-        targetCurrency: targetCurrency.toUpperCase(),
-        rate: parseFloat(rate),
-        effectiveDate: new Date(),
-        source: 'manual'
-      },
-      { upsert: true, new: true }
+    const query = { company_id: companyId };
+
+    if (from_currency) {
+      query.from_currency = from_currency.toUpperCase();
+    }
+    if (date) {
+      const d = new Date(date);
+      d.setUTCHours(0, 0, 0, 0);
+      query.effective_date = { $lte: d };
+    }
+
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 25 });
+    const total = await ExchangeRate.countDocuments(query);
+    const rates = await ExchangeRate.find(query)
+      .sort({ effective_date: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      data: rates,
+      pagination: paginationMeta(page, limit, total),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get current rate for a currency (most recent on or before today)
+// @route   GET /api/exchange-rates/current/:currency
+// @access  Private
+exports.getCurrentRate = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use a company context for exchange rates'
+      });
+    }
+    const companyId = req.user.company._id || req.user.company;
+    const { currency } = req.params;
+    const asOfDate = req.query.date ? new Date(req.query.date) : new Date();
+
+    const rate = await CurrencyService.getRate(
+      companyId.toString(),
+      currency,
+      null,
+      asOfDate
     );
 
     res.json({
       success: true,
-      data: exchangeRate
+      data: { currency: currency.toUpperCase(), rate, as_of: asOfDate }
+    });
+  } catch (error) {
+    if (error.message.startsWith('EXCHANGE_RATE_NOT_FOUND')) {
+      return res.status(404).json({
+        success: false,
+        message: error.message
+      });
+    }
+    if (error.message.startsWith('RATE_LOOKUP_ERROR')) {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+    next(error);
+  }
+};
+
+// @desc    Convert amount (legacy / internal use)
+// @route   POST /api/exchange-rates/convert
+// @access  Private
+exports.convert = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use a company context for exchange rates'
+      });
+    }
+    const companyId = req.user.company._id || req.user.company;
+    const { amount, from_currency, as_of_date } = req.body;
+
+    if (!amount || !from_currency) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide amount and from_currency'
+      });
+    }
+
+    const asOfDate = as_of_date ? new Date(as_of_date) : new Date();
+    const converted = await CurrencyService.convert(
+      companyId.toString(),
+      parseFloat(amount),
+      from_currency,
+      asOfDate
+    );
+
+    res.json({
+      success: true,
+      data: {
+        original_amount: parseFloat(amount),
+        from_currency: from_currency.toUpperCase(),
+        converted_amount: converted,
+        as_of: asOfDate
+      }
     });
   } catch (error) {
     next(error);

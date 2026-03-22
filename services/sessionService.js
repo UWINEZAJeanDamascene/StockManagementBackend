@@ -1,13 +1,72 @@
 const { redisClient } = require('../config/redis');
 const jwt = require('jsonwebtoken');
 
-// Session configuration
-const SESSION_TTL = parseInt(process.env.SESSION_TTL) || 86400; // 24 hours default
+// Session configuration (SESSION_TTL = Redis session + token mapping TTL in seconds)
+const SESSION_TTL = parseInt(process.env.SESSION_TTL, 10) || 86400; // 24 hours default
+// Max concurrent access tokens per user (Redis FIFO eviction of oldest). Default 5 devices.
+// Set SESSION_MAX_CONCURRENT=0 for unlimited (not recommended in production).
+const _parsedMax = parseInt(process.env.SESSION_MAX_CONCURRENT, 10);
+const SESSION_MAX_CONCURRENT = Number.isFinite(_parsedMax) ? _parsedMax : 5;
 const SESSION_PREFIX = 'session:';
 const TOKEN_BLACKLIST_PREFIX = 'blacklist:';
+const TOKENS_LIST_SUFFIX = 'tokens:';
+
+function tokenBlacklistTtlSeconds(token) {
+  try {
+    const dec = jwt.decode(token);
+    if (dec && typeof dec.exp === 'number') {
+      const left = dec.exp - Math.floor(Date.now() / 1000);
+      return Math.max(1, left);
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return SESSION_TTL;
+}
 
 // Session data structure
 class SessionService {
+  _tokensListKey(userId) {
+    return `${SESSION_PREFIX}${TOKENS_LIST_SUFFIX}${userId}`;
+  }
+
+  /**
+   * Enforce max concurrent access tokens per user (FIFO eviction of oldest).
+   */
+  async _registerAccessTokenForConcurrency(userId, token) {
+    if (!SESSION_MAX_CONCURRENT || SESSION_MAX_CONCURRENT < 1) {
+      return;
+    }
+    const listKey = this._tokensListKey(userId);
+    await redisClient.rpush(listKey, token);
+    await redisClient.expire(listKey, SESSION_TTL);
+
+    let len = await redisClient.llen(listKey);
+    while (len > SESSION_MAX_CONCURRENT) {
+      const oldToken = await redisClient.lpop(listKey);
+      if (oldToken) {
+        await redisClient.del(`${SESSION_PREFIX}token:${oldToken}`);
+        await this.blacklistToken(oldToken, tokenBlacklistTtlSeconds(oldToken));
+      }
+      len = await redisClient.llen(listKey);
+    }
+  }
+
+  /**
+   * Map an access token to userId in Redis and apply concurrent-session rules.
+   * Use after refresh when the session blob already exists.
+   */
+  async registerAccessToken(userId, token) {
+    const tokenKey = `${SESSION_PREFIX}token:${token}`;
+    try {
+      await redisClient.setex(tokenKey, SESSION_TTL, userId);
+      await this._registerAccessTokenForConcurrency(userId, token);
+    } catch (error) {
+      console.error('Error registering access token:', error);
+      throw error;
+    }
+  }
+
   /**
    * Create a new session for a user
    * @param {string} userId - User ID
@@ -34,6 +93,7 @@ class SessionService {
       // Store token-to-user mapping for quick lookup
       const tokenKey = `${SESSION_PREFIX}token:${token}`;
       await redisClient.setex(tokenKey, SESSION_TTL, userId);
+      await this._registerAccessTokenForConcurrency(userId, token);
 
       console.log(`Session created for user: ${userId}`);
       return sessionData;
@@ -123,6 +183,7 @@ class SessionService {
    */
   async deleteSession(userId, token = null) {
     const sessionKey = `${SESSION_PREFIX}${userId}`;
+    const listKey = this._tokensListKey(userId);
 
     try {
       // Delete main session
@@ -132,6 +193,7 @@ class SessionService {
       if (token) {
         const tokenKey = `${SESSION_PREFIX}token:${token}`;
         await redisClient.del(tokenKey);
+        await redisClient.lrem(listKey, 1, token);
       }
 
       console.log(`Session deleted for user: ${userId}`);
@@ -147,12 +209,19 @@ class SessionService {
    * @param {string} userId - User ID
    */
   async deleteAllSessions(userId) {
-    try {
-      // Delete main session
-      await this.deleteSession(userId);
+    const listKey = this._tokensListKey(userId);
+    const sessionKey = `${SESSION_PREFIX}${userId}`;
 
-      // For additional security, we could track all tokens per user
-      // but for simplicity, we'll rely on token TTL
+    try {
+      const tokens = await redisClient.lrange(listKey, 0, -1);
+      if (tokens && tokens.length) {
+        for (const t of tokens) {
+          await redisClient.del(`${SESSION_PREFIX}token:${t}`);
+        }
+      }
+      await redisClient.del(listKey);
+      await redisClient.del(sessionKey);
+
       console.log(`All sessions deleted for user: ${userId}`);
       return true;
     } catch (error) {

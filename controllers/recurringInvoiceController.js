@@ -1,6 +1,7 @@
 const RecurringInvoice = require('../models/RecurringInvoice');
 const RecurringInvoiceRun = require('../models/RecurringInvoiceRun');
 const recurringService = require('../services/recurringService');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // List recurring templates
 // GET /api/recurring-templates - List. Filters: client_id, status, frequency
@@ -19,9 +20,21 @@ exports.getRecurringInvoices = async (req, res, next) => {
     if (frequency) {
       query['schedule.frequency'] = frequency;
     }
-    
-    const recs = await RecurringInvoice.find(query).populate('client createdBy');
-    res.json({ success: true, count: recs.length, data: recs });
+
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await RecurringInvoice.countDocuments(query);
+    const recs = await RecurringInvoice.find(query)
+      .populate('client createdBy')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      count: recs.length,
+      data: recs,
+      pagination: paginationMeta(page, limit, total),
+    });
   } catch (err) {
     next(err);
   }
@@ -190,15 +203,24 @@ exports.getRecurringInvoiceRuns = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Template not found' });
     }
     
-    const runs = await RecurringInvoiceRun.find({ 
+    const runQuery = {
       template: templateId,
-      company: companyId 
-    })
-    .populate('invoice', 'referenceNo status totalAmount')
-    .sort({ createdAt: -1 })
-    .limit(50);
-    
-    res.json({ success: true, count: runs.length, data: runs });
+      company: companyId,
+    };
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });
+    const total = await RecurringInvoiceRun.countDocuments(runQuery);
+    const runs = await RecurringInvoiceRun.find(runQuery)
+      .populate('invoice', 'referenceNo status totalAmount')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      count: runs.length,
+      data: runs,
+      pagination: paginationMeta(page, limit, total),
+    });
   } catch (err) {
     next(err);
   }

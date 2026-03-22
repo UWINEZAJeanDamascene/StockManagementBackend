@@ -8,6 +8,7 @@ const JournalService = require('./journalService');
 const periodService = require('./periodService');
 const cacheService = require('./cacheService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 /**
  * AR Service - Handles Accounts Receivable operations
@@ -97,7 +98,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -232,7 +233,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -316,7 +317,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -371,7 +372,7 @@ class ARService {
     }
 
     // Check available amount to allocate on the receipt
-    const allocatedSum = await ARReceiptAllocation.aggregate([
+    const allocatedSum = await aggregateWithTimeout(ARReceiptAllocation, [
       { $match: { receipt: receipt._id } },
       { $group: { _id: null, total: { $sum: '$amountAllocated' } } }
     ]);
@@ -401,7 +402,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -555,7 +556,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -635,7 +636,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }
@@ -714,7 +715,7 @@ class ARService {
 
     // Invalidate cache
     try {
-      await cacheService.invalidateByCompany(companyId, 'report');
+      await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }

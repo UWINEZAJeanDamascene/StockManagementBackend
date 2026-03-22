@@ -1,5 +1,6 @@
 const PurchaseOrder = require('../models/PurchaseOrder');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 exports.createPurchaseOrder = async (req, res, next) => {
   try {
@@ -69,8 +70,18 @@ exports.getPurchaseOrders = async (req, res, next) => {
     if (date_from) q.orderDate.$gte = new Date(date_from);
     if (date_to) q.orderDate.$lte = new Date(date_to);
 
-    const list = await PurchaseOrder.find(q).sort({ orderDate: -1 }).limit(200);
-    res.json({ success: true, data: list });
+    const { page, limit, skip } = parsePagination(req.query);
+    const total = await PurchaseOrder.countDocuments(q);
+    const list = await PurchaseOrder.find(q)
+      .sort({ orderDate: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    res.json({
+      success: true,
+      data: list,
+      pagination: paginationMeta(page, limit, total),
+    });
   } catch (err) { next(err); }
 };
 

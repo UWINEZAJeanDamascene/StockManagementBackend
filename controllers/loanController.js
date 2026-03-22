@@ -1,4 +1,5 @@
 const Loan = require('../models/Loan');
+const { parsePagination, paginationMeta } = require('../utils/pagination');
 const JournalService = require('../services/journalService');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const BankAccount = require('../models/BankAccount');
@@ -18,24 +19,39 @@ exports.getLoans = async (req, res, next) => {
     if (status) query.status = status;
     if (loanType) query.loanType = loanType;
 
-    const loans = await Loan.find(query)
-      .populate('createdBy', 'name email')
-      .sort({ startDate: -1 });
+    const { page, limit, skip } = parsePagination(req.query);
+    const [total, agg, loans] = await Promise.all([
+      Loan.countDocuments(query),
+      Loan.aggregate([
+        { $match: query },
+        {
+          $group: {
+            _id: null,
+            totalOriginal: { $sum: { $ifNull: ['$originalAmount', 0] } },
+            totalPaid: { $sum: { $ifNull: ['$amountPaid', 0] } },
+            totalOutstanding: { $sum: { $ifNull: ['$outstandingBalance', 0] } },
+          },
+        },
+      ]),
+      Loan.find(query)
+        .populate('createdBy', 'name email')
+        .sort({ startDate: -1 })
+        .skip(skip)
+        .limit(limit),
+    ]);
 
-    // Calculate totals
-    const totalOriginal = loans.reduce((sum, loan) => sum + (loan.originalAmount || 0), 0);
-    const totalPaid = loans.reduce((sum, loan) => sum + (loan.amountPaid || 0), 0);
-    const totalOutstanding = loans.reduce((sum, loan) => sum + (loan.remainingBalance || 0), 0);
+    const s = agg[0] || {};
 
     res.json({
       success: true,
       count: loans.length,
       data: loans,
+      pagination: paginationMeta(page, limit, total),
       summary: {
-        totalOriginal,
-        totalPaid,
-        totalOutstanding
-      }
+        totalOriginal: s.totalOriginal || 0,
+        totalPaid: s.totalPaid || 0,
+        totalOutstanding: s.totalOutstanding || 0,
+      },
     });
   } catch (error) {
     next(error);

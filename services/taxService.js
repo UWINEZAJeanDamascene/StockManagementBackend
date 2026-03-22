@@ -5,6 +5,7 @@ const JournalService = require('./journalService');
 const SequenceService = require('./sequenceService');
 const PeriodService = require('./periodService');
 const { BankAccount } = require('../models/BankAccount');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 class TaxService {
 
@@ -124,7 +125,7 @@ class TaxService {
         reversalOf: { $exists: true, $ne: null }
       });
       
-      const outputResult = await JournalEntry.aggregate([
+      const outputResult = await aggregateWithTimeout(JournalEntry, [
         {
           $match: {
             company: new mongoose.Types.ObjectId(companyId),
@@ -153,7 +154,7 @@ class TaxService {
 
       // Input VAT — sum of debit lines on input_account_code in period
       // Excludes draft, reversed, and cancelled entries
-      const inputResult = await JournalEntry.aggregate([
+      const inputResult = await aggregateWithTimeout(JournalEntry, [
         {
           $match: {
             company: new mongoose.Types.ObjectId(companyId),

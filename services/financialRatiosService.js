@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 const BalanceSheetService = require('./balanceSheetService');
 const PLStatementService = require('./plStatementService');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -265,7 +266,7 @@ class FinancialRatiosService {
    * Get account balance from journal entries
    */
   static async _getAccountBalance(companyId, accountCode, dateFrom, dateTo) {
-    const result = await JournalEntry.aggregate([
+    const result = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
@@ -308,7 +309,7 @@ class FinancialRatiosService {
    */
   static async _getTotalPurchases(companyId, dateFrom, dateTo) {
     // Total purchases = SUM of DR on inventory accounts from purchase source_type
-    const result = await JournalEntry.aggregate([
+    const result = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
