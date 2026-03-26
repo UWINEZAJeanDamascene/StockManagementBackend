@@ -1,11 +1,17 @@
 const jwt = require('jsonwebtoken');
 let io = null;
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const JWT_SECRET = config.jwt.secret;
+const CORS_ORIGINS = config.server.corsOrigins;
+
 const init = (server, options = {}) => {
   const { Server } = require('socket.io');
   io = new Server(server, {
     cors: {
-      origin: (process.env.CORS_ORIGINS && process.env.CORS_ORIGINS.split(',')) || '*',
+      origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : '*',
       credentials: true
     },
     ...options
@@ -16,7 +22,7 @@ const init = (server, options = {}) => {
     try {
       const token = socket.handshake.auth && socket.handshake.auth.token;
       if (!token) return next(new Error('Authentication error'));
-      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      const payload = jwt.verify(token, JWT_SECRET);
       socket.user = { id: payload.id || payload._id, companyId: payload.companyId };
       return next();
     } catch (err) {

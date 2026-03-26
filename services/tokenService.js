@@ -3,13 +3,18 @@ const crypto = require('crypto');
 const User = require('../models/User');
 const SessionService = require('./sessionService');
 
-if (!process.env.JWT_SECRET) {
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+
+// Validate required config
+if (!config.jwt.secret) {
   throw new Error('FATAL: JWT_SECRET environment variable is required.');
 }
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const ACCESS_EXPIRE = process.env.JWT_ACCESS_EXPIRE || '15m';
-const REFRESH_EXPIRE = process.env.REFRESH_TOKEN_EXPIRE || '7d';
+const JWT_SECRET = config.jwt.secret;
+const ACCESS_EXPIRE = config.jwt.expiresIn;
+const REFRESH_EXPIRE = config.jwt.refreshExpiresIn;
 
 /**
  * Refresh-token rotation (RFC 6819 style):

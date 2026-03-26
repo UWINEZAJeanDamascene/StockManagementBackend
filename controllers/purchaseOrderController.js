@@ -73,13 +73,20 @@ exports.getPurchaseOrders = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query);
     const total = await PurchaseOrder.countDocuments(q);
     const list = await PurchaseOrder.find(q)
+      .populate('supplier', 'name code contact email')
       .sort({ orderDate: -1 })
       .skip(skip)
       .limit(limit);
 
+    // Add computed linesCount to each PO
+    const data = list.map(po => ({
+      ...po.toObject(),
+      linesCount: po.lines ? po.lines.length : 0
+    }));
+
     res.json({
       success: true,
-      data: list,
+      data,
       pagination: paginationMeta(page, limit, total),
     });
   } catch (err) { next(err); }
@@ -88,8 +95,25 @@ exports.getPurchaseOrders = async (req, res, next) => {
 exports.getPurchaseOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId });
+    const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId })
+      .populate('supplier', 'name code contact email phone address')
+      .populate('warehouse', 'name code')
+      .populate('createdBy', 'name email')
+      .populate('approvedBy', 'name email')
+      .populate('lines.product', 'name sku unit');
+    
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
-    res.json({ success: true, data: po });
+
+    // Fetch related GRNs for the GRNs tab
+    const grns = await GoodsReceivedNote.find({ purchaseOrder: po._id, company: companyId })
+      .populate('createdBy', 'name email')
+      .populate('confirmedBy', 'name email')
+      .sort({ createdAt: -1 });
+
+    res.json({ 
+      success: true, 
+      data: po,
+      grns: grns
+    });
   } catch (err) { next(err); }
 };

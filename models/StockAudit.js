@@ -65,9 +65,13 @@ const stockAuditLineSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Compound indexes
-stockAuditLineSchema.index({ audit: 1, product: 1 }, { unique: true });
+// Note: The unique index on stockAuditLine was removed because MongoDB partial indexes
+// don't support $ne: null expressions properly. Uniqueness is now enforced at application level.
+// For embedded documents, uniqueness per audit is still maintained by the audit reference.
+stockAuditLineSchema.index({ audit: 1 });
 stockAuditLineSchema.index({ product: 1 });
+
+
 
 /**
  * StockAudit Schema - represents a stock audit session
@@ -214,6 +218,10 @@ stockAuditSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
 stockAuditSchema.index({ company: 1, status: 1 });
 stockAuditSchema.index({ warehouse: 1, status: 1 });
 stockAuditSchema.index({ auditDate: -1 });
+
+// Note: The unique index on embedded items was removed because MongoDB partial indexes
+// don't support $ne: null expressions. The uniqueness is now enforced at the application level
+// when items are assigned to an audit (audit field is not null).
 
 // Pre-save middleware to generate audit number
 stockAuditSchema.pre('save', async function(next) {

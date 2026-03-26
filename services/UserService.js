@@ -15,8 +15,12 @@ const TokenService = require('./tokenService');
 const { notifyUserCreated, notifyPasswordChanged, notifyAccountLocked } = require('./notificationHelper');
 const ActionLog = require('../models/ActionLog');
 
-// Configuration - JWT_SECRET MUST be set in environment
-if (!process.env.JWT_SECRET) {
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+
+// Validate required config - JWT_SECRET MUST be set in environment
+if (!config.jwt.secret) {
   throw new Error('FATAL: JWT_SECRET environment variable is required. Please set it in your .env file.');
 }
 const MAX_LOGIN_ATTEMPTS = 5;

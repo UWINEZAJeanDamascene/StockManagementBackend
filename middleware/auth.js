@@ -3,6 +3,11 @@ const User = require('../models/User');
 const Company = require('../models/Company');
 const { recordUserSessionActivity } = require('../services/userSessionActivity');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const JWT_SECRET = config.jwt.secret;
+
 const protect = async (req, res, next) => {
   let token;
 
@@ -12,7 +17,7 @@ const protect = async (req, res, next) => {
       token = req.headers.authorization.split(' ')[1];
 
       // Verify token
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, JWT_SECRET);
 
       // Get user from token
       req.user = await User.findById(decoded.id).select('-password');
@@ -71,7 +76,8 @@ const protect = async (req, res, next) => {
     } catch (error) {
       console.error(error);
       // In test mode, allow decoding tokens without verification to ease test harness.
-      if (process.env.NODE_ENV === 'test' && token) {
+      const nodeEnv = config.server.env;
+      if (nodeEnv === 'test' && token) {
         try {
           const decoded = jwt.decode(token);
           if (decoded && decoded.id) {
@@ -89,6 +95,21 @@ const protect = async (req, res, next) => {
         success: false, 
         message: 'Not authorized, token failed' 
       });
+    }
+  }
+
+  // If no Authorization header token, try cookie token (httpOnly cookie set by server)
+  if (!token && req.cookies && req.cookies.token) {
+    token = req.cookies.token;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      req.user = await User.findById(decoded.id).select('-password');
+      req.company = decoded.companyId ? await Company.findById(decoded.companyId) : null;
+      if (req.user) recordUserSessionActivity(req.user._id);
+      return next();
+    } catch (err) {
+      console.error('Cookie token verify failed', err);
+      return res.status(401).json({ success: false, message: 'Not authorized, token failed' });
     }
   }
 

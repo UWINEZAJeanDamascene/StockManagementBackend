@@ -296,21 +296,21 @@ describe('Accounts Payable API', () => {
       
       // Verify journal entries were created
       const journals = await JournalEntry.find({ reference: postRes.body.data.referenceNo });
-      expect(journals).toHaveLength(2);
+      // One journal entry with both debit and credit lines
+      expect(journals).toHaveLength(1);
+      const journal = journals[0];
       
-      // Should have DR AP (2100) and CR Bank (1100)
-      const drEntry = journals.find(j => j.totalDebit > 0);
-      const crEntry = journals.find(j => j.totalCredit > 0);
-      expect(Number(drEntry.totalDebit)).toBe(1000.00);
-      expect(Number(crEntry.totalCredit)).toBe(1000.00);
+      // Should have DR AP (2100) and CR Bank (1100) in the same entry
+      expect(Number(journal.totalDebit)).toBe(1000.00);
+      expect(Number(journal.totalCredit)).toBe(1000.00);
       
       // Verify DR account is 2100 (AP)
-      const apLine = drEntry.lines.find(l => l.accountCode === '2100');
+      const apLine = journal.lines.find(l => l.accountCode === '2100');
       expect(apLine).toBeDefined();
       expect(Number(apLine.debit)).toBe(1000.00);
       
       // Verify CR account is 1100 (Bank)
-      const bankLine = crEntry.lines.find(l => l.accountCode === '1100');
+      const bankLine = journal.lines.find(l => l.accountCode === '1100');
       expect(bankLine).toBeDefined();
       expect(Number(bankLine.credit)).toBe(1000.00);
     });

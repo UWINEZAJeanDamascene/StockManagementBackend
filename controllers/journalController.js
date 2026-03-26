@@ -1,6 +1,7 @@
 const JournalEntry = require('../models/JournalEntry');
 const FixedAsset = require('../models/FixedAsset');
 const { CHART_OF_ACCOUNTS, getAccount, getAccountsByType, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalService = require('../services/journalService');
 const AccountBalance = require('../models/AccountBalance');
 const cacheService = require('../services/cacheService');
@@ -377,19 +378,46 @@ exports.voidJournalEntry = async (req, res, next) => {
 // @access  Private
 exports.getAccounts = async (req, res, next) => {
   try {
+    const companyId = req.user.company._id;
     const { type, subtype } = req.query;
     
-    let accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
-      code,
-      ...account
-    }));
-    
-    if (type) {
-      accounts = accounts.filter(a => a.type === type);
+    // Query database for actual accounts
+    // Include inactive accounts if explicitly requested (for settings/liabilities)
+    let query = { company: companyId };
+    const includeInactive = req.query.includeInactive === 'true';
+    if (!includeInactive) {
+      query.isActive = true;
     }
+    if (type) query.type = type;
+    if (subtype) query.subtype = subtype;
     
-    if (subtype) {
-      accounts = accounts.filter(a => a.subtype === subtype);
+    let accounts = await ChartOfAccount.find(query).sort({ code: 1 });
+    
+    // If no accounts in database, return default Chart of Accounts
+    if (accounts.length === 0) {
+      // Convert default CHART_OF_ACCOUNTS to array format
+      const defaultAccounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, details]) => ({
+        _id: code, // Use code as ID for default accounts
+        code,
+        name: details.name,
+        type: details.type,
+        subtype: details.subtype,
+        normalBalance: details.normalBalance,
+        allowDirectPosting: details.allowDirectPosting,
+        isActive: true,
+        isDefault: true
+      }));
+      
+      // Filter by type/subtype if specified
+      let filtered = defaultAccounts;
+      if (type) {
+        filtered = filtered.filter(a => a.type === type);
+      }
+      if (subtype) {
+        filtered = filtered.filter(a => a.subtype === subtype);
+      }
+      
+      return res.json({ success: true, data: filtered });
     }
     
     res.json({ success: true, data: accounts });

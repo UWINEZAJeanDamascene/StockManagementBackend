@@ -1,5 +1,7 @@
 const Client = require('../models/Client');
 const Invoice = require('../models/Invoice');
+const CreditNote = require('../models/CreditNote');
+const ARReceipt = require('../models/ARReceipt');
 
 // @desc    Get all clients
 // @route   GET /api/clients
@@ -426,6 +428,259 @@ exports.exportClientsToPDF = async (req, res, next) => {
       
       y += 18;
     });
+
+    doc.end();
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get client invoices
+// @route   GET /api/clients/:id/invoices
+// @access  Private
+exports.getClientInvoices = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { page = 1, limit = 20, status } = req.query;
+    const query = { 
+      client: req.params.id,
+      company: companyId
+    };
+
+    if (status) {
+      query.status = status;
+    }
+
+    const total = await Invoice.countDocuments(query);
+    const invoices = await Invoice.find(query)
+      .populate('createdBy', 'name email')
+      .sort({ invoiceDate: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    // Calculate totals
+    const allInvoices = await Invoice.find(query);
+    const totalAmount = allInvoices.reduce((sum, inv) => sum + inv.grandTotal, 0);
+    const totalPaid = allInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
+    const totalBalance = allInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+
+    res.json({
+      success: true,
+      count: invoices.length,
+      total,
+      pages: Math.ceil(total / limit),
+      currentPage: page,
+      summary: {
+        totalAmount,
+        totalPaid,
+        totalBalance
+      },
+      data: invoices
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get client receipts (payments)
+// @route   GET /api/clients/:id/receipts
+// @access  Private
+exports.getClientReceipts = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { page = 1, limit = 20, startDate, endDate } = req.query;
+    const query = { 
+      company: companyId
+    };
+
+    // Find receipts that have allocations to this client's invoices
+    const receipts = await ARReceipt.find(query)
+      .populate('createdBy', 'name email')
+      .sort({ receiptDate: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    // Filter receipts that have allocations to this client
+    const ARReceiptAllocation = require('../models/ARReceiptAllocation');
+    const clientReceipts = [];
+    
+    for (const receipt of receipts) {
+      const allocations = await ARReceiptAllocation.find({ receipt: receipt._id })
+        .populate({
+          path: 'invoice',
+          match: { client: req.params.id }
+        });
+      
+      if (allocations.some(a => a.invoice)) {
+        clientReceipts.push(receipt);
+      }
+    }
+
+    const total = clientReceipts.length;
+    const totalAmount = clientReceipts.reduce((sum, r) => sum + r.amount, 0);
+
+    res.json({
+      success: true,
+      count: clientReceipts.length,
+      total,
+      summary: {
+        totalAmount
+      },
+      data: clientReceipts
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get client credit notes
+// @route   GET /api/clients/:id/credit-notes
+// @access  Private
+exports.getClientCreditNotes = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { page = 1, limit = 20 } = req.query;
+    const query = { 
+      client: req.params.id,
+      company: companyId
+    };
+
+    const total = await CreditNote.countDocuments(query);
+    const creditNotes = await CreditNote.find(query)
+      .populate('createdBy', 'name email')
+      .sort({ creditNoteDate: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const totalAmount = creditNotes.reduce((sum, cn) => sum + cn.grandTotal, 0);
+
+    res.json({
+      success: true,
+      count: creditNotes.length,
+      total,
+      pages: Math.ceil(total / limit),
+      currentPage: page,
+      summary: {
+        totalAmount
+      },
+      data: creditNotes
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Generate client statement PDF
+// @route   GET /api/clients/:id/statement
+// @access  Private
+exports.getClientStatementPDF = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { startDate, endDate } = req.query;
+    
+    const client = await Client.findOne({ _id: req.params.id, company: companyId });
+    if (!client) {
+      return res.status(404).json({
+        success: false,
+        message: 'Client not found'
+      });
+    }
+
+    // Get invoices for the period
+    const invoiceQuery = { 
+      client: req.params.id,
+      company: companyId
+    };
+
+    if (startDate || endDate) {
+      invoiceQuery.invoiceDate = {};
+      if (startDate) invoiceQuery.invoiceDate.$gte = new Date(startDate);
+      if (endDate) invoiceQuery.invoiceDate.$lte = new Date(endDate);
+    }
+
+    const invoices = await Invoice.find(invoiceQuery).sort({ invoiceDate: 1 });
+    
+    // Get receipts
+    const ARReceipt = require('../models/ARReceipt');
+    const receiptQuery = { company: companyId };
+    if (startDate || endDate) {
+      receiptQuery.receiptDate = {};
+      if (startDate) receiptQuery.receiptDate.$gte = new Date(startDate);
+      if (endDate) receiptQuery.receiptDate.$lte = new Date(endDate);
+    }
+    const receipts = await ARReceipt.find(receiptQuery).sort({ receiptDate: 1 });
+
+    // Generate PDF
+    const PDFDocument = require('pdfkit');
+    const doc = new PDFDocument({ margin: 50 });
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=statement-${client.code || client.name}-${new Date().toISOString().split('T')[0]}.pdf`);
+    doc.pipe(res);
+
+    // Header
+    doc.fontSize(20).text('ACCOUNT STATEMENT', { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(12).text(`Client: ${client.name}`, { align: 'center' });
+    doc.fontSize(10).text(`Period: ${startDate || 'Start'} to ${endDate || 'Today'}`, { align: 'center' });
+    doc.moveDown(2);
+
+    // Outstanding Summary
+    doc.fontSize(12).text('Account Summary', { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(10);
+    doc.text(`Current Outstanding: ${(client.outstandingBalance || 0).toFixed(2)}`);
+    doc.text(`Total Purchases: ${(client.totalPurchases || 0).toFixed(2)}`);
+    doc.moveDown(2);
+
+    // Invoices Table
+    if (invoices.length > 0) {
+      doc.fontSize(12).text('Invoices', { underline: true });
+      doc.moveDown(0.5);
+      
+      const startX = 50;
+      let y = doc.y;
+      
+      doc.fontSize(9).text('Date', startX, y);
+      doc.text('Invoice #', startX + 70, y);
+      doc.text('Due Date', startX + 170, y);
+      doc.text('Amount', startX + 250, y);
+      doc.text('Paid', startX + 330, y);
+      doc.text('Balance', startX + 400, y);
+      
+      y += 15;
+      doc.fontSize(8);
+
+      invoices.forEach(inv => {
+        if (y > 700) {
+          doc.addPage();
+          y = 50;
+        }
+        
+        const invDate = inv.invoiceDate ? new Date(inv.invoiceDate).toLocaleDateString() : '-';
+        const dueDate = inv.dueDate ? new Date(inv.dueDate).toLocaleDateString() : '-';
+        
+        doc.text(invDate, startX, y);
+        doc.text((inv.referenceNo || inv.invoiceNumber || '-').substring(0, 15), startX + 70, y);
+        doc.text(dueDate, startX + 170, y);
+        doc.text(inv.grandTotal.toFixed(2), startX + 250, y);
+        doc.text(inv.amountPaid.toFixed(2), startX + 330, y);
+        doc.text(inv.balance.toFixed(2), startX + 400, y);
+        
+        y += 12;
+      });
+
+      // Totals
+      y += 5;
+      const totalAmount = invoices.reduce((sum, inv) => sum + inv.grandTotal, 0);
+      const totalPaid = invoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
+      const totalBalance = invoices.reduce((sum, inv) => sum + inv.balance, 0);
+      
+      doc.fontSize(9).text('Totals:', startX + 170, y);
+      doc.text(totalAmount.toFixed(2), startX + 250, y);
+      doc.text(totalPaid.toFixed(2), startX + 330, y);
+      doc.text(totalBalance.toFixed(2), startX + 400, y);
+    }
 
     doc.end();
   } catch (error) {

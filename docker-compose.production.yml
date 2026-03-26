@@ -1,0 +1,56 @@
+# =============================================================================
+# Docker Compose - Production Environment
+# =============================================================================
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.production.yml up -d
+# =============================================================================
+# NOTE: Production should use MongoDB Atlas and external Redis (Upstash/Redis Cloud)\n# =============================================================================
+
+services:
+  # Backend API
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-management-prod
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.production
+    volumes:
+      - prod-logs:/app/logs
+    # For production, use external Redis (not local docker)
+    # Configure in .env.production:
+    # - REDIS_URL or UPSTASH_REDIS_REST_URL
+    networks:
+      - stock-prod
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+networks:
+  stock-prod:
+    driver: bridge
+
+volumes:
+  prod-logs:
+
+# IMPORTANT: For production, use MongoDB Atlas (not local Docker MongoDB)
+# Configure your Atlas connection in .env.production:
+# MONGODB_URI=mongodb+srv://<user>:<pass>@cluster0.xxxxx.mongodb.net/stock-management-prod?retryWrites=true&w=majority

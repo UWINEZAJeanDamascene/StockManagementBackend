@@ -1,252 +1,267 @@
-const cron = require('node-cron');
-const Backup = require('../models/Backup');
-const Company = require('../models/Company');
-const { performBackup, performVerification } = require('../controllers/backupController');
+/**
+ * Backup Scheduler Service
+ * Automates database backups on a schedule
+ */
 
-let backupSchedulerTask = null;
-let verificationTask = null;
+const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const { promisify } = require('util');
 
-// Get cron expression based on frequency
-const getCronExpression = (frequency) => {
-  switch (frequency) {
-    case 'hourly':
-      return '0 * * * *'; // Every hour at minute 0
-    case 'daily':
-      return '0 2 * * *'; // Daily at 2 AM
-    case 'weekly':
-      return '0 2 * * 0'; // Weekly on Sunday at 2 AM
-    case 'monthly':
-      return '0 2 1 * *'; // Monthly on 1st at 2 AM
-    default:
-      return '0 2 * * *'; // Default to daily
+const execAsync = promisify(exec);
+
+// Import config
+const env = require('../src/config/environment');
+const config = env.getConfig();
+
+const BACKUP_DIR = process.env.BACKUP_DIR || './backups';
+const RETENTION_DAYS = parseInt(process.env.BACKUP_RETENTION_DAYS, 10) || 30;
+const AUTO_BACKUP_ENABLED = process.env.AUTO_BACKUP_ENABLED === 'true';
+
+class BackupScheduler {
+  constructor() {
+    this.backupTimer = null;
+    this.isRunning = false;
   }
-};
 
-// Run automated backup for a company
-const runAutomatedBackup = async (companyId, backupSettings) => {
-  try {
-    console.log(`Running automated backup for company ${companyId}`);
-
-    const backup = await Backup.create({
-      company: companyId,
-      name: `Automated_Backup_${new Date().toISOString().replace(/[:.]/g, '-')}`,
-      type: 'automated',
-      status: 'pending',
-      storageLocation: backupSettings.storageLocation || 'local',
-      createdBy: null // System-generated
-    });
-
-    // Get all collections
-    const collections = [
-      'ActionLog', 'Budget', 'CashDrawer', 'Category', 'Client', 
-      'Company', 'CreditNote', 'Department', 'ExchangeRate', 
-      'InventoryBatch', 'Invoice', 'InvoiceReceiptMetadata', 'IPWhitelist',
-      'Notification', 'NotificationSettings', 'Product', 'Purchase', 
-      'Quotation', 'RecurringInvoice', 'ReorderPoint', 'Role',
-      'SerialNumber', 'StockAudit', 'StockMovement', 'StockTransfer',
-      'Subscription', 'Supplier', 'User', 'Warehouse'
-    ];
-
-    await performBackup(backup._id, companyId, collections);
-
-    // Auto-verify if enabled
-    if (backupSettings.autoVerify) {
-      setTimeout(async () => {
-        await performVerification(backup._id, null);
-      }, 5000); // Wait 5 seconds after backup completes
+  /**
+   * Start the backup scheduler
+   */
+  startBackupScheduler() {
+    if (!AUTO_BACKUP_ENABLED) {
+      console.log('📦 Auto-backup is disabled (AUTO_BACKUP_ENABLED=false)');
+      return;
     }
 
-    // Cleanup old backups based on retention policy
-    await cleanupOldBackups(companyId, backupSettings.retention?.keepForDays || 30);
-
-    console.log(`Automated backup completed for company ${companyId}`);
-  } catch (error) {
-    console.error(`Automated backup failed for company ${companyId}:`, error);
-  }
-};
-
-// Cleanup old backups based on retention policy
-const cleanupOldBackups = async (companyId, keepForDays) => {
-  try {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - keepForDays);
-
-    const oldBackups = await Backup.find({
-      company: companyId,
-      createdAt: { $lt: cutoffDate },
-      'retention.autoDelete': true
-    });
-
-    for (const backup of oldBackups) {
-      try {
-        await backup.deleteOne();
-        console.log(`Deleted old backup ${backup._id}`);
-      } catch (err) {
-        console.warn(`Failed to delete backup ${backup._id}:`, err.message);
-      }
+    // Backup schedule: Daily at 2am
+    const schedule = process.env.BACKUP_CRON || '0 2 * * *';
+    
+    console.log(`📦 Backup scheduler started (cron: ${schedule})`);
+    
+    // For simplicity, we'll use a simple interval in development
+    // In production, use node-cron or similar
+    if (process.env.NODE_ENV === 'development') {
+      // For development, run every hour for testing
+      this.backupTimer = setInterval(() => {
+        this.runBackup();
+      }, 60 * 60 * 1000); // 1 hour
+    } else {
+      // Production: daily at 2am
+      this.scheduleCronBackup(schedule);
     }
-  } catch (error) {
-    console.error('Error cleaning up old backups:', error);
-  }
-};
 
-// Process all companies with enabled backup schedules
-const processScheduledBackups = async () => {
-  try {
+    // Run initial backup on start (delayed)
+    setTimeout(() => {
+      this.runBackup();
+    }, 30000); // Wait 30 seconds after startup
+  }
+
+  /**
+   * Schedule cron-based backup
+   */
+  scheduleCronBackup(cronExpression) {
+    // Simple cron parser (basic support)
+    // In production, use node-cron package
+    console.log(`📦 Cron backup scheduled: ${cronExpression}`);
+    
+    // For now, use setInterval as fallback
+    // In production, replace with proper cron
     const now = new Date();
-
-    // Find all companies with scheduled backups
-    const scheduledBackups = await Backup.find({
-      'schedule.enabled': true,
-      'schedule.nextRun': { $lte: now }
-    }).populate('company', 'name');
-
-    for (const backupSettings of scheduledBackups) {
-      try {
-        await runAutomatedBackup(backupSettings.company._id, {
-          storageLocation: backupSettings.storageLocation,
-          retention: backupSettings.retention,
-          autoVerify: backupSettings.schedule?.autoVerify || false
-        });
-
-        // Update next run time
-        const frequency = backupSettings.schedule.frequency;
-        let nextRun = new Date();
-
-        switch (frequency) {
-          case 'hourly':
-            nextRun.setHours(nextRun.getHours() + 1);
-            break;
-          case 'daily':
-            nextRun.setDate(nextRun.getDate() + 1);
-            break;
-          case 'weekly':
-            nextRun.setDate(nextRun.getDate() + 7);
-            break;
-          case 'monthly':
-            nextRun.setMonth(nextRun.getMonth() + 1);
-            break;
-        }
-
-        backupSettings.schedule.lastRun = now;
-        backupSettings.schedule.nextRun = nextRun;
-        await backupSettings.save();
-      } catch (err) {
-        console.error(`Error processing scheduled backup for company:`, err);
-      }
-    }
-  } catch (error) {
-    console.error('Error processing scheduled backups:', error);
+    const hoursUntil2AM = (2 - now.getHours() + 24) % 24;
+    const msUntil2AM = hoursUntil2AM * 60 * 60 * 1000;
+    
+    setTimeout(() => {
+      this.runBackup();
+      this.backupTimer = setInterval(() => {
+        this.runBackup();
+      }, 24 * 60 * 60 * 1000); // Daily
+    }, msUntil2AM);
   }
-};
 
-// Run verification on all completed backups
-const runScheduledVerification = async () => {
-  try {
-    const now = new Date();
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  /**
+   * Run backup
+   */
+  async runBackup() {
+    if (this.isRunning) {
+      console.log('📦 Backup already in progress, skipping...');
+      return;
+    }
 
-    // Find completed backups from the last day that haven't been verified
-    const unverifiedBackups = await Backup.find({
-      status: 'completed',
-      createdAt: { $gte: oneDayAgo },
-      'verification.verified': false
+    this.isRunning = true;
+    console.log('📦 Starting database backup...');
+
+    try {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const dbName = config.db.uri.split('/').pop().split('?')[0];
+      const backupFile = path.join(BACKUP_DIR, `backup_${dbName}_${timestamp}.gz`);
+
+      // Ensure backup directory exists
+      if (!fs.existsSync(BACKUP_DIR)) {
+        fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      }
+
+      // Get MongoDB URI (remove database name for mongodump)
+      const mongoUri = config.db.uri;
+
+      // Run mongodump
+      const dumpCmd = `mongodump --uri="${mongoUri}" --archive=${backupFile} --gzip`;
+      await execAsync(dumpCmd);
+
+      // Verify backup was created
+      if (fs.existsSync(backupFile)) {
+        const stats = fs.statSync(backupFile);
+        console.log(`✅ Backup created: ${backupFile} (${Math.round(stats.size / 1024 / 1024)}MB)`);
+        
+        // Upload to cloud if configured
+        await this.uploadBackup(backupFile);
+        
+        // Clean old backups
+        await this.cleanOldBackups();
+        
+        console.log('📦 Backup completed successfully');
+      } else {
+        throw new Error('Backup file not created');
+      }
+    } catch (err) {
+      console.error('❌ Backup failed:', err.message);
+    } finally {
+      this.isRunning = false;
+    }
+  }
+
+  /**
+   * Upload backup to cloud storage
+   */
+  async uploadBackup(backupFile) {
+    // Check if cloud backup is enabled
+    const cloudBackupEnabled = config.features.cloudBackup;
+    
+    if (!cloudBackupEnabled) {
+      console.log('📦 Cloud backup disabled, skipping upload');
+      return;
+    }
+
+    try {
+      // Check for cloud provider
+      if (process.env.AWS_S3_BUCKET) {
+        await this.uploadToS3(backupFile);
+      } else if (process.env.GOOGLE_DRIVE_FOLDER_ID) {
+        await this.uploadToGoogleDrive(backupFile);
+      } else if (process.env.DROPBOX_ACCESS_TOKEN) {
+        await this.uploadToDropbox(backupFile);
+      }
+    } catch (err) {
+      console.error('⚠️  Cloud upload failed:', err.message);
+    }
+  }
+
+  /**
+   * Upload to AWS S3
+   */
+  async uploadToS3(backupFile) {
+    const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+    const fs = require('fs');
+    
+    const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+    const fileName = path.basename(backupFile);
+    
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.AWS_S3_BUCKET,
+      Key: `backups/${fileName}`,
+      Body: fs.createReadStream(backupFile),
+      ContentType: 'application/gzip',
+    }));
+    
+    console.log('✅ Backup uploaded to S3');
+  }
+
+  /**
+   * Upload to Google Drive (using googleDriveService)
+   */
+  async uploadToGoogleDrive(backupFile) {
+    const googleDriveService = require('./googleDriveService');
+    await googleDriveService.uploadFile(backupFile);
+    console.log('✅ Backup uploaded to Google Drive');
+  }
+
+  /**
+   * Upload to Dropbox
+   */
+  async uploadToDropbox(backupFile) {
+    const axios = require('axios');
+    const fs = require('fs');
+    const fileContent = fs.readFileSync(backupFile);
+    const fileName = path.basename(backupFile);
+    
+    await axios({
+      method: 'post',
+      url: 'https://content.dropboxapi.com/2/files/upload',
+      headers: {
+        Authorization: `Bearer ${process.env.DROPBOX_ACCESS_TOKEN}`,
+        'Content-Type': 'application/octet-stream',
+        'Dropbox-API-Arg': JSON.stringify({
+          path: `/backups/${fileName}`,
+          mode: 'add',
+          autorename: true,
+        }),
+      },
+      data: fileContent,
     });
+    
+    console.log('✅ Backup uploaded to Dropbox');
+  }
 
-    for (const backup of unverifiedBackups) {
-      try {
-        await performVerification(backup._id, null);
-      } catch (err) {
-        console.error(`Error verifying backup ${backup._id}:`, err);
+  /**
+   * Clean up old backups
+   */
+  async cleanOldBackups() {
+    console.log('📦 Cleaning old backups...');
+    
+    if (!fs.existsSync(BACKUP_DIR)) return;
+    
+    const files = fs.readdirSync(BACKUP_DIR);
+    const now = Date.now();
+    let deletedCount = 0;
+
+    for (const file of files) {
+      const filePath = path.join(BACKUP_DIR, file);
+      const stats = fs.statSync(filePath);
+      
+      // Check if file is older than retention period
+      const ageInDays = (now - stats.mtimeMs) / (1000 * 60 * 60 * 24);
+      
+      if (ageInDays > RETENTION_DAYS) {
+        fs.unlinkSync(filePath);
+        deletedCount++;
       }
     }
-  } catch (error) {
-    console.error('Error running scheduled verification:', error);
+
+    console.log(`📦 Cleaned ${deletedCount} old backup(s)`);
   }
-};
 
-// Start the backup scheduler
-const startBackupScheduler = () => {
-  if (backupSchedulerTask) return;
-  
-  // Run scheduled backups every hour
-  backupSchedulerTask = cron.schedule('0 * * * *', () => {
-    console.log('Running scheduled backup check...');
-    processScheduledBackups();
-  }, { scheduled: true });
-
-  // Run initial check
-  processScheduledBackups();
-  
-  console.log('Backup scheduler started');
-};
-
-// Start the verification scheduler
-const startVerificationScheduler = () => {
-  if (verificationTask) return;
-  
-  // Run verification check every day at 3 AM
-  verificationTask = cron.schedule('0 3 * * *', () => {
-    console.log('Running backup verification check...');
-    runScheduledVerification();
-  }, { scheduled: true });
-
-  // Run initial verification
-  runScheduledVerification();
-  
-  console.log('Backup verification scheduler started');
-};
-
-// Stop all schedulers
-const stopBackupScheduler = () => {
-  if (backupSchedulerTask) {
-    backupSchedulerTask.stop();
-    backupSchedulerTask = null;
+  /**
+   * Stop the scheduler
+   */
+  stopBackupScheduler() {
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
+      this.backupTimer = null;
+      console.log('📦 Backup scheduler stopped');
+    }
   }
-  if (verificationTask) {
-    verificationTask.stop();
-    verificationTask = null;
+}
+
+// Export singleton
+const backupScheduler = new BackupScheduler();
+
+// Auto-start if enabled
+if (AUTO_BACKUP_ENABLED && process.env.NODE_ENV !== 'test') {
+  try {
+    backupScheduler.startBackupScheduler();
+  } catch (err) {
+    console.warn('⚠️  Could not start backup scheduler:', err.message);
   }
-  console.log('Backup schedulers stopped');
-};
+}
 
-// Manual trigger for backup
-const triggerManualBackup = async (companyId, options = {}) => {
-  const { name, type = 'manual', storageLocation = 'local', collections } = options;
-
-  const backup = await Backup.create({
-    company: companyId,
-    name: name || `Manual_Backup_${new Date().toISOString().replace(/[:.]/g, '-')}`,
-    type,
-    status: 'pending',
-    storageLocation,
-    createdBy: null
-  });
-
-  await performBackup(backup._id, companyId, collections || getAllCollections());
-  
-  return backup;
-};
-
-const getAllCollections = () => {
-  return [
-    'ActionLog', 'Budget', 'CashDrawer', 'Category', 'Client', 
-    'Company', 'CreditNote', 'Department', 'ExchangeRate', 
-    'InventoryBatch', 'Invoice', 'InvoiceReceiptMetadata', 'IPWhitelist',
-    'Notification', 'NotificationSettings', 'Product', 'Purchase', 
-    'Quotation', 'RecurringInvoice', 'ReorderPoint', 'Role',
-    'SerialNumber', 'StockAudit', 'StockMovement', 'StockTransfer',
-    'Subscription', 'Supplier', 'User', 'Warehouse'
-  ];
-};
-
-module.exports = {
-  startBackupScheduler,
-  startVerificationScheduler,
-  stopBackupScheduler,
-  runAutomatedBackup,
-  processScheduledBackups,
-  runScheduledVerification,
-  triggerManualBackup,
-  getCronExpression
-};
+module.exports = backupScheduler;

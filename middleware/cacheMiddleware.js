@@ -2,6 +2,11 @@ const cacheService = require('../services/cacheService');
 const jwt = require('jsonwebtoken');
 const sessionService = require('../services/sessionService');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const JWT_SECRET = config.jwt.secret;
+
 /**
  * Cache middleware factory
  * Caches GET request responses automatically
@@ -133,7 +138,7 @@ const cacheInvalidationMiddleware = (options = {}) => {
 
 /**
  * Express middleware for session management with Redis
- * Adds session data to request object
+ * Adds session data to request object and updates activity on every request
  */
 const sessionMiddleware = async (req, res, next) => {
   // Skip for public routes
@@ -158,9 +163,17 @@ const sessionMiddleware = async (req, res, next) => {
     }
 
     // If `req.user` already exists (auth middleware ran earlier), use it
+    let userId = null;
     if (req.user && req.user._id) {
-      const session = await sessionService.getSession(req.user._id.toString());
-      if (session) req.session = session;
+      userId = req.user._id.toString();
+      const session = await sessionService.getSession(userId);
+      if (session) {
+        req.session = session;
+        // Update last activity on every request (fire-and-forget)
+        sessionService.extendSession(userId).catch(err => {
+          console.error('Failed to extend session:', err.message);
+        });
+      }
       return next();
     }
 
@@ -168,16 +181,30 @@ const sessionMiddleware = async (req, res, next) => {
     const byToken = await sessionService.getUserByToken(token);
     if (byToken) {
       req.session = byToken;
+      userId = byToken.userId;
+      // Update last activity on every request (fire-and-forget)
+      if (userId) {
+        sessionService.extendSession(userId).catch(err => {
+          console.error('Failed to extend session:', err.message);
+        });
+      }
       return next();
     }
 
     // As a last resort, decode JWT to find user id and load session
     try {
-      const payload = jwt.verify(token, process.env.JWT_SECRET);
-      const userId = payload.id || payload._id || null;
-      if (userId) {
-        const session = await sessionService.getSession(userId.toString());
-        if (session) req.session = session;
+      const payload = jwt.verify(token, JWT_SECRET);
+      const userIdFromPayload = payload.id || payload._id || null;
+      if (userIdFromPayload) {
+        userId = userIdFromPayload.toString();
+        const session = await sessionService.getSession(userId);
+        if (session) {
+          req.session = session;
+          // Update last activity on every request (fire-and-forget)
+          sessionService.extendSession(userId).catch(err => {
+            console.error('Failed to extend session:', err.message);
+          });
+        }
       }
     } catch (e) {
       // ignore invalid tokens here; auth middleware will handle if required

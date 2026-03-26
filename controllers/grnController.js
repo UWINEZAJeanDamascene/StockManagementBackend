@@ -16,11 +16,25 @@ const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNT
 exports.createGRN = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { purchaseOrderId, warehouse, lines, referenceNo } = req.body;
+    const { purchaseOrderId, warehouse, lines, referenceNo, supplierInvoiceNo } = req.body;
 
     const po = await PurchaseOrder.findOne({ _id: purchaseOrderId, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found' });
     if (po.status !== 'approved') return res.status(409).json({ success: false, message: 'PO must be approved before creating GRN' });
+
+    // Validate qtyReceived against remaining qty for each line
+    for (const line of lines) {
+      const poLine = po.lines.id(line.purchaseOrderLine);
+      if (poLine) {
+        const remainingQty = (poLine.qtyOrdered || 0) - (poLine.qtyReceived || 0);
+        if (line.qtyReceived > remainingQty) {
+          return res.status(400).json({ 
+            success: false, 
+            message: `Qty received (${line.qtyReceived}) exceeds remaining qty (${remainingQty}) for product` 
+          });
+        }
+      }
+    }
 
     const grn = await GoodsReceivedNote.create({
       company: companyId,
@@ -28,6 +42,7 @@ exports.createGRN = async (req, res, next) => {
       purchaseOrder: po._id,
       warehouse,
       supplier: po.supplier,
+      supplierInvoiceNo: supplierInvoiceNo || null,
       lines,
       createdBy: req.user.id
     });
@@ -332,6 +347,91 @@ exports.confirmGRN = async (req, res, next) => {
     res.json({ success: true, message: 'GRN confirmed', data: await GoodsReceivedNote.findById(result._id) });
   } catch (err) {
     if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });
+    next(err);
+  }
+};
+
+// List GRNs with filters
+exports.listGRNs = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { supplier_id, status, date_from, date_to, page = 1, limit = 20 } = req.query;
+    
+    const query = { company: companyId };
+    
+    if (supplier_id) query.supplier = supplier_id;
+    if (status) query.status = status;
+    if (date_from || date_to) {
+      query.receivedDate = {};
+      if (date_from) query.receivedDate.$gte = new Date(date_from);
+      if (date_to) query.receivedDate.$lte = new Date(date_to);
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const grns = await GoodsReceivedNote.find(query)
+      .populate('purchaseOrder', 'referenceNo')
+      .populate('supplier', 'name code')
+      .populate('warehouse', 'name code')
+      .populate('createdBy', 'name email')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+    
+    const total = await GoodsReceivedNote.countDocuments(query);
+    
+    // Calculate totalAmount for each GRN from lines
+    const grnsWithTotal = grns.map(grn => {
+      const totalAmount = grn.lines.reduce((sum, line) => sum + (Number(line.qtyReceived) * Number(line.unitCost || 0)), 0);
+      return { ...grn, totalAmount };
+    });
+    
+    res.json({
+      success: true,
+      data: grnsWithTotal,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(total / parseInt(limit)),
+        total,
+        limit: parseInt(limit)
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Get single GRN by ID
+exports.getGRN = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const grn = await GoodsReceivedNote.findOne({ _id: req.params.id, company: companyId })
+      .populate({
+        path: 'purchaseOrder',
+        populate: {
+          path: 'lines.product',
+          select: 'name sku'
+        }
+      })
+      .populate('supplier', 'name code email phone address')
+      .populate('warehouse', 'name code')
+      .populate('createdBy', 'name email')
+      .populate('confirmedBy', 'name email')
+      .populate('journalEntry')
+      .lean();
+    
+    if (!grn) {
+      return res.status(404).json({ success: false, message: 'GRN not found' });
+    }
+    
+    // Calculate totals from lines
+    const totalAmount = grn.lines.reduce((sum, line) => sum + (Number(line.qtyReceived) * Number(line.unitCost || 0)), 0);
+    grn.totalAmount = totalAmount;
+    
+    res.json({ success: true, data: grn });
+  } catch (err) {
     next(err);
   }
 };

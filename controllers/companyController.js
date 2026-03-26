@@ -230,3 +230,118 @@ exports.deleteCompany = async (req, res) => {
     });
   }
 };
+
+/** POST /api/companies/register — public */
+exports.registerPublic = async (req, res) => {
+  try {
+    const { company, admin } = req.body;
+    const result = await CompanyService.registerPublicCompany({ company, admin });
+    res.status(201).json({
+      success: true,
+      message: 'Registration submitted. A platform administrator will review your application.',
+      data: {
+        company: {
+          _id: result.company._id,
+          name: result.company.name,
+          email: result.company.email,
+          status: result.company.approvalStatus
+        },
+        user: { _id: result.user._id, email: result.user.email }
+      }
+    });
+  } catch (error) {
+    const code = error.code || error.message;
+    if (code === 'COMPANY_EMAIL_ALREADY_REGISTERED') {
+      return res.status(409).json({
+        success: false,
+        message: 'A company with this business email is already registered',
+        code
+      });
+    }
+    if (code === 'EMAIL_NOT_AVAILABLE') {
+      return res.status(409).json({
+        success: false,
+        message: 'This email cannot be used for registration',
+        code
+      });
+    }
+    if (code === 'DUPLICATE_USER_EMAIL_FOR_COMPANY' || code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'An account with this email already exists for this registration',
+        code: 'DUPLICATE_USER_EMAIL_FOR_COMPANY'
+      });
+    }
+    if (code === 'PASSWORD_TOO_SHORT') {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters', code });
+    }
+    if (error.message === 'MISSING_REQUIRED_FIELDS') {
+      return res.status(400).json({ success: false, message: 'Please fill in all required fields' });
+    }
+    console.error('registerPublic:', error);
+    res.status(500).json({ success: false, message: error.message || 'Registration failed' });
+  }
+};
+
+/** GET /api/companies/pending — platform_admin */
+exports.getPendingCompanies = async (req, res) => {
+  try {
+    const data = await CompanyService.listCompaniesByApprovalStatus('pending');
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message || 'Failed to load pending companies' });
+  }
+};
+
+/** GET /api/companies/rejected — platform_admin */
+exports.getRejectedCompanies = async (req, res) => {
+  try {
+    const data = await CompanyService.listCompaniesByApprovalStatus('rejected');
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message || 'Failed to load rejected companies' });
+  }
+};
+
+/** PUT /api/companies/:id/approve — platform_admin */
+exports.approveCompany = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const company = await CompanyService.approveCompanyById(id, req.user._id);
+    res.json({
+      success: true,
+      message: 'Company approved successfully',
+      data: company
+    });
+  } catch (error) {
+    if (error.message === 'COMPANY_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Company not found' });
+    }
+    if (error.message === 'COMPANY_NOT_PENDING') {
+      return res.status(400).json({ success: false, message: 'Company is not awaiting approval' });
+    }
+    res.status(500).json({ success: false, message: error.message || 'Approval failed' });
+  }
+};
+
+/** PUT /api/companies/:id/reject — platform_admin */
+exports.rejectCompany = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = req.body && req.body.reason;
+    const company = await CompanyService.rejectCompanyById(id, reason, req.user._id);
+    res.json({
+      success: true,
+      message: 'Company registration rejected',
+      data: company
+    });
+  } catch (error) {
+    if (error.message === 'COMPANY_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Company not found' });
+    }
+    if (error.message === 'COMPANY_NOT_PENDING') {
+      return res.status(400).json({ success: false, message: 'Company is not awaiting approval' });
+    }
+    res.status(500).json({ success: false, message: error.message || 'Rejection failed' });
+  }
+};

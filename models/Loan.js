@@ -138,12 +138,12 @@ const loanSchema = new mongoose.Schema({
   
   // Account references for journal entries
   liabilityAccountId: {
-    type: mongoose.Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.Mixed, // Accept both ObjectId and string (account code)
     ref: 'ChartOfAccounts',
     required: [true, 'Liability account is required']
   },
   interestExpenseAccountId: {
-    type: mongoose.Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.Mixed,
     ref: 'ChartOfAccounts',
     default: null
   },

@@ -204,13 +204,12 @@ describe('Accounts Receivable API', () => {
       
       // Verify journal entries were created
       const journals = await JournalEntry.find({ reference: `RCP-2024-00002` });
-      expect(journals).toHaveLength(2);
+      expect(journals).toHaveLength(1);
       
-      // Should have DR bank and CR AR
-      const drEntry = journals.find(j => j.debitTotal > 0);
-      const crEntry = journals.find(j => j.creditTotal > 0);
-      expect(drEntry.debitTotal).toBe(500.00);
-      expect(crEntry.creditTotal).toBe(500.00);
+      // Should have DR bank and CR AR in the same entry
+      const journal = journals[0];
+      expect(journal.debitTotal).toBe(500.00);
+      expect(journal.creditTotal).toBe(500.00);
     });
 
     it('should not allow posting a posted receipt', async () => {
@@ -521,12 +520,12 @@ describe('Accounts Receivable API', () => {
       
       // Verify journal entries
       const journals = await JournalEntry.find({ reference: 'BDW-2024-00001' });
-      expect(journals).toHaveLength(2);
+      expect(journals).toHaveLength(1);
       
-      const drEntry = journals.find(j => j.debitTotal > 0);
-      const crEntry = journals.find(j => j.creditTotal > 0);
-      expect(drEntry.debitTotal).toBe(1100.00);
-      expect(crEntry.creditTotal).toBe(1100.00);
+      // Should have DR bad debt expense and CR AR in the same entry
+      const journal = journals[0];
+      expect(journal.debitTotal).toBe(1100.00);
+      expect(journal.creditTotal).toBe(1100.00);
     });
   });
 

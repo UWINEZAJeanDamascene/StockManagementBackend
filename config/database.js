@@ -1,45 +1,39 @@
 const mongoose = require('mongoose');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+
 /**
  * Pool and timeout options for production load (overridable via environment).
  */
 function buildMongooseConnectOptions() {
-  const maxPoolSize = Math.max(
-    10,
-    parseInt(process.env.MONGODB_MAX_POOL_SIZE || '50', 10) || 50
-  );
-  const minPoolSize = Math.max(
-    0,
-    parseInt(process.env.MONGODB_MIN_POOL_SIZE || '0', 10) || 0
-  );
+  const config = env.getConfig();
+  const dbConfig = config.db;
+  
+  const maxPoolSize = Math.max(10, dbConfig.maxPoolSize);
+  const minPoolSize = Math.max(0, dbConfig.minPoolSize);
 
   return {
     maxPoolSize,
     minPoolSize,
-    serverSelectionTimeoutMS: parseInt(
-      process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS || '30000',
-      10
-    ),
-    socketTimeoutMS: parseInt(process.env.MONGODB_SOCKET_TIMEOUT_MS || '0', 10),
-    connectTimeoutMS: parseInt(process.env.MONGODB_CONNECT_TIMEOUT_MS || '30000', 10),
-    heartbeatFrequencyMS: parseInt(
-      process.env.MONGODB_HEARTBEAT_FREQUENCY_MS || '10000',
-      10
-    ),
+    serverSelectionTimeoutMS: dbConfig.serverSelectionTimeoutMs,
+    socketTimeoutMS: dbConfig.socketTimeoutMs,
+    connectTimeoutMS: dbConfig.connectTimeoutMs,
+    heartbeatFrequencyMS: dbConfig.heartbeatFrequencyMs,
   };
 }
 
 const connectDB = async () => {
   try {
-    if (!process.env.MONGODB_URI) {
+    const config = env.getConfig();
+    const dbUri = config.db.uri;
+    
+    if (!dbUri) {
       console.error('Error: MONGODB_URI is not defined in environment');
       process.exit(1);
     }
 
-    const conn = await mongoose.connect(
-      process.env.MONGODB_URI,
-      buildMongooseConnectOptions()
-    );
+    const conn = await mongoose.connect(dbUri, buildMongooseConnectOptions());
 
     console.log(`MongoDB Connected: ${conn.connection.host}`);
 

@@ -3,6 +3,9 @@ const User = require('../models/User');
 const Company = require('../models/Company');
 const { notifyPasswordChanged, notifyFailedLogin } = require('../services/notificationHelper');
 const sessionService = require('../services/sessionService');
+// Centralized config
+const env = require('../src/config/environment');
+const config = env.getConfig();
 
 // Generate JWT Token with company and role info
 const generateToken = (id, companyId, role) => {
@@ -61,11 +64,17 @@ exports.login = async (req, res, next) => {
         token,
         { email: user.email, name: user.name }
       );
-      
+      // Set httpOnly cookie for token (server-side session)
+      res.cookie('token', token, {
+        httpOnly: true,
+        secure: config.server.env === 'production',
+        sameSite: 'lax',
+        maxAge: (config.session && config.session.ttl ? config.session.ttl : 24 * 60 * 60) * 1000,
+      });
+
       return res.json({
         success: true,
         data: userWithoutPassword,
-        token,
         requirePasswordChange: user.mustChangePassword || false,
         isPlatformAdmin: true
       });
@@ -132,11 +141,18 @@ exports.login = async (req, res, next) => {
       { email: user.email, name: user.name, companyName: user.company.name }
     );
 
+    // Set httpOnly cookie for token
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: config.server.env === 'production',
+      sameSite: 'lax',
+      maxAge: (config.session && config.session.ttl ? config.session.ttl : 24 * 60 * 60) * 1000,
+    });
+
     res.json({
       success: true,
       data: userWithoutPassword,
       company: user.company,
-      token,
       requirePasswordChange
     });
   } catch (error) {
@@ -216,8 +232,8 @@ exports.updatePassword = async (req, res, next) => {
 // @access  Private
 exports.logout = async (req, res, next) => {
   try {
-    // Get token from header
-    const token = req.headers.authorization?.split(' ')[1];
+    // Get token from header or cookie
+    const token = req.headers.authorization?.split(' ')[1] || req.cookies?.token;
 
     // Delete session from Redis
     if (req.user) {
@@ -228,6 +244,8 @@ exports.logout = async (req, res, next) => {
     if (token) {
       await sessionService.blacklistToken(token);
     }
+    // Clear cookie on logout
+    res.clearCookie('token');
 
     res.json({
       success: true,

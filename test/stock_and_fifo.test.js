@@ -95,7 +95,8 @@ test('Can create delivery note with required fields', async () => {
   const invoice = await Invoice.create({ 
     company: companyId, 
     client: client._id, 
-    dueDate: new Date(),
+    invoiceDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), // 7 days ago
+    dueDate: new Date(), // today - which is after invoiceDate
     createdBy: userId,
     status: 'confirmed',
     items: [{ 

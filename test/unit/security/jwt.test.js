@@ -24,7 +24,7 @@ let testUser;
 beforeAll(async () => {
   mongoServer = await MongoMemoryServer.create();
   await mongoose.connect(mongoServer.getUri());
-  process.env.JWT_ACCESS_EXPIRE = '15m';
+  process.env.JWT_EXPIRE = '15m';
 });
 
 afterAll(async () => {

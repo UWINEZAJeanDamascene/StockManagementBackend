@@ -1,10 +1,15 @@
 const express = require('express');
 const compression = require('compression');
+const cookieParser = require('cookie-parser');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const helmet = require('helmet');
 const hpp = require('hpp');
 const morgan = require('morgan');
+
+// Load environment variables FIRST, before any other imports
+dotenv.config();
+
 const connectDB = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
 
@@ -13,8 +18,14 @@ const { redisClient } = require('./config/redis');
 const { createRateLimiters } = require('./middleware/redisRateLimiter');
 const { sessionMiddleware } = require('./middleware/cacheMiddleware');
 
-// Load environment variables
-dotenv.config();
+// Import centralized configuration (now dotenv has been loaded)
+const env = require('./src/config/environment');
+const config = env.getConfig();
+
+// Get commonly used config values
+const NODE_ENV = config.server.env;
+const PORT = config.server.port;
+const CORS_ORIGINS = config.server.corsOrigins;
 
 // Connect to MongoDB
 connectDB();
@@ -22,7 +33,7 @@ connectDB();
 // Register tenant plugin before models are loaded so all models inherit it
 const mongoose = require('mongoose');
 // Determine if running under tests (Jest sets JEST_WORKER_ID, and tests may set NODE_ENV='test')
-const isTestEnv = (process.env.NODE_ENV === 'test') || !!process.env.JEST_WORKER_ID;
+const isTestEnv = (NODE_ENV === 'test') || !!process.env.JEST_WORKER_ID;
 // During tests, disable automatic index creation to avoid long-running index builds
 if (isTestEnv) {
   try {
@@ -63,12 +74,13 @@ require('./models/StockTransferLine');
 require('./models/StockBatch');
 require('./models/StockSerialNumber');
 require('./models/CompanyUser');
+require('./src/models/ImportJob');
 
 const app = express();
 
 // Security middleware — XSS, clickjacking, MIME sniffing protection
 app.use(helmet({
-  contentSecurityPolicy: process.env.NODE_ENV === 'production',
+  contentSecurityPolicy: NODE_ENV === 'production',
   crossOriginEmbedderPolicy: false
 }));
 
@@ -95,20 +107,18 @@ const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true); // Allow no-origin (server-to-server)
 
-    const isDevelopment = process.env.NODE_ENV === 'development';
-    const isTest = process.env.NODE_ENV === 'test';
+    const isDevelopment = NODE_ENV === 'development';
+    const isTest = NODE_ENV === 'test';
 
     // In development/test mode, allow common dev origins
-    if (isDevelopment || isTest) {
+    if (isDevelopment || isTest || !NODE_ENV || NODE_ENV === 'undefined') {
       if (origin.includes('localhost')) return callback(null, true);
       if (origin.includes('vercel.app')) return callback(null, true);
       if (origin.includes('render.com')) return callback(null, true);
     }
 
     // Check environment variable whitelist (production only)
-    const explicitOrigins = process.env.CORS_ORIGINS
-      ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
-      : [];
+    const explicitOrigins = CORS_ORIGINS;
 
     if (explicitOrigins.length > 0 && explicitOrigins.includes(origin)) {
       return callback(null, true);
@@ -145,6 +155,9 @@ app.use(compression({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Cookie parser (needed for httpOnly cookie sessions)
+app.use(cookieParser());
+
 // HTTP Parameter Pollution — last duplicate query key wins (single scalar)
 app.use(hpp());
 
@@ -156,7 +169,7 @@ app.use(sanitizeInput);
 app.use(sessionMiddleware);
 
 // Logging
-if (process.env.NODE_ENV === 'development') {
+if (NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
 
@@ -171,6 +184,7 @@ apiRouter.use('/categories', require('./routes/categoryRoutes'));
 apiRouter.use('/suppliers', require('./routes/supplierRoutes'));
 apiRouter.use('/clients', require('./routes/clientRoutes'));
 apiRouter.use('/stock', require('./routes/stockRoutes'));
+apiRouter.use('/stock/warehouses', require('./routes/warehouseRoutes'));
 apiRouter.use('/stock/advanced', require('./routes/advancedStockRoutes'));
 apiRouter.use('/quotations', require('./routes/quotationRoutes'));
 apiRouter.use('/sales-invoices', require('./routes/invoiceRoutes'));
@@ -220,6 +234,10 @@ apiRouter.use('/periods', require('./routes/periodRoutes'));
 apiRouter.use('/settings', require('./routes/settingsRoutes'));
 apiRouter.use('/opening-balances', require('./routes/openingBalanceRoutes'));
 apiRouter.use('/audit-logs', require('./routes/auditRoutes'));
+
+// Import/Export routes (PHASE 5)
+apiRouter.use('/import', require('./src/routes/v1/import.routes'));
+apiRouter.use('/export', require('./src/routes/v1/export.routes'));
 
 app.use('/api', apiRouter);
 app.use('/api/v1', apiRouter);
@@ -272,11 +290,9 @@ app.use((req, res) => {
 // Error handler
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
-
 // Start background schedulers and workers (skip during tests and in Jest workers)
 // Jest sets NODE_ENV='test' and also sets JEST_WORKER_ID; guard both to be safe.
-if (!(process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
+if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
   // Start recurring scheduler (non-blocking)
   try {
     const { startScheduler } = require('./services/recurringService');
@@ -343,9 +359,9 @@ try {
 }
 
 let server;
-if (process.env.NODE_ENV !== 'test') {
+if (NODE_ENV !== 'test') {
   server = app.listen(PORT, () => {
-    console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+    console.log(`Server running in ${NODE_ENV} mode on port ${PORT}`);
   });
 
   server.on('error', (err) => {
@@ -356,7 +372,7 @@ if (process.env.NODE_ENV !== 'test') {
       console.log(`Attempting to listen on port ${fallbackPort} instead...`);
       server.close();
       app.listen(fallbackPort, () => {
-        console.log(`Server running in ${process.env.NODE_ENV} mode on port ${fallbackPort}`);
+        console.log(`Server running in ${NODE_ENV} mode on port ${fallbackPort}`);
       }).on('error', (e) => {
         console.error('Failed to bind to fallback port:', e.message);
         process.exit(1);

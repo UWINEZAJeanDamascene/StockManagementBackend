@@ -1,5 +1,10 @@
 const { getTransporter } = require('../config/email');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const emailConfig = config.email;
+
 // ============================================
 // CONSTANTS
 // ============================================
@@ -8,7 +13,9 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1000; // exponential: 1s → 2s → 4s
 
 const getSender = () =>
-  `${process.env.EMAIL_FROM_NAME || 'StockManager'} <${process.env.EMAIL_FROM_ADDRESS || process.env.GMAIL_USER}>`;
+  `${emailConfig.fromName} <${emailConfig.fromAddress || emailConfig.gmailUser}>`;
+
+const FRONTEND_URL = config.server.frontendUrl;
 
 // ============================================
 // HELPERS
@@ -146,7 +153,7 @@ const sendInvoiceEmail = async (invoice, company, client, pdfBuffer = null) => {
         </div>
         ${invoice.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(invoice.notes)}</div>` : ''}
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}/invoices/${invoice._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Invoice Online</a>
+          <a href="${FRONTEND_URL}/invoices/${invoice._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Invoice Online</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">Thank you for your business! Payment is due by ${dueDate}.<br/>StockManager — Manage Your Stock From Supply to Final Sale</p>
@@ -195,7 +202,7 @@ const sendPaymentReminderEmail = async (invoice, company, client) => {
         </table>
         <p>Please arrange payment at your earliest convenience.</p>
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}/invoices/${invoice._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Pay Now</a>
+          <a href="${FRONTEND_URL}/invoices/${invoice._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Pay Now</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">If you have already made payment, please ignore this reminder.<br/>StockManager — Manage Your Stock From Supply to Final Sale</p>
@@ -248,7 +255,7 @@ const sendLowStockAlertEmail = async (product, company, reorderPoint = null) => 
           </table>
         </div>
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}/products/${product._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Reorder Now</a>
+          <a href="${FRONTEND_URL}/products/${product._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Reorder Now</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">StockManager — Automated Stock Alert</p>
@@ -318,7 +325,7 @@ const sendWelcomeEmail = async ({ to, name, companyName }) => {
         <p>Your account for <b>${esc(companyName)}</b> has been approved.</p>
         <p>You can now login and start managing your stock.</p>
         <div style="text-align:center; margin:30px 0;">
-          <a href="${process.env.FRONTEND_URL}/login" style="background:#7c3aed; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Login to Dashboard →</a>
+          <a href="${FRONTEND_URL}/login" style="background:#7c3aed; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Login to Dashboard →</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
@@ -333,7 +340,7 @@ const sendWelcomeEmail = async ({ to, name, companyName }) => {
 // ============================================
 
 const sendPasswordResetEmail = async ({ to, name, resetToken }) => {
-  const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
+  const resetUrl = `${FRONTEND_URL}/reset-password/${resetToken}`;
   const subject = 'Reset Your StockManager Password';
 
   const html = `
@@ -408,7 +415,7 @@ const sendApprovalEmail = async (companyEmail, companyName, adminName) => {
           </ul>
         </div>
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Login to Your Account</a>
+          <a href="${FRONTEND_URL}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">Login to Your Account</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
@@ -476,7 +483,7 @@ const sendDailySummaryEmail = async (company, stats) => {
           </tr>
         </table>
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}/dashboard" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Dashboard</a>
+          <a href="${FRONTEND_URL}/dashboard" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Dashboard</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">StockManager — Automated Daily Report</p>
@@ -520,7 +527,7 @@ const sendWeeklySummaryEmail = async (company, stats) => {
           </tr>
         </table>
         <div style="text-align:center; margin-top:30px;">
-          <a href="${process.env.FRONTEND_URL}/reports" style="background:#10b981; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Full Report</a>
+          <a href="${FRONTEND_URL}/reports" style="background:#10b981; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Full Report</a>
         </div>
         <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
         <p style="font-size:12px; color:#888; text-align:center;">StockManager — Automated Weekly Report</p>

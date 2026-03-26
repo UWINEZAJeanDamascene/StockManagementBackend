@@ -7,7 +7,8 @@ const {
   updateExpense,
   deleteExpense,
   getExpenseSummary,
-  bulkCreateExpenses
+  bulkCreateExpenses,
+  reverseExpense
 } = require('../controllers/expenseController');
 
 const { protect } = require('../middleware/auth');
@@ -30,5 +31,8 @@ router.route('/:id')
   .get(getExpense)
   .put(updateExpense)
   .delete(deleteExpense);
+
+router.route('/:id/reverse')
+  .post(reverseExpense);
 
 module.exports = router;

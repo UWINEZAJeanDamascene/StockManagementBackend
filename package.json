@@ -9,7 +9,8 @@
     "migrate:backfill-account-balances": "node scripts/backfill_account_balances.js --dry-run",
     "drop-category-unique-index": "node scripts/removeCategoryUniqueIndex.js",
     "test": "jest --runInBand",
-    "migrate:journal": "node scripts/migrate_journal_engine.js"
+    "migrate:journal": "node scripts/migrate_journal_engine.js",
+    "seed:platform-admin": "node scripts/seedPlatformAdmin.js"
   },
   "keywords": [
     "stock",
@@ -28,6 +29,7 @@
     "bullmq": "^5.70.4",
     "bwip-js": "^2.0.11",
     "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "csv-parse": "^6.1.0",
     "csv-stringify": "^6.6.0",

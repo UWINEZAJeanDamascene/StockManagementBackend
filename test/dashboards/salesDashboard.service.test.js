@@ -157,14 +157,16 @@ describe('SalesDashboardService', () => {
 
   it('ar_aging days_1_30 includes invoices 1 to 30 days past due_date', async () => {
     jest.useFakeTimers({ advanceTimers: true })
-    jest.setSystemTime(new Date(Date.UTC(2025, 5, 15, 12, 0, 0)))
+    jest.setSystemTime(new Date(Date.UTC(2025, 6, 25, 12, 0, 0))) // July 25, 2025
 
+    // Invoice dated July 1, due July 15 (14 days after invoice)
+    // Current time is July 25 - that's 10 days after due date (within 1-30 range)
     await Invoice.create({
       company: companyA._id,
       client: clientA._id,
       referenceNo: invRef(),
-      invoiceDate: new Date(),
-      dueDate: new Date(Date.UTC(2025, 5, 10)),
+      invoiceDate: new Date(Date.UTC(2025, 6, 1)), // July 1, 2025
+      dueDate: new Date(Date.UTC(2025, 6, 15)), // July 15, 2025 (14 days after invoice)
       status: 'confirmed',
       totalAmount: 40,
       amountPaid: 0,
@@ -180,14 +182,16 @@ describe('SalesDashboardService', () => {
 
   it('ar_aging days_90_plus includes invoices more than 90 days past due_date', async () => {
     jest.useFakeTimers({ advanceTimers: true })
-    jest.setSystemTime(new Date(Date.UTC(2025, 5, 15, 12, 0, 0)))
+    jest.setSystemTime(new Date(Date.UTC(2025, 5, 20, 12, 0, 0))) // July 20, 2025
 
+    // Invoice dated March 1, due March 15 (14 days after invoice)
+    // Current time is July 20 - that's 127 days after due date (>90 days)
     await Invoice.create({
       company: companyA._id,
       client: clientA._id,
       referenceNo: invRef(),
-      invoiceDate: new Date(),
-      dueDate: new Date(Date.UTC(2025, 2, 1)),
+      invoiceDate: new Date(Date.UTC(2025, 2, 1)), // March 1, 2025
+      dueDate: new Date(Date.UTC(2025, 2, 15)), // March 15, 2025 (14 days after invoice)
       status: 'confirmed',
       totalAmount: 25,
       amountPaid: 0,

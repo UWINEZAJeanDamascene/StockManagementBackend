@@ -10,7 +10,11 @@ const {
   getClientOutstandingInvoices,
   toggleClientStatus,
   getClientsWithStats,
-  exportClientsToPDF
+  exportClientsToPDF,
+  getClientInvoices,
+  getClientReceipts,
+  getClientCreditNotes,
+  getClientStatementPDF
 } = require('../controllers/clientController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
@@ -37,5 +41,11 @@ router.put('/:id/toggle-status', authorize('admin'), toggleClientStatus);
 
 router.get('/:id/purchase-history', getClientPurchaseHistory);
 router.get('/:id/outstanding-invoices', getClientOutstandingInvoices);
+
+// Client detail endpoints
+router.get('/:id/invoices', getClientInvoices);
+router.get('/:id/receipts', getClientReceipts);
+router.get('/:id/credit-notes', getClientCreditNotes);
+router.get('/:id/statement', getClientStatementPDF);
 
 module.exports = router;

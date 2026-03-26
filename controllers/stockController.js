@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
@@ -491,6 +492,186 @@ exports.updateStockMovement = async (req, res, next) => {
     const companyId = req.user.company._id;
     // Stock movements are immutable. Updates are not allowed; create compensating opposite movements instead.
     return res.status(405).json({ success: false, message: 'Stock movements are immutable and cannot be modified', code: 'MOVEMENT_IMMUTABLE' });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get stock levels (per-warehouse stock information)
+// @route   GET /api/stock/levels
+// @access  Private
+exports.getStockLevels = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { 
+      warehouse, 
+      product, 
+      lowStock, 
+      search, 
+      page = 1, 
+      limit = 50,
+      sortBy = 'productName',
+      order = 'asc'
+    } = req.query;
+
+    // Use already imported models
+    // Build aggregation pipeline
+    const matchStage = { company: companyId };
+    
+    if (warehouse) {
+      matchStage.warehouse = warehouse;
+    }
+    
+    if (product) {
+      matchStage.product = product;
+    }
+
+    // Filter for low stock (available <= 20% of threshold or below reorder point)
+    if (lowStock === 'true') {
+      matchStage.$expr = { $lte: ['$availableQuantity', '$quantity * 0.2'] };
+    }
+
+    // Get total count from InventoryBatch
+    let total = await InventoryBatch.countDocuments(matchStage);
+
+    // If no inventory batches found but we have products with default warehouse, also show those
+    // This handles the case where products have currentStock but no InventoryBatch records
+    if (total === 0) {
+      const productQuery = { 
+        company: companyId,
+        $or: [
+          { currentStock: { $gt: 0 } },
+          { defaultWarehouse: { $exists: true, $ne: null } }
+        ]
+      };
+      if (product) {
+        productQuery._id = product;
+      }
+      if (search) {
+        productQuery.$or = [
+          { name: { $regex: search, $options: 'i' } },
+          { sku: { $regex: search, $options: 'i' } }
+        ];
+      }
+      const productsWithStock = await Product.find(productQuery).lean();
+      if (productsWithStock.length > 0) {
+        // Get all warehouses to show product stock (default warehouse or all)
+        const warehouses = await Warehouse.find({ company: companyId, isActive: true }).lean();
+        
+        const stockFromProducts = productsWithStock.map(p => ({
+          _id: p._id,
+          product: p._id,
+          productId: p._id,
+          productName: p.name,
+          productSku: p.sku,
+          warehouse: p.defaultWarehouse || (warehouses[0]?._id || null),
+          warehouseId: p.defaultWarehouse || (warehouses[0]?._id || null),
+          warehouseName: p.defaultWarehouse 
+            ? (warehouses.find(w => w._id.toString() === p.defaultWarehouse?.toString())?.name || 'Default')
+            : (warehouses[0]?.name || 'Unassigned'),
+          quantity: Number(p.currentStock || 0),
+          availableQuantity: Number(p.currentStock || 0),
+          reservedQuantity: 0,
+          unitCost: Number(p.costPrice || p.averageCost || 0),
+          totalCost: Number(p.currentStock || 0) * Number(p.costPrice || p.averageCost || 0),
+          status: 'active',
+          source: 'product' // Mark as from product currentStock
+        }));
+
+        // Apply pagination
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
+        const startIndex = (pageNum - 1) * limitNum;
+        const paginatedData = stockFromProducts.slice(startIndex, startIndex + limitNum);
+
+        return res.json({
+          success: true,
+          data: paginatedData,
+          warehouses: warehouses,
+          pagination: {
+            total: stockFromProducts.length,
+            page: pageNum,
+            limit: limitNum,
+            pages: Math.ceil(stockFromProducts.length / limitNum)
+          }
+        });
+      }
+    }
+
+    // Aggregation to get stock levels with product and warehouse info
+    const stockLevels = await InventoryBatch.aggregate([
+      { $match: matchStage },
+      {
+        $lookup: {
+          from: 'products',
+          localField: 'product',
+          foreignField: '_id',
+          as: 'productInfo'
+        }
+      },
+      { $unwind: { path: '$productInfo', preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: 'warehouses',
+          localField: 'warehouse',
+          foreignField: '_id',
+          as: 'warehouseInfo'
+        }
+      },
+      { $unwind: { path: '$warehouseInfo', preserveNullAndEmptyArrays: true } },
+      // Search filter
+      ...(search ? [{
+        $match: {
+          $or: [
+            { 'productInfo.name': { $regex: search, $options: 'i' } },
+            { 'productInfo.sku': { $regex: search, $options: 'i' } },
+            { 'warehouseInfo.name': { $regex: search, $options: 'i' } }
+          ]
+        }
+      }] : []),
+      // Project final fields
+      {
+        $project: {
+          _id: 1,
+          product: { $concat: ['$productInfo.name', ' (', '$productInfo.sku', ')'] },
+          productId: '$product',
+          productName: '$productInfo.name',
+          productSku: '$productInfo.sku',
+          warehouse: { $concat: ['$warehouseInfo.name'] },
+          warehouseId: '$warehouse',
+          warehouseName: '$warehouseInfo.name',
+          quantity: 1,
+          availableQuantity: 1,
+          reservedQuantity: 1,
+          unitCost: 1,
+          totalCost: 1,
+          batchNumber: 1,
+          expiryDate: 1,
+          status: 1,
+          lastMovement: '$updatedAt'
+        }
+      },
+      // Sort
+      { $sort: { [sortBy]: order === 'asc' ? 1 : -1 } },
+      // Pagination
+      { $skip: (page - 1) * limit },
+      { $limit: parseInt(limit) }
+    ]);
+
+    // Get warehouses for filter dropdown
+    const warehouses = await Warehouse.find({ company: companyId, isActive: true }).select('name _id');
+
+    res.json({
+      success: true,
+      data: stockLevels,
+      warehouses,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     next(error);
   }

@@ -1,25 +1,30 @@
   const nodemailer = require('nodemailer');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const emailConfig = config.email;
+
 // ============================================
 // ENVIRONMENT VALIDATION
 // ============================================
 
 const validateConfig = () => {
-  const provider = (process.env.EMAIL_PROVIDER || 'gmail').toLowerCase();
+  const provider = emailConfig.provider;
   const missing = [];
 
   if (provider === 'gmail') {
-    if (!process.env.GMAIL_USER) missing.push('GMAIL_USER');
-    if (!process.env.GMAIL_APP_PASSWORD) missing.push('GMAIL_APP_PASSWORD');
+    if (!emailConfig.gmailUser) missing.push('GMAIL_USER');
+    if (!emailConfig.gmailAppPassword) missing.push('GMAIL_APP_PASSWORD');
   } else if (provider === 'resend') {
-    if (!process.env.RESEND_API_KEY) missing.push('RESEND_API_KEY');
+    if (!emailConfig.resendApiKey) missing.push('RESEND_API_KEY');
   } else {
-    if (!process.env.SMTP_HOST) missing.push('SMTP_HOST');
-    if (!process.env.SMTP_USER) missing.push('SMTP_USER');
-    if (!process.env.SMTP_PASS) missing.push('SMTP_PASS');
+    if (!emailConfig.smtpHost) missing.push('SMTP_HOST');
+    if (!emailConfig.smtpUser) missing.push('SMTP_USER');
+    if (!emailConfig.smtpPass) missing.push('SMTP_PASS');
   }
 
-  if (!process.env.EMAIL_FROM_ADDRESS && !process.env.GMAIL_USER) {
+  if (!emailConfig.fromAddress && !emailConfig.gmailUser) {
     missing.push('EMAIL_FROM_ADDRESS');
   }
 
@@ -36,6 +41,7 @@ const validateConfig = () => {
 
 const createTransporter = () => {
   const { provider } = validateConfig();
+  const nodeEnv = config.server.env;
 
   const poolDefaults = {
     pool: true,
@@ -45,8 +51,8 @@ const createTransporter = () => {
     connectionTimeout: 10000,
     greetingTimeout: 10000,
     socketTimeout: 30000,
-    logger: process.env.NODE_ENV === 'development',
-    debug: process.env.NODE_ENV === 'development'
+    logger: nodeEnv === 'development',
+    debug: nodeEnv === 'development'
   };
 
   if (provider === 'gmail') {
@@ -54,8 +60,8 @@ const createTransporter = () => {
       ...poolDefaults,
       service: 'gmail',
       auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
+        user: emailConfig.gmailUser,
+        pass: emailConfig.gmailAppPassword
       }
     });
   }
@@ -68,21 +74,21 @@ const createTransporter = () => {
       secure: true,
       auth: {
         user: 'resend',
-        pass: process.env.RESEND_API_KEY
+        pass: emailConfig.resendApiKey
       }
     });
   }
 
   // Fallback: generic SMTP
-  const port = parseInt(process.env.SMTP_PORT, 10) || 587;
+  const port = emailConfig.smtpPort;
   return nodemailer.createTransport({
     ...poolDefaults,
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    host: emailConfig.smtpHost,
     port,
     secure: port === 465,
     auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
+      user: emailConfig.smtpUser,
+      pass: emailConfig.smtpPass
     }
   });
 };
@@ -106,12 +112,14 @@ const getTransporter = () => {
  */
 const testConnection = async () => {
   try {
+    const { provider } = validateConfig();
     const t = getTransporter();
     await t.verify();
-    console.log(`✅ Email server connected (provider: ${process.env.EMAIL_PROVIDER || 'gmail'})`);
+    console.log(`✅ Email server connected (provider: ${provider})`);
     return true;
   } catch (error) {
-    console.error(`❌ Email server error [${process.env.EMAIL_PROVIDER || 'gmail'}]:`, error.message);
+    const { provider } = validateConfig();
+    console.error(`❌ Email server error [${provider}]:`, error.message);
     return false;
   }
 };

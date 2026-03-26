@@ -190,6 +190,8 @@ exports.createProduct = async (req, res, next) => {
     try {
       await cacheService.invalidateByCompany(companyId, 'product');
       await cacheService.invalidateByCompany(companyId, 'stock');
+      // Also invalidate all product type caches to ensure fresh data
+      await cacheService.invalidateType('product');
     } catch (e) {
       console.error('Cache invalidation failed:', e);
     }

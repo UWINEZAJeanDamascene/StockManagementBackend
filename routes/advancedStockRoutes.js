@@ -77,7 +77,9 @@ const {
 
 const {
   createGRN,
-  confirmGRN
+  confirmGRN,
+  listGRNs,
+  getGRN
 } = require('../controllers/grnController');
 
 const {
@@ -196,7 +198,9 @@ router.post('/purchase-orders/:id/approve', authorize('admin', 'stock_manager'),
 router.post('/purchase-orders/:id/cancel', authorize('admin', 'stock_manager'), logAction('stock'), cancelPurchaseOrder);
 
 // ========== GRN ROUTES ==========
+router.get('/grn', authorize('admin', 'stock_manager'), listGRNs);
 router.post('/grn', authorize('admin', 'stock_manager'), logAction('stock'), createGRN);
+router.get('/grn/:id', authorize('admin', 'stock_manager'), getGRN);
 router.post('/grn/:id/confirm', authorize('admin', 'stock_manager'), logAction('stock'), confirmGRN);
 
 // ========== PURCHASE RETURNS ==========

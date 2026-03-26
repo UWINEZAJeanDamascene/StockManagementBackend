@@ -1,5 +1,6 @@
 const { PettyCashFloat, PettyCashExpense, PettyCashReplenishment, PettyCashTransaction } = require('../models/PettyCash');
 const { BankAccount } = require('../models/BankAccount');
+const ChartOfAccountsService = require('../services/chartOfAccountsService');
 const JournalService = require('../services/journalService');
 const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS, getAccount, canPostToAccount } = require('../constants/chartOfAccounts');
 const mongoose = require('mongoose');
@@ -1206,6 +1207,26 @@ exports.topUp = async (req, res, next) => {
       });
     }
     
+    // Validate bank has sufficient balance for top-up
+    // Convert Decimal128 to number
+    let bankCurrentBalance = 0;
+    if (bankAccount.cachedBalance) {
+      bankCurrentBalance = parseFloat(bankAccount.cachedBalance.toString());
+    } else if (bankAccount.openingBalance) {
+      bankCurrentBalance = parseFloat(bankAccount.openingBalance.toString());
+    }
+    
+    if (bankCurrentBalance < amount) {
+      return res.status(409).json({
+        success: false,
+        code: 'INSUFFICIENT_BANK_BALANCE',
+        message: 'Insufficient bank account balance',
+        currentBalance: bankCurrentBalance,
+        requestedAmount: amount,
+        shortfall: amount - bankCurrentBalance
+      });
+    }
+    
     // Find the float
     const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
     if (!float) {
@@ -1269,6 +1290,20 @@ exports.topUp = async (req, res, next) => {
       // Update transaction with journal entry ID
       transaction.journalEntryId = journalEntry._id;
       await transaction.save();
+      
+      // Manually update bank account cached balance since journal entry affects it
+      // This ensures the balance is immediately reflected without waiting for cache invalidation
+      try {
+        const JournalEntry = mongoose.model('JournalEntry');
+        const bankAccountDoc = await BankAccount.findById(bankAccount._id);
+        if (bankAccountDoc) {
+          // Call getBalance to recalculate and update the cached balance
+          const balanceResult = await bankAccountDoc.getBalance(JournalEntry);
+          console.log('[PettyCashListPage] Bank account balance recalculated:', balanceResult.balance);
+        }
+      } catch (e) {
+        console.error('Failed to update bank account cached balance:', e);
+      }
     } catch (journalError) {
       console.error('Failed to create journal entry for petty cash top-up:', journalError);
     }
@@ -1396,6 +1431,15 @@ exports.recordExpense = async (req, res, next) => {
       // Update transaction with journal entry ID
       transaction.journalEntryId = journalEntry._id;
       await transaction.save();
+      
+      // Manually invalidate the petty cash float cache
+      try {
+        await PettyCashFloat.findByIdAndUpdate(float._id, { 
+          $set: { cacheValid: false }
+        });
+      } catch (e) {
+        console.error('Failed to invalidate petty cash cache:', e);
+      }
     } catch (journalError) {
       console.error('Failed to create journal entry for petty cash expense:', journalError);
     }
@@ -1457,19 +1501,39 @@ exports.getFundTransactions = async (req, res, next) => {
     
     // Calculate running balance for each transaction
     let runningBalance = float.openingBalance;
+    
+    // Get expense account details for populated expenseAccountIds
+    const expenseAccountIds = [...new Set(transactions.map(tx => tx.expenseAccountId).filter(Boolean))];
+    const expenseAccounts = {};
+    if (expenseAccountIds.length > 0) {
+      for (const accountId of expenseAccountIds) {
+        try {
+          const account = await ChartOfAccountsService.getAccountByCode(companyId, accountId);
+          if (account) {
+            expenseAccounts[accountId] = account.name;
+          }
+        } catch (e) {
+          // Account lookup failed, continue without name
+        }
+      }
+    }
+    
     const transactionsWithRunningBalance = transactions.map(tx => {
       runningBalance += tx.amount;
       return {
         _id: tx._id,
         referenceNo: tx.referenceNo,
         type: tx.type,
+        typeLabel: tx.type === 'top_up' ? 'Top Up' : tx.type === 'expense' ? 'Expense' : tx.type === 'opening' ? 'Opening' : tx.type === 'replenishment' ? 'Replenishment' : tx.type === 'adjustment' ? 'Adjustment' : 'Closing',
         amount: Math.abs(tx.amount),
         runningBalance,
         description: tx.description,
         expenseAccountId: tx.expenseAccountId,
+        expenseAccountName: tx.expenseAccountId ? expenseAccounts[tx.expenseAccountId] || null : null,
         receiptRef: tx.receiptRef,
         transactionDate: tx.transactionDate,
-        createdAt: tx.createdAt
+        createdAt: tx.createdAt,
+        createdBy: tx.createdBy
       };
     });
     

@@ -1,62 +1,57 @@
 /**
- * Platform Admin Seed Script
- * Run this once to create the default platform admin account
- * 
- * Usage: node scripts/seedPlatformAdmin.js
+ * Creates the first platform_admin user if none exists with this email.
+ * Run once after deploying the API:
+ *   PLATFORM_ADMIN_EMAIL=you@example.com PLATFORM_ADMIN_PASSWORD='SecurePass123!' node scripts/seedPlatformAdmin.js
+ *
+ * Requires MONGODB_URI (or your project's DB env var) in .env — same as server.
  */
+require('dotenv').config();
 
 const mongoose = require('mongoose');
-const dotenv = require('dotenv');
-const path = require('path');
+const connectDB = require('../config/database');
 const User = require('../models/User');
 
-dotenv.config({ path: path.join(__dirname, '..', '.env') });
+async function run() {
+  await connectDB();
 
-const seedPlatformAdmin = async () => {
-  try {
-    // Connect to MongoDB
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+  const email = (process.env.PLATFORM_ADMIN_EMAIL || 'platform.admin@stockmanager.local').toLowerCase().trim();
+  const password = process.env.PLATFORM_ADMIN_PASSWORD;
+  const name = (process.env.PLATFORM_ADMIN_NAME || 'Platform Administrator').trim();
 
-    console.log('MongoDB Connected...');
-
-    // Check if platform admin already exists
-    const existingAdmin = await User.findOne({ role: 'platform_admin' });
-    
-    if (existingAdmin) {
-      console.log('⚠️  Platform admin already exists!');
-      console.log(`   Email: ${existingAdmin.email}`);
-      console.log('   Use the existing credentials or reset password if needed.');
-      process.exit(0);
-    }
-
-    // Create platform admin user
-    const platformAdmin = await User.create({
-      name: 'Platform Administrator',
-      email: 'admin@stockmanager.com',
-      password: 'admin123',
-      role: 'platform_admin',
-      company: null  // Platform admin has no company
-    });
-
-    console.log('✅ Platform admin created successfully!');
-    console.log('\n📝 Platform Admin Credentials:');
-    console.log('==============================');
-    console.log('  Email: admin@stockmanager.com');
-    console.log('  Password: admin123');
-    console.log('\n⚠️  IMPORTANT: Change this password after first login!');
-    console.log('\nThis account has full access to:');
-    console.log('  - View all pending company registrations');
-    console.log('  - Approve or reject company access');
-    console.log('  - Platform-wide settings');
-
-    process.exit(0);
-  } catch (error) {
-    console.error('Error creating platform admin:', error);
+  if (!password || password.length < 8) {
+    console.error('Set PLATFORM_ADMIN_PASSWORD in the environment (min 8 characters). Example:');
+    console.error('  PLATFORM_ADMIN_EMAIL=admin@yourcompany.com PLATFORM_ADMIN_PASSWORD=YourSecurePass123! node scripts/seedPlatformAdmin.js');
     process.exit(1);
   }
-};
 
-seedPlatformAdmin();
+  const existing = await User.findOne({ role: 'platform_admin', email });
+  if (existing) {
+    console.log('Platform admin already exists for', email, '- nothing to do.');
+    await mongoose.connection.close();
+    process.exit(0);
+    return;
+  }
+
+  await User.create({
+    name,
+    email,
+    password,
+    role: 'platform_admin'
+  });
+
+  console.log('Platform admin created.');
+  console.log('  Email:', email);
+  console.log('  Password: (the value you set in PLATFORM_ADMIN_PASSWORD)');
+  console.log('Sign in at the app login, then open /platform to review company registrations.');
+
+  await mongoose.connection.close();
+  process.exit(0);
+}
+
+run().catch(async (err) => {
+  console.error(err);
+  try {
+    await mongoose.connection.close();
+  } catch (_) {}
+  process.exit(1);
+});

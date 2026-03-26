@@ -6,12 +6,15 @@ const {
   createLoan,
   updateLoan,
   deleteLoan,
+  cancelLoan,
   recordPayment,
   getLoansSummary,
   recordDrawdown,
   recordRepayment,
   recordInterest,
-  getTransactions
+  getTransactions,
+  calculatePaymentSchedule,
+  getPaymentSchedule
 } = require('../controllers/loanController');
 const { protect } = require('../middleware/auth');
 
@@ -20,6 +23,10 @@ router.use(protect);
 router.route('/')
   .get(getLoans)
   .post(createLoan);
+
+// Calculate payment schedule (preview before creating loan)
+router.route('/calculate')
+  .post(calculatePaymentSchedule);
 
 router.route('/summary')
   .get(getLoansSummary);
@@ -44,5 +51,13 @@ router.route('/:id/interest')
 
 router.route('/:id/transactions')
   .get(getTransactions);
+
+// Get payment schedule for existing loan
+router.route('/:id/schedule')
+  .get(getPaymentSchedule);
+
+// Cancel loan route
+router.route('/:id/cancel')
+  .post(cancelLoan);
 
 module.exports = router;

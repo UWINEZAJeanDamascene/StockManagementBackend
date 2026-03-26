@@ -111,6 +111,12 @@ const companySchema = new mongoose.Schema({
     enum:    ['pending', 'approved', 'rejected'],
     default: 'approved'  // Allow login in tests
   },
+  /** Set when platform_admin rejects a public registration */
+  registration_rejection_reason: {
+    type:    String,
+    trim:    true,
+    default: null
+  },
   is_vat_registered: {
     type:    Boolean,
     default: false

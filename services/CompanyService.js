@@ -38,6 +38,131 @@ class CompanyService {
   }
 
   /**
+   * Public self-service registration (pending platform approval)
+   */
+  static async registerPublicCompany({ company: c, admin: a }) {
+    const User = require('../models/User');
+
+    const emailCompany = (c.email || '').toLowerCase().trim();
+    const emailAdmin = (a.email || '').toLowerCase().trim();
+
+    if (!emailCompany || !c.name || !emailAdmin || !a.name || !a.password) {
+      throw new Error('MISSING_REQUIRED_FIELDS');
+    }
+    if (a.password.length < 8) {
+      const err = new Error('PASSWORD_TOO_SHORT');
+      err.code = 'PASSWORD_TOO_SHORT';
+      throw err;
+    }
+
+    const dupCompany = await Company.findOne({ email: emailCompany });
+    if (dupCompany) {
+      const err = new Error('COMPANY_EMAIL_ALREADY_REGISTERED');
+      err.code = 'COMPANY_EMAIL_ALREADY_REGISTERED';
+      throw err;
+    }
+
+    const platformAdminEmail = await User.findOne({ email: emailAdmin, role: 'platform_admin' });
+    if (platformAdminEmail) {
+      const err = new Error('EMAIL_NOT_AVAILABLE');
+      err.code = 'EMAIL_NOT_AVAILABLE';
+      throw err;
+    }
+
+    const company = await Company.create({
+      name: c.name.trim(),
+      email: emailCompany,
+      phone: c.phone || null,
+      tax_identification_number: c.tin || null,
+      approvalStatus: 'pending',
+      isActive: false,
+      registration_rejection_reason: null
+    });
+
+    try {
+      const user = await User.create({
+        name: a.name.trim(),
+        email: emailAdmin,
+        password: a.password,
+        company: company._id,
+        role: 'admin',
+        isActive: true
+      });
+      return { company, user };
+    } catch (e) {
+      await Company.deleteOne({ _id: company._id });
+      if (e.code === 11000) {
+        const err = new Error('DUPLICATE_USER_EMAIL_FOR_COMPANY');
+        err.code = 'DUPLICATE_USER_EMAIL_FOR_COMPANY';
+        throw err;
+      }
+      throw e;
+    }
+  }
+
+  static async listCompaniesByApprovalStatus(status) {
+    const list = await Company.find({ approvalStatus: status })
+      .sort({ createdAt: -1 })
+      .lean();
+    return list.map((row) => ({
+      _id: row._id,
+      name: row.name,
+      email: row.email,
+      phone: row.phone || '',
+      tin: row.tax_identification_number || '',
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      registration_rejection_reason: row.registration_rejection_reason || null
+    }));
+  }
+
+  static async approveCompanyById(companyId, reviewerUserId) {
+    const company = await Company.findById(companyId);
+    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    if (company.approvalStatus !== 'pending') {
+      throw new Error('COMPANY_NOT_PENDING');
+    }
+    company.approvalStatus = 'approved';
+    company.isActive = true;
+    company.registration_rejection_reason = null;
+    await company.save();
+
+    await AuditLogService.log({
+      companyId: company._id,
+      userId: reviewerUserId,
+      action: 'company.registration_approved',
+      entityType: 'company',
+      entityId: company._id,
+      changes: { approvalStatus: 'approved' }
+    });
+
+    return company;
+  }
+
+  static async rejectCompanyById(companyId, reason, reviewerUserId) {
+    const company = await Company.findById(companyId);
+    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    if (company.approvalStatus !== 'pending') {
+      throw new Error('COMPANY_NOT_PENDING');
+    }
+    company.approvalStatus = 'rejected';
+    company.isActive = false;
+    company.registration_rejection_reason = (reason || 'No reason provided').trim();
+    await company.save();
+
+    await AuditLogService.log({
+      companyId: company._id,
+      userId: reviewerUserId,
+      action: 'company.registration_rejected',
+      entityType: 'company',
+      entityId: company._id,
+      changes: { approvalStatus: 'rejected', reason: company.registration_rejection_reason }
+    });
+
+    return company;
+  }
+
+  /**
    * Get company by ID
    */
   static async getById(companyId) {

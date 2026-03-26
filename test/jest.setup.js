@@ -6,7 +6,7 @@ if (!process.env.JWT_SECRET) {
   process.env.JWT_SECRET = 'test_jwt_secret_for_testing_only';
 }
 if (!process.env.JWT_EXPIRE) {
-  process.env.JWT_EXPIRE = '1h';
+  process.env.JWT_EXPIRE = '15m'; // Match application default
 }
 process.env.NODE_ENV = 'test';
 

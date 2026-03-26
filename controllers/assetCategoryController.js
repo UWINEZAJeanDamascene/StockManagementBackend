@@ -11,11 +11,17 @@ const { parsePagination, paginationMeta } = require('../utils/pagination');
 exports.getCategories = async (req, res) => {
   try {
     const companyId = req.user.company._id;
-    const { includeDeleted } = req.query;
+    const { includeDeleted, autoSeed } = req.query;
 
     const query = { company: companyId };
     if (!includeDeleted) {
       query.isDeleted = false;
+    }
+
+    // Check if categories exist, if not and autoSeed is true, create defaults
+    const count = await AssetCategory.countDocuments(query);
+    if (count === 0 && autoSeed !== 'false') {
+      await AssetCategory.seedDefaults(companyId, req.user._id);
     }
 
     const { page, limit, skip } = parsePagination(req.query);

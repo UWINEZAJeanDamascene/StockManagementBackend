@@ -6,6 +6,97 @@ const BankAccount = require('../models/BankAccount');
 const JournalEntry = require('../models/JournalEntry');
 const SequenceService = require('../services/sequenceService');
 const PeriodService = require('../services/periodService');
+const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
+
+// =====================================================
+// PAYMENT SCHEDULE CALCULATION (HELPER FUNCTIONS)
+// =====================================================
+
+/**
+ * Calculate monthly payment using amortization formula
+ * PMT = P * [r(1+r)^n] / [(1+r)^n - 1]
+ * Where:
+ *   P = Principal (loan amount)
+ *   r = Monthly interest rate (annual rate / 12)
+ *   n = Number of payments (months)
+ */
+function calculateMonthlyPayment(principal, annualRate, months, method = 'simple') {
+  if (months <= 0) return 0;
+  if (principal <= 0) return 0;
+  
+  const monthlyRate = annualRate / 100 / 12;
+  
+  if (monthlyRate === 0) {
+    // No interest - simple division
+    return principal / months;
+  }
+  
+  if (method === 'simple') {
+    // Simple interest: Interest = Principal * Rate * Time
+    const totalInterest = principal * (annualRate / 100) * (months / 12);
+    return (principal + totalInterest) / months;
+  }
+  
+  // Compound interest (amortized)
+  const factor = Math.pow(1 + monthlyRate, months);
+  return principal * (monthlyRate * factor) / (factor - 1);
+}
+
+/**
+ * Generate payment schedule for a loan
+ */
+function generatePaymentSchedule(loan) {
+  const schedule = [];
+  const principal = loan.originalAmount;
+  const annualRate = loan.interestRate || 0;
+  const months = loan.durationMonths || 12;
+  const method = loan.interestMethod || 'simple';
+  const startDate = loan.startDate ? new Date(loan.startDate) : new Date();
+  
+  const monthlyPayment = calculateMonthlyPayment(principal, annualRate, months, method);
+  let remainingBalance = principal;
+  let totalInterest = 0;
+  
+  for (let month = 1; month <= months; month++) {
+    const paymentDate = new Date(startDate);
+    paymentDate.setMonth(paymentDate.getMonth() + month);
+    
+    // Calculate interest for this period
+    let interestPortion;
+    if (method === 'simple') {
+      interestPortion = (principal * (annualRate / 100)) / 12;
+    } else {
+      interestPortion = remainingBalance * (annualRate / 100 / 12);
+    }
+    
+    // Principal portion
+    let principalPortion = monthlyPayment - interestPortion;
+    
+    // Last payment adjustment
+    if (month === months) {
+      principalPortion = remainingBalance;
+    }
+    
+    remainingBalance = Math.max(0, remainingBalance - principalPortion);
+    totalInterest += interestPortion;
+    
+    schedule.push({
+      paymentNumber: month,
+      paymentDate: paymentDate.toISOString().split('T')[0],
+      principalPortion: Math.round(principalPortion * 100) / 100,
+      interestPortion: Math.round(interestPortion * 100) / 100,
+      totalPayment: Math.round((principalPortion + interestPortion) * 100) / 100,
+      remainingBalance: Math.round(remainingBalance * 100) / 100
+    });
+  }
+  
+  return {
+    monthlyPayment: Math.round(monthlyPayment * 100) / 100,
+    totalPayment: Math.round((monthlyPayment * months) * 100) / 100,
+    totalInterest: Math.round(totalInterest * 100) / 100,
+    schedule
+  };
+}
 
 // @desc    Get all loans for a company
 // @route   GET /api/loans
@@ -73,7 +164,52 @@ exports.getLoan = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Loan not found' });
     }
 
-    res.json({ success: true, data: loan });
+    // Resolve account names for display
+    const loanData = loan.toObject();
+    
+    if (loan.liabilityAccountId) {
+      const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(loan.liabilityAccountId));
+      let liabAccount;
+      
+      if (isValidObjectId) {
+        try {
+          liabAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+        } catch (e) {
+          liabAccount = null;
+        }
+      }
+      
+      if (!liabAccount) {
+        liabAccount = await ChartOfAccount.findOne({ code: String(loan.liabilityAccountId), company: companyId });
+      }
+      
+      if (liabAccount) {
+        loanData.liabilityAccountId = { _id: liabAccount._id, code: liabAccount.code, name: liabAccount.name };
+      }
+    }
+    
+    if (loan.interestExpenseAccountId) {
+      const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(loan.interestExpenseAccountId));
+      let intAccount;
+      
+      if (isValidObjectId) {
+        try {
+          intAccount = await ChartOfAccount.findOne({ _id: loan.interestExpenseAccountId, company: companyId });
+        } catch (e) {
+          intAccount = null;
+        }
+      }
+      
+      if (!intAccount) {
+        intAccount = await ChartOfAccount.findOne({ code: String(loan.interestExpenseAccountId), company: companyId });
+      }
+      
+      if (intAccount) {
+        loanData.interestExpenseAccountId = { _id: intAccount._id, code: intAccount.code, name: intAccount.name };
+      }
+    }
+
+    res.json({ success: true, data: loanData });
   } catch (error) {
     next(error);
   }
@@ -85,12 +221,103 @@ exports.getLoan = async (req, res, next) => {
 exports.createLoan = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { name, loanType, originalAmount, startDate, liabilityAccountId } = req.body;
+
+    // Input validation
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Liability name is required' });
+    }
+
+    if (!loanType) {
+      return res.status(400).json({ success: false, message: 'Loan type is required' });
+    }
+
+    if (!originalAmount || originalAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Original amount must be greater than 0' });
+    }
+
+    if (!startDate) {
+      return res.status(400).json({ success: false, message: 'Start date is required' });
+    }
+
+    if (!liabilityAccountId) {
+      return res.status(400).json({ success: false, message: 'Liability account is required' });
+    }
+
+    // Validate liability account exists
+    let liabilityAccount;
+    // Check if liabilityAccountId is a valid MongoDB ObjectId format (24 hex chars)
+    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(liabilityAccountId));
     
+    // Try to find by ObjectId first (only if valid format)
+    if (isValidObjectId) {
+      liabilityAccount = await ChartOfAccount.findOne({ _id: liabilityAccountId, company: companyId });
+    }
+    
+    // If not found, try by account code
+    if (!liabilityAccount) {
+      liabilityAccount = await ChartOfAccount.findOne({ code: String(liabilityAccountId), company: companyId });
+    }
+    
+    // If still not found, check if it's a default account code from CHART_OF_ACCOUNTS
+    if (!liabilityAccount && CHART_OF_ACCOUNTS[liabilityAccountId]) {
+      const defaultAccount = CHART_OF_ACCOUNTS[liabilityAccountId];
+      // Create a virtual account object for default accounts
+      liabilityAccount = {
+        _id: liabilityAccountId,
+        code: liabilityAccountId,
+        name: defaultAccount.name,
+        type: defaultAccount.type,
+        isDefault: true
+      };
+    }
+    
+    if (!liabilityAccount) {
+      return res.status(400).json({ success: false, message: 'Liability account not found. Please select a valid account.' });
+    }
+
+    // Validate interest expense account if provided
+    if (req.body.interestExpenseAccountId && req.body.interestExpenseAccountId !== '') {
+      let interestAccount;
+      const interestIsValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(req.body.interestExpenseAccountId));
+      
+      if (interestIsValidObjectId) {
+        interestAccount = await ChartOfAccount.findOne({ _id: req.body.interestExpenseAccountId, company: companyId });
+      }
+      if (!interestAccount) {
+        interestAccount = await ChartOfAccount.findOne({ code: String(req.body.interestExpenseAccountId), company: companyId });
+      }
+      
+      // If still not found, check if it's a default account code from CHART_OF_ACCOUNTS
+      if (!interestAccount && CHART_OF_ACCOUNTS[req.body.interestExpenseAccountId]) {
+        const defaultAccount = CHART_OF_ACCOUNTS[req.body.interestExpenseAccountId];
+        interestAccount = {
+          _id: req.body.interestExpenseAccountId,
+          code: req.body.interestExpenseAccountId,
+          name: defaultAccount.name,
+          type: defaultAccount.type,
+          isDefault: true
+        };
+      }
+      
+      if (!interestAccount) {
+        return res.status(400).json({ success: false, message: 'Interest expense account not found. Please select a valid account.' });
+      }
+    }
+
     const loan = await Loan.create({
       ...req.body,
       company: companyId,
-      createdBy: req.user._id
+      createdBy: req.user._id,
+      outstandingBalance: req.body.outstandingBalance || originalAmount
     });
+
+    // Calculate and set monthly payment if duration and interest rate are provided
+    if (loan.originalAmount && loan.durationMonths && loan.durationMonths > 0) {
+      const schedule = generatePaymentSchedule(loan);
+      loan.monthlyPayment = schedule.monthlyPayment;
+      await loan.save();
+    }
 
     // Create journal entry for loan received if loan is active
     if (loan.status === 'active' && loan.originalAmount > 0) {
@@ -111,6 +338,10 @@ exports.createLoan = async (req, res, next) => {
 
     res.status(201).json({ success: true, data: loan });
   } catch (error) {
+    // Handle duplicate loan number error
+    if (error.code === 11000) {
+      return res.status(400).json({ success: false, message: 'A loan with this number already exists' });
+    }
     next(error);
   }
 };
@@ -121,11 +352,63 @@ exports.createLoan = async (req, res, next) => {
 exports.updateLoan = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { name, originalAmount, liabilityAccountId, interestExpenseAccountId, status } = req.body;
     
     let loan = await Loan.findOne({ _id: req.params.id, company: companyId });
 
     if (!loan) {
       return res.status(404).json({ success: false, message: 'Loan not found' });
+    }
+
+    // Prevent updating certain fields if loan has transactions
+    if (loan.transactions && loan.transactions.length > 0) {
+      // Allow only status updates and notes
+      const allowedFields = ['status', 'notes'];
+      const updatedFields = Object.keys(req.body);
+      const hasDisallowedFields = updatedFields.some(field => !allowedFields.includes(field));
+      
+      if (hasDisallowedFields) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Cannot update loan details once transactions exist. Only status and notes can be updated.'
+        });
+      }
+    }
+
+    // Validate liability account if being updated
+    if (liabilityAccountId && liabilityAccountId !== loan.liabilityAccountId?.toString()) {
+      let liabilityAccount;
+      try {
+        liabilityAccount = await ChartOfAccount.findOne({ _id: liabilityAccountId, company: companyId });
+      } catch (e) {
+        liabilityAccount = await ChartOfAccount.findOne({ code: String(liabilityAccountId), company: companyId });
+      }
+      
+      if (!liabilityAccount) {
+        return res.status(400).json({ success: false, message: 'Liability account not found' });
+      }
+    }
+
+    // Validate interest expense account if being updated
+    if (interestExpenseAccountId && interestExpenseAccountId !== loan.interestExpenseAccountId?.toString()) {
+      let interestAccount;
+      try {
+        interestAccount = await ChartOfAccount.findOne({ _id: interestExpenseAccountId, company: companyId });
+      } catch (e) {
+        interestAccount = await ChartOfAccount.findOne({ code: String(interestExpenseAccountId), company: companyId });
+      }
+      
+      if (!interestAccount) {
+        return res.status(400).json({ success: false, message: 'Interest expense account not found' });
+      }
+    }
+
+    // If setting status to cancelled, check if loan has payments
+    if (status === 'cancelled' && loan.amountPaid > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot cancel a loan with existing payments' 
+      });
     }
 
     loan = await Loan.findByIdAndUpdate(
@@ -135,6 +418,40 @@ exports.updateLoan = async (req, res, next) => {
     );
 
     res.json({ success: true, data: loan });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Cancel a loan/liability
+// @route   POST /api/loans/:id/cancel
+// @access  Private
+exports.cancelLoan = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { reason } = req.body;
+    
+    const loan = await Loan.findOne({ _id: req.params.id, company: companyId });
+
+    if (!loan) {
+      return res.status(404).json({ success: false, message: 'Loan not found' });
+    }
+
+    if (loan.status === 'fully_repaid' || loan.status === 'paid-off') {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot cancel a fully repaid loan' 
+      });
+    }
+
+    loan.status = 'cancelled';
+    if (reason) {
+      loan.notes = (loan.notes || '') + `\nCancellation reason: ${reason}`;
+    }
+
+    await loan.save();
+
+    res.json({ success: true, data: loan, message: 'Loan cancelled successfully' });
   } catch (error) {
     next(error);
   }
@@ -153,9 +470,41 @@ exports.deleteLoan = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Loan not found' });
     }
 
+    // Check if there are any journal entries linked to this loan
+    const linkedEntries = await JournalEntry.find({
+      $or: [
+        { sourceId: loan._id.toString() },
+        { reference: loan.loanNumber }
+      ]
+    });
+
+    if (linkedEntries && linkedEntries.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete loan with linked journal entries. Please reverse or delete the journal entries first.',
+        linkedEntriesCount: linkedEntries.length
+      });
+    }
+
+    // Check if loan has transactions
+    if (loan.transactions && loan.transactions.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete loan with existing transactions. Consider marking it as cancelled instead.'
+      });
+    }
+
+    // Check if loan has been partially paid
+    if (loan.amountPaid > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete loan with payments. Consider marking it as cancelled instead.'
+      });
+    }
+
     await Loan.findByIdAndDelete(req.params.id);
 
-    res.json({ success: true, message: 'Loan deleted' });
+    res.json({ success: true, message: 'Loan deleted successfully' });
   } catch (error) {
     next(error);
   }
@@ -262,7 +611,17 @@ exports.recordDrawdown = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { amount, bankAccountId, transactionDate, notes } = req.body;
     
+    // Input validation
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Drawdown amount must be greater than 0' });
+    }
+
+    if (!bankAccountId) {
+      return res.status(400).json({ success: false, message: 'Bank account is required for drawdown' });
+    }
+    
     const loan = await Loan.findOne({ _id: req.params.id, company: companyId });
+
 
     if (!loan) {
       return res.status(404).json({ success: false, message: 'Liability not found' });
@@ -278,15 +637,30 @@ exports.recordDrawdown = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Bank account not found' });
     }
 
-    // Validate liability account exists
-    const liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+    // Validate liability account exists - accept both ObjectId and account code
+    if (!loan.liabilityAccountId) {
+      return res.status(400).json({ success: false, message: 'Liability account not configured for this loan. Please edit the loan to add a liability account.' });
+    }
+    let liabilityAccount;
+    try {
+      liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+    } catch (e) {
+      // If not a valid ObjectId, try finding by account code
+      liabilityAccount = await ChartOfAccount.findOne({ code: String(loan.liabilityAccountId), company: companyId });
+    }
     if (!liabilityAccount) {
-      return res.status(400).json({ success: false, message: 'Liability account not found' });
+      return res.status(400).json({ success: false, message: 'Liability account not found. The configured account may have been deleted. Please edit the loan to select a valid account.' });
     }
 
     // Create journal entry for drawdown
     // DR Bank / CR Liability Account
     const entryDate = transactionDate ? new Date(transactionDate) : new Date();
+    
+    // Validate date
+    if (isNaN(entryDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid transaction date' });
+    }
+
     const entryNumber = await SequenceService.next(companyId, 'JE');
     const period = await PeriodService.getOpenPeriodId(companyId, entryDate);
 
@@ -353,6 +727,15 @@ exports.recordRepayment = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { principalPortion, interestPortion, bankAccountId, transactionDate, notes } = req.body;
+
+    // Input validation
+    if (!principalPortion || principalPortion <= 0) {
+      return res.status(400).json({ success: false, message: 'Principal portion must be greater than 0' });
+    }
+
+    if (!bankAccountId) {
+      return res.status(400).json({ success: false, message: 'Bank account is required for repayment' });
+    }
     
     const loan = await Loan.findOne({ _id: req.params.id, company: companyId });
 
@@ -366,6 +749,7 @@ exports.recordRepayment = async (req, res, next) => {
 
     const totalPayment = principalPortion + (interestPortion || 0);
 
+
     if (principalPortion > loan.outstandingBalance) {
       return res.status(400).json({ success: false, message: 'Repayment exceeds outstanding balance' });
     }
@@ -376,15 +760,42 @@ exports.recordRepayment = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Bank account not found' });
     }
 
-    // Validate liability account exists
-    const liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+    // Validate liability account exists - accept both ObjectId and account code
+    if (!loan.liabilityAccountId) {
+      return res.status(400).json({ success: false, message: 'Liability account not configured for this loan. Please edit the loan to add a liability account.' });
+    }
+    let liabilityAccount;
+    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(loan.liabilityAccountId));
+    
+    // Try to find by ObjectId first (only if valid format)
+    if (isValidObjectId) {
+      liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+    }
+    
+    // If not found, try by account code
     if (!liabilityAccount) {
-      return res.status(400).json({ success: false, message: 'Liability account not found' });
+      liabilityAccount = await ChartOfAccount.findOne({ code: String(loan.liabilityAccountId), company: companyId });
+    }
+    
+    // If still not found, check if it's a default account code from CHART_OF_ACCOUNTS
+    if (!liabilityAccount && CHART_OF_ACCOUNTS[loan.liabilityAccountId]) {
+      const defaultAccount = CHART_OF_ACCOUNTS[loan.liabilityAccountId];
+      liabilityAccount = {
+        _id: loan.liabilityAccountId,
+        code: loan.liabilityAccountId,
+        name: defaultAccount.name,
+        type: defaultAccount.type,
+        isDefault: true
+      };
+    }
+    
+    if (!liabilityAccount) {
+      return res.status(400).json({ success: false, message: 'Liability account not found. The configured account may have been deleted. Please edit the loan to select a valid account.' });
     }
 
     // Create journal entry for repayment
     const entryDate = transactionDate ? new Date(transactionDate) : new Date();
-    const entryNumber = await SequenceService.next(companyId, 'JE');
+    const entryNumber = await SequenceService.nextSequence(companyId, 'JE');
     const period = await PeriodService.getOpenPeriodId(companyId, entryDate);
 
     const journalLines = [
@@ -479,6 +890,11 @@ exports.recordInterest = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { amount, chargeDate, notes } = req.body;
+
+    // Input validation
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ success: false, message: 'Interest amount must be greater than 0' });
+    }
     
     const loan = await Loan.findOne({ _id: req.params.id, company: companyId });
 
@@ -490,56 +906,105 @@ exports.recordInterest = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Liability is not active' });
     }
 
-    if (!loan.interestExpenseAccountId) {
-      return res.status(400).json({ success: false, message: 'Interest expense account not configured' });
+    // Validate liability account exists
+    if (!loan.liabilityAccountId) {
+      return res.status(400).json({ success: false, message: 'Liability account not configured for this loan. Please edit the loan to add a liability account.' });
+    }
+    let liabilityAccount;
+    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(loan.liabilityAccountId));
+    
+    // Try to find by ObjectId first (only if valid format)
+    if (isValidObjectId) {
+      liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
+    }
+    
+    // If not found, try by account code
+    if (!liabilityAccount) {
+      liabilityAccount = await ChartOfAccount.findOne({ code: String(loan.liabilityAccountId), company: companyId });
+    }
+    
+    // If still not found, check if it's a default account code from CHART_OF_ACCOUNTS
+    if (!liabilityAccount && CHART_OF_ACCOUNTS[loan.liabilityAccountId]) {
+      const defaultAccount = CHART_OF_ACCOUNTS[loan.liabilityAccountId];
+      liabilityAccount = {
+        _id: loan.liabilityAccountId,
+        code: loan.liabilityAccountId,
+        name: defaultAccount.name,
+        type: defaultAccount.type,
+        isDefault: true
+      };
     }
 
-    // Validate accounts exist
-    const liabilityAccount = await ChartOfAccount.findOne({ _id: loan.liabilityAccountId, company: companyId });
-    const interestAccount = await ChartOfAccount.findOne({ _id: loan.interestExpenseAccountId, company: companyId });
-
-    if (!liabilityAccount || !interestAccount) {
-      return res.status(400).json({ success: false, message: 'Account configuration error' });
+    if (!liabilityAccount) {
+      return res.status(400).json({ success: false, message: 'Liability account not found. The configured account may have been deleted. Please edit the loan to select a valid account.' });
     }
 
-    // Create journal entry for interest accrual (no cash movement)
-    const entryDate = chargeDate ? new Date(chargeDate) : new Date();
-    const entryNumber = await SequenceService.next(companyId, 'JE');
-    const period = await PeriodService.getOpenPeriodId(companyId, entryDate);
+    // Validate interest expense account if configured
+    let interestAccount = null;
+    if (loan.interestExpenseAccountId && loan.interestExpenseAccountId !== '') {
+      const interestIsValidObjectId = /^[0-9a-fA-F]{24}$/.test(String(loan.interestExpenseAccountId));
+      
+      if (interestIsValidObjectId) {
+        interestAccount = await ChartOfAccount.findOne({ _id: loan.interestExpenseAccountId, company: companyId });
+      }
+      if (!interestAccount) {
+        interestAccount = await ChartOfAccount.findOne({ code: String(loan.interestExpenseAccountId), company: companyId });
+      }
+      
+      // If still not found, check if it's a default account code from CHART_OF_ACCOUNTS
+      if (!interestAccount && CHART_OF_ACCOUNTS[loan.interestExpenseAccountId]) {
+        const defaultAccount = CHART_OF_ACCOUNTS[loan.interestExpenseAccountId];
+        interestAccount = {
+          _id: loan.interestExpenseAccountId,
+          code: loan.interestExpenseAccountId,
+          name: defaultAccount.name,
+          type: defaultAccount.type,
+          isDefault: true
+        };
+      }
+    }
 
-    const journalEntry = await JournalEntry.create({
-      company: companyId,
-      entryNumber,
-      date: entryDate,
-      description: `Interest Accrual - ${loan.name} - ${loan.loanNumber}`,
-      sourceType: 'liability_interest',
-      sourceId: `${loan._id}_interest_${entryDate.toISOString()}`,
-      reference: loan.loanNumber,
-      status: 'posted',
-      lines: [
-        {
-          accountCode: interestAccount.code,
-          accountName: interestAccount.name,
-          description: 'Interest expense accrued',
-          debit: amount,
-          credit: 0
-        },
-        {
-          accountCode: liabilityAccount.code,
-          accountName: liabilityAccount.name,
-          description: 'Interest added to liability',
-          debit: 0,
-          credit: amount
-        }
-      ],
-      totalDebit: amount,
-      totalCredit: amount,
-      debitTotal: amount,
-      creditTotal: amount,
-      postedBy: req.user._id,
-      period: period,
-      isAutoGenerated: false
-    });
+    // Create journal entry only if interest expense account is configured
+    let journalEntry = null;
+    if (interestAccount) {
+      const entryDate = chargeDate ? new Date(chargeDate) : new Date();
+      const entryNumber = await SequenceService.nextSequence(companyId, 'JE');
+      const period = await PeriodService.getOpenPeriodId(companyId, entryDate);
+
+      journalEntry = await JournalEntry.create({
+        company: companyId,
+        entryNumber,
+        date: entryDate,
+        description: `Interest Accrual - ${loan.name} - ${loan.loanNumber}`,
+        sourceType: 'liability_interest',
+        sourceId: `${loan._id}_interest_${entryDate.toISOString()}`,
+        reference: loan.loanNumber,
+        status: 'posted',
+        lines: [
+          {
+            accountCode: interestAccount.code,
+            accountName: interestAccount.name,
+            description: 'Interest expense accrued',
+            debit: amount,
+            credit: 0
+          },
+          {
+            accountCode: liabilityAccount.code,
+            accountName: liabilityAccount.name,
+            description: 'Interest added to liability',
+            debit: 0,
+            credit: amount
+          }
+        ],
+        totalDebit: amount,
+        totalCredit: amount,
+        debitTotal: amount,
+        creditTotal: amount,
+        postedBy: req.user._id,
+        period: period,
+        isAutoGenerated: false
+      });
+    }
 
     // Add transaction record
     loan.transactions.push({
@@ -578,6 +1043,197 @@ exports.getTransactions = async (req, res, next) => {
     }
 
     res.json({ success: true, data: loan.transactions || [] });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// =====================================================
+// PAYMENT SCHEDULE CALCULATION
+// =====================================================
+
+/**
+ * Calculate monthly payment using amortization formula
+ * PMT = P * [r(1+r)^n] / [(1+r)^n - 1]
+ * Where:
+ *   P = Principal (loan amount)
+ *   r = Monthly interest rate (annual rate / 12)
+ *   n = Number of payments (months)
+ */
+function calculateMonthlyPayment(principal, annualRate, months, method = 'simple') {
+  if (months <= 0) return 0;
+  if (principal <= 0) return 0;
+  
+  const monthlyRate = annualRate / 100 / 12;
+  
+  if (monthlyRate === 0) {
+    // No interest - simple division
+    return principal / months;
+  }
+  
+  if (method === 'simple') {
+    // Simple interest: Interest = Principal * Rate * Time
+    const totalInterest = principal * (annualRate / 100) * (months / 12);
+    return (principal + totalInterest) / months;
+  }
+  
+  // Compound interest (amortized)
+  const factor = Math.pow(1 + monthlyRate, months);
+  return principal * (monthlyRate * factor) / (factor - 1);
+}
+
+/**
+ * Generate payment schedule
+ */
+function generatePaymentSchedule(loan) {
+  const schedule = [];
+  const principal = loan.originalAmount;
+  const annualRate = loan.interestRate || 0;
+  const months = loan.durationMonths || 12;
+  const method = loan.interestMethod || 'simple';
+  const startDate = new Date(loan.startDate);
+  
+  const monthlyPayment = calculateMonthlyPayment(principal, annualRate, months, method);
+  let remainingBalance = principal;
+  let totalInterest = 0;
+  
+  for (let month = 1; month <= months; month++) {
+    const paymentDate = new Date(startDate);
+    paymentDate.setMonth(paymentDate.getMonth() + month);
+    
+    // Calculate interest for this period
+    let interestPortion;
+    if (method === 'simple') {
+      interestPortion = (principal * (annualRate / 100)) / 12;
+    } else {
+      interestPortion = remainingBalance * (annualRate / 100 / 12);
+    }
+    
+    // Principal portion
+    let principalPortion = monthlyPayment - interestPortion;
+    
+    // Last payment adjustment
+    if (month === months) {
+      principalPortion = remainingBalance;
+    }
+    
+    remainingBalance = Math.max(0, remainingBalance - principalPortion);
+    totalInterest += interestPortion;
+    
+    schedule.push({
+      paymentNumber: month,
+      paymentDate: paymentDate.toISOString().split('T')[0],
+      principalPortion: Math.round(principalPortion * 100) / 100,
+      interestPortion: Math.round(interestPortion * 100) / 100,
+      totalPayment: Math.round((principalPortion + interestPortion) * 100) / 100,
+      remainingBalance: Math.round(remainingBalance * 100) / 100
+    });
+  }
+  
+  return {
+    monthlyPayment: Math.round(monthlyPayment * 100) / 100,
+    totalPayment: Math.round((monthlyPayment * months) * 100) / 100,
+    totalInterest: Math.round(totalInterest * 100) / 100,
+    schedule
+  };
+}
+
+// @desc    Calculate payment schedule for a loan
+// @route   POST /api/loans/calculate
+// @access  Private
+exports.calculatePaymentSchedule = async (req, res, next) => {
+  try {
+    const { 
+      originalAmount, 
+      interestRate, 
+      durationMonths, 
+      interestMethod,
+      startDate,
+      loanType 
+    } = req.body;
+    
+    // Validation
+    if (!originalAmount || originalAmount <= 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Original amount must be greater than 0' 
+      });
+    }
+    
+    if (durationMonths && durationMonths <= 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Duration must be greater than 0 months' 
+      });
+    }
+    
+    if (interestRate && (interestRate < 0 || interestRate > 100)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Interest rate must be between 0 and 100' 
+      });
+    }
+    
+    // Build loan object for calculation
+    const loanData = {
+      originalAmount: originalAmount,
+      interestRate: interestRate || 0,
+      durationMonths: durationMonths || 12,
+      interestMethod: interestMethod || 'simple',
+      startDate: startDate || new Date().toISOString()
+    };
+    
+    // Generate schedule
+    const schedule = generatePaymentSchedule(loanData);
+    
+    res.json({
+      success: true,
+      data: {
+        loanType: loanType || 'loan',
+        inputs: loanData,
+        schedule: schedule
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get payment schedule for existing loan
+// @route   GET /api/loans/:id/schedule
+// @access  Private
+exports.getPaymentSchedule = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    const loan = await Loan.findOne({ _id: req.params.id, company: companyId });
+    
+    if (!loan) {
+      return res.status(404).json({ success: false, message: 'Loan not found' });
+    }
+    
+    // Generate schedule based on loan data
+    const schedule = generatePaymentSchedule(loan);
+    
+    // Add current status info
+    const response = {
+      loanNumber: loan.loanNumber,
+      name: loan.name,
+      status: loan.status,
+      originalAmount: loan.originalAmount,
+      outstandingBalance: loan.outstandingBalance,
+      amountPaid: loan.amountPaid,
+      inputs: {
+        originalAmount: loan.originalAmount,
+        interestRate: loan.interestRate,
+        durationMonths: loan.durationMonths,
+        interestMethod: loan.interestMethod,
+        startDate: loan.startDate
+      },
+      schedule: schedule
+    };
+    
+    res.json({ success: true, data: response });
   } catch (error) {
     next(error);
   }

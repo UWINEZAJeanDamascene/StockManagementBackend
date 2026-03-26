@@ -359,3 +359,79 @@ exports.logoutAll = async (req, res, next) => {
     next(error);
   }
 };
+
+/**
+ * Get current user's sessions
+ * GET /api/auth/my-sessions
+ */
+exports.getMySessions = async (req, res, next) => {
+  try {
+    const sessions = await sessionService.getUserSessions(req.user.id);
+    
+    res.json({
+      success: true,
+      data: sessions
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get user's sessions (admin only)
+ * GET /api/auth/users/:userId/sessions
+ */
+exports.getUserSessions = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const sessions = await sessionService.getUserSessions(userId);
+    
+    res.json({
+      success: true,
+      data: sessions
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Force logout a specific user (admin only)
+ * POST /api/auth/users/:userId/force-logout
+ */
+exports.forceLogoutUser = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    
+    await sessionService.deleteAllSessions(userId);
+    
+    res.json({
+      success: true,
+      message: `All sessions for user ${userId} have been terminated`
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get all active sessions (admin only - platform admin)
+ * GET /api/auth/admin/sessions
+ */
+exports.getAllSessions = async (req, res, next) => {
+  try {
+    const { limit = 100 } = req.query;
+    const sessions = await sessionService.getAllSessionsDetailed(parseInt(limit));
+    const count = await sessionService.getActiveSessionsCount();
+    
+    res.json({
+      success: true,
+      data: {
+        sessions,
+        totalActive: count
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};

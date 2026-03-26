@@ -7,6 +7,7 @@ const {
   adjustStock,
   getProductStockMovements,
   getStockSummary,
+  getStockLevels,
   updateStockMovement,
   deleteStockMovement
 } = require('../controllers/stockController');
@@ -25,5 +26,8 @@ router.delete('/movements/:id', authorize('admin'), logAction('stock'), deleteSt
 router.get('/product/:productId/movements', getProductStockMovements);
 router.post('/adjust', authorize('admin'), logAction('stock'), adjustStock);
 router.get('/summary', getStockSummary);
+
+// Stock Levels endpoint - provides per-warehouse stock information
+router.get('/levels', getStockLevels);
 
 module.exports = router;

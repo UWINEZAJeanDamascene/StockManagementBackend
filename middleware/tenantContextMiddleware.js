@@ -1,6 +1,11 @@
 const jwt = require('jsonwebtoken');
 const tenantContext = require('../lib/tenantContext');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const JWT_SECRET = config.jwt.secret;
+
 // Middleware to populate AsyncLocalStorage with companyId extracted from JWT
 // This runs for every request; store may be empty if token missing or invalid.
 module.exports = (req, res, next) => {
@@ -10,7 +15,7 @@ module.exports = (req, res, next) => {
   if (authHeader && authHeader.startsWith('Bearer')) {
     const token = authHeader.split(' ')[1];
     try {
-      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      const payload = jwt.verify(token, JWT_SECRET);
       if (payload && payload.companyId) companyId = payload.companyId;
     } catch (err) {
       // ignore invalid token here; auth middleware will handle auth

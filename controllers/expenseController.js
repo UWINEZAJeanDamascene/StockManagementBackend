@@ -1,7 +1,9 @@
 const Expense = require('../models/Expense');
 const mongoose = require('mongoose');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalService = require('../services/journalService');
+const JournalEntry = require('../models/JournalEntry');
 
 // @desc    Get all expenses for a company
 // @route   GET /api/expenses
@@ -9,12 +11,30 @@ const JournalService = require('../services/journalService');
 exports.getExpenses = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { type, startDate, endDate, page = 1, limit = 50 } = req.query;
+    const { 
+      type, 
+      startDate, 
+      endDate, 
+      expenseAccountId, 
+      paymentMethod,
+      page = 1, 
+      limit = 50 
+    } = req.query;
     
     const query = { company: companyId };
     
     if (type) {
       query.type = type;
+    }
+    
+    // Filter by expense account
+    if (expenseAccountId) {
+      query.expense_account_id = expenseAccountId;
+    }
+    
+    // Filter by payment method
+    if (paymentMethod) {
+      query.payment_method = paymentMethod;
     }
     
     if (startDate || endDate) {
@@ -26,18 +46,51 @@ exports.getExpenses = async (req, res, next) => {
     const expenses = await Expense.find(query)
       .populate('createdBy', 'name email')
       .populate('approvedBy', 'name email')
+      .populate('expense_account_id', 'code name')
+      .populate('bank_account_id', 'accountCode accountName')
+      .populate('petty_cash_fund_id', 'name')
       .sort({ expenseDate: -1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
     
     const total = await Expense.countDocuments(query);
     
+    // Transform to include populated Account and Method columns
+    const transformedExpenses = expenses.map(exp => ({
+      _id: exp._id,
+      reference: exp.reference_no || exp.expenseNumber,
+      date: exp.expenseDate || exp.expense_date,
+      description: exp.description,
+      account: exp.expense_account_id ? {
+        _id: exp.expense_account_id._id,
+        code: exp.expense_account_id.code,
+        name: exp.expense_account_id.name
+      } : null,
+      method: exp.payment_method || exp.paymentMethod,
+      amount: exp.amount,
+      taxAmount: exp.tax_amount || exp.vatAmount,
+      totalAmount: exp.total_amount || (exp.amount + (exp.tax_amount || 0)),
+      status: exp.status,
+      bankAccount: exp.bank_account_id ? {
+        _id: exp.bank_account_id._id,
+        code: exp.bank_account_id.accountCode,
+        name: exp.bank_account_id.accountName
+      } : null,
+      pettyCashFund: exp.petty_cash_fund_id ? {
+        _id: exp.petty_cash_fund_id._id,
+        name: exp.petty_cash_fund_id.name
+      } : null,
+      receiptRef: exp.receipt_ref,
+      createdAt: exp.createdAt,
+      updatedAt: exp.updatedAt
+    }));
+    
     res.json({
       success: true,
-      count: expenses.length,
+      count: transformedExpenses.length,
       total,
       pages: Math.ceil(total / limit),
-      data: expenses
+      data: transformedExpenses
     });
   } catch (error) {
     next(error);
@@ -299,6 +352,79 @@ exports.deleteExpense = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Expense cancelled'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reverse an expense
+// @route   POST /api/expenses/:id/reverse
+// @access  Private
+exports.reverseExpense = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { reason } = req.body;
+    
+    const expense = await Expense.findOne({
+      _id: req.params.id,
+      company: companyId
+    }).populate('expense_account_id', 'code name');
+    
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+    
+    if (expense.status === 'reversed') {
+      return res.status(400).json({ success: false, message: 'Expense already reversed' });
+    }
+    
+    // Create reversal journal entry
+    let reversalJournalEntry = null;
+    if (expense.journal_entry_id) {
+      try {
+        // Get the original journal entry
+        const originalEntry = await JournalEntry.findById(expense.journal_entry_id);
+        
+        if (originalEntry) {
+          // Create reversal entry with opposite debits/credits
+          reversalJournalEntry = new JournalEntry({
+            company: companyId,
+            date: new Date(),
+            description: `REVERSAL: ${expense.description}`,
+            reference: expense.reference_no,
+            referenceType: 'Expense',
+            referenceId: expense._id,
+            entries: originalEntry.entries.map(entry => ({
+              account: entry.account,
+              accountCode: entry.accountCode,
+              accountName: entry.accountName,
+              debit: entry.credit,  // Swap debit/credit
+              credit: entry.debit,
+              description: entry.description
+            })),
+            status: 'posted',
+            postedBy: req.user._id,
+            notes: reason || `Reversal of expense ${expense.reference_no}`
+          });
+          
+          await reversalJournalEntry.save();
+        }
+      } catch (journalError) {
+        console.error('Error creating reversal journal entry:', journalError);
+      }
+    }
+    
+    // Update expense status to reversed
+    expense.status = 'reversed';
+    expense.reversal_journal_entry_id = reversalJournalEntry ? reversalJournalEntry._id : null;
+    await expense.save();
+    
+    res.json({
+      success: true,
+      message: 'Expense reversed successfully',
+      data: expense,
+      reversalJournalEntry: reversalJournalEntry
     });
   } catch (error) {
     next(error);

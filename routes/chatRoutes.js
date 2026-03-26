@@ -10,7 +10,12 @@ const Client = require('../models/Client');
 const Expense = require('../models/Expense');
 const StockMovement = require('../models/StockMovement');
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const geminiApiKey = config.ai.geminiApiKey;
+
+const genAI = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
 
 router.post('/', protect, async (req, res) => {
   try {

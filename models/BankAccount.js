@@ -395,6 +395,76 @@ bankAccountSchema.index({ company: 1, isDefault: 1 });
 bankTransactionSchema.index({ company: 1, account: 1, date: -1 });
 bankTransactionSchema.index({ company: 1, reference: 1 });
 
+// Transform for JSON serialization - ensures Decimal128 fields are converted to numbers
+bankTransactionSchema.set('toJSON', {
+  transform: function(doc, ret) {
+    // Convert Decimal128 fields to numbers
+    if (ret.amount && ret.amount.$numberDecimal) {
+      ret.amount = parseFloat(ret.amount.$numberDecimal);
+    }
+    if (ret.balanceAfter && ret.balanceAfter.$numberDecimal) {
+      ret.balanceAfter = parseFloat(ret.balanceAfter.$numberDecimal);
+    }
+    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
+      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
+    }
+    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
+      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
+    }
+    return ret;
+  }
+});
+bankTransactionSchema.set('toObject', {
+  transform: function(doc, ret) {
+    // Convert Decimal128 fields to numbers
+    if (ret.amount && ret.amount.$numberDecimal) {
+      ret.amount = parseFloat(ret.amount.$numberDecimal);
+    }
+    if (ret.balanceAfter && ret.balanceAfter.$numberDecimal) {
+      ret.balanceAfter = parseFloat(ret.balanceAfter.$numberDecimal);
+    }
+    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
+      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
+    }
+    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
+      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
+    }
+    return ret;
+  }
+});
+
+// Transform for JSON serialization - ensures Decimal128 fields are converted to numbers
+bankAccountSchema.set('toJSON', {
+  transform: function(doc, ret) {
+    // Convert Decimal128 fields to numbers
+    if (ret.openingBalance && ret.openingBalance.$numberDecimal) {
+      ret.openingBalance = parseFloat(ret.openingBalance.$numberDecimal);
+    }
+    if (ret.cachedBalance && ret.cachedBalance.$numberDecimal) {
+      ret.cachedBalance = parseFloat(ret.cachedBalance.$numberDecimal);
+    }
+    if (ret.targetBalance && ret.targetBalance.$numberDecimal) {
+      ret.targetBalance = parseFloat(ret.targetBalance.$numberDecimal);
+    }
+    return ret;
+  }
+});
+bankAccountSchema.set('toObject', {
+  transform: function(doc, ret) {
+    // Convert Decimal128 fields to numbers
+    if (ret.openingBalance && ret.openingBalance.$numberDecimal) {
+      ret.openingBalance = parseFloat(ret.openingBalance.$numberDecimal);
+    }
+    if (ret.cachedBalance && ret.cachedBalance.$numberDecimal) {
+      ret.cachedBalance = parseFloat(ret.cachedBalance.$numberDecimal);
+    }
+    if (ret.targetBalance && ret.targetBalance.$numberDecimal) {
+      ret.targetBalance = parseFloat(ret.targetBalance.$numberDecimal);
+    }
+    return ret;
+  }
+});
+
 // Pre-save middleware
 bankAccountSchema.pre('save', async function(next) {
   if (this.isNew) {

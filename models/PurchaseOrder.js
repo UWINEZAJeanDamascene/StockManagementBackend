@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { generateUniqueNumber } = require('./utils/autoIncrement');
 
 const poLineSchema = new mongoose.Schema({
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
@@ -12,7 +13,7 @@ const poLineSchema = new mongoose.Schema({
 
 const purchaseOrderSchema = new mongoose.Schema({
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  referenceNo: { type: String, required: true, uppercase: true },
+  referenceNo: { type: String, uppercase: true },
   supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
   warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse' },
   orderDate: { type: Date, default: Date.now },
@@ -33,5 +34,13 @@ const purchaseOrderSchema = new mongoose.Schema({
 purchaseOrderSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
 purchaseOrderSchema.index({ company: 1, status: 1 });
 purchaseOrderSchema.index({ company: 1, status: 1, orderDate: 1 });
+
+// Auto-generate reference number
+purchaseOrderSchema.pre('save', async function(next) {
+  if (this.isNew && !this.referenceNo) {
+    this.referenceNo = await generateUniqueNumber('PO', mongoose.model('PurchaseOrder'), this.company, 'referenceNo');
+  }
+  next();
+});
 
 module.exports = mongoose.model('PurchaseOrder', purchaseOrderSchema);

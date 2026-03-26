@@ -1,0 +1,77 @@
+# =============================================================================
+# Docker Compose - Staging Environment
+# =============================================================================
+# Usage: docker-compose -f docker-compose.staging.yml up -d
+# =============================================================================
+
+services:
+  # Backend API
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-management-staging
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=staging
+    env_file:
+      - .env.staging
+    volumes:
+      - staging-logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - stock-staging
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Redis for staging (if not using external)
+  redis:
+    image: redis:7-alpine
+    container_name: stock-redis-staging
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - staging-redis-data:/data
+    networks:
+      - stock-staging
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  stock-staging:
+    driver: bridge
+
+volumes:
+  staging-logs:
+  staging-redis-data:
+
+# Note: MongoDB and Redis should be Atlas/Upstash managed for staging
+# If using local, uncomment below:
+#   mongodb:
+#     image: mongo:7.0
+#     ports:
+#       - "27017:27017"
+#     volumes:
+#       - staging-mongodb-data:/data/db

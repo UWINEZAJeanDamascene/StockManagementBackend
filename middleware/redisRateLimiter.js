@@ -1,6 +1,11 @@
 const { redisClient } = require('../config/redis');
 const jwt = require('jsonwebtoken');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const JWT_SECRET = config.jwt.secret;
+
 // Helper to scan keys (avoid KEYS in production)
 async function scanKeys(pattern) {
   try {
@@ -94,7 +99,7 @@ const createRateLimiter = (options = {}) => {
             } else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
               try {
                 const token = req.headers.authorization.split(' ')[1];
-                const payload = jwt.verify(token, process.env.JWT_SECRET);
+                const payload = jwt.verify(token, JWT_SECRET);
                 key = (payload.id || payload._id) ? (payload.id || payload._id).toString() : req.ip;
               } catch (e) {
                 key = req.ip;
@@ -112,7 +117,7 @@ const createRateLimiter = (options = {}) => {
             } else if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
               try {
                 const token = req.headers.authorization.split(' ')[1];
-                const payload = jwt.verify(token, process.env.JWT_SECRET);
+                const payload = jwt.verify(token, JWT_SECRET);
                 key = payload.companyId ? payload.companyId.toString() : req.ip;
               } catch (e) {
                 key = req.ip;
@@ -273,6 +278,38 @@ const createRateLimiters = () => {
       max: 50, // 50 requests per minute per IP
       keyPrefix: 'ratelimit:strict',
       limitBy: 'ip',
+    }),
+
+    // Import rate limiter: 5 import jobs per hour per company
+    import: createRateLimiter({
+      windowMs: 60 * 60 * 1000, // 1 hour
+      max: 5,
+      keyPrefix: 'ratelimit:import',
+      limitBy: 'company',
+      handler: (req, res, meta = {}) => {
+        res.status(429).json({
+          success: false,
+          code: 'IMPORT_RATE_LIMIT_EXCEEDED',
+          message: 'Maximum 5 import jobs per hour. Please try again later.',
+          retry_after: meta.retryAfter ?? 0,
+        });
+      },
+    }),
+
+    // Export rate limiter: 20 exports per 15 minutes per company
+    export: createRateLimiter({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      max: 20,
+      keyPrefix: 'ratelimit:export',
+      limitBy: 'company',
+      handler: (req, res, meta = {}) => {
+        res.status(429).json({
+          success: false,
+          code: 'EXPORT_RATE_LIMIT_EXCEEDED',
+          message: 'Maximum 20 exports per 15 minutes. Please try again later.',
+          retry_after: meta.retryAfter ?? 0,
+        });
+      },
     }),
   };
 };

@@ -1,12 +1,15 @@
 const { redisClient } = require('../config/redis');
 const jwt = require('jsonwebtoken');
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+
 // Session configuration (SESSION_TTL = Redis session + token mapping TTL in seconds)
-const SESSION_TTL = parseInt(process.env.SESSION_TTL, 10) || 86400; // 24 hours default
+const SESSION_TTL = config.session.ttl; // 24 hours default
 // Max concurrent access tokens per user (Redis FIFO eviction of oldest). Default 5 devices.
 // Set SESSION_MAX_CONCURRENT=0 for unlimited (not recommended in production).
-const _parsedMax = parseInt(process.env.SESSION_MAX_CONCURRENT, 10);
-const SESSION_MAX_CONCURRENT = Number.isFinite(_parsedMax) ? _parsedMax : 5;
+const SESSION_MAX_CONCURRENT = config.session.maxConcurrent;
 const SESSION_PREFIX = 'session:';
 const TOKEN_BLACKLIST_PREFIX = 'blacklist:';
 const TOKENS_LIST_SUFFIX = 'tokens:';
@@ -305,6 +308,87 @@ class SessionService {
     } catch (error) {
       console.error('Error getting active sessions count:', error);
       return 0;
+    }
+  }
+
+  /**
+   * Get all active sessions for a specific user
+   * @param {string} userId - User ID
+   */
+  async getUserSessions(userId) {
+    const sessionKey = `${SESSION_PREFIX}${userId}`;
+    const listKey = this._tokensListKey(userId);
+    
+    try {
+      // Get main session data
+      const sessionData = await redisClient.get(sessionKey);
+      const tokens = await redisClient.lrange(listKey, 0, -1);
+      
+      const session = sessionData ? JSON.parse(sessionData) : null;
+      
+      // Get TTL for session
+      const ttl = await redisClient.ttl(sessionKey);
+      
+      return {
+        active: !!session,
+        session: session,
+        tokens: tokens || [],
+        ttlSeconds: ttl > 0 ? ttl : 0,
+        lastActivity: session?.lastActivity || null,
+        createdAt: session?.createdAt || null
+      };
+    } catch (error) {
+      console.error('Error getting user sessions:', error);
+      return { active: false, session: null, tokens: [], ttlSeconds: 0 };
+    }
+  }
+
+  /**
+   * Get detailed list of all active sessions (for admin)
+   */
+  async getAllSessionsDetailed(limit = 100) {
+    const pattern = `${SESSION_PREFIX}*`;
+    let cursor = '0';
+    const sessions = [];
+    
+    try {
+      do {
+        const reply = await redisClient.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+        if (Array.isArray(reply)) {
+          cursor = reply[0];
+          const keys = reply[1] || [];
+          const sessionKeys = keys.filter(k => !k.includes('token:') && !k.includes('tokens:'));
+          
+          for (const key of sessionKeys) {
+            if (sessions.length >= limit) break;
+            
+            const userId = key.replace(SESSION_PREFIX, '');
+            const sessionData = await redisClient.get(key);
+            const ttl = await redisClient.ttl(key);
+            
+            if (sessionData) {
+              const parsed = JSON.parse(sessionData);
+              sessions.push({
+                userId,
+                companyId: parsed.companyId,
+                role: parsed.role,
+                lastActivity: parsed.lastActivity,
+                createdAt: parsed.createdAt,
+                ttlSeconds: ttl > 0 ? ttl : 0
+              });
+            }
+          }
+        } else if (reply && reply.cursor !== undefined) {
+          cursor = reply.cursor;
+        } else {
+          break;
+        }
+      } while (cursor !== '0' && sessions.length < limit);
+      
+      return sessions;
+    } catch (error) {
+      console.error('Error getting all sessions:', error);
+      return [];
     }
   }
 

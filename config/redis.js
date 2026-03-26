@@ -8,18 +8,18 @@ const { UpstashRedis } = (() => {
   }
 })();
 
+// Import centralized configuration
+const env = require('../src/config/environment');
+const config = env.getConfig();
+const cacheConfig = config.cache;
+
 // Redis configuration with connection pooling for high performance
 // Supports: Local Redis, Redis Cloud, Render Redis, Upstash, AWS ElastiCache, etc.
 // Uses REDIS_URL if available, or UPSTASH_REDIS_REST_URL for Upstash serverless Redis
 
 // Check if Redis is configured at all
 const isRedisConfigured = () => {
-  return !!(
-    process.env.UPSTASH_REDIS_REST_URL ||
-    process.env.REDIS_URL ||
-    process.env.REDIS_HOST ||
-    process.env.REDIS_CLUSTER_NODES
-  );
+  return cacheConfig.isConfigured;
 };
 
 // Create a no-op client for when Redis is not available
@@ -71,13 +71,15 @@ const createNoOpClient = () => {
 const createRedisClient = () => {
   const redisConfig = {
     // Connection settings optimized for high throughput
-    maxRetriesPerRequest: 3,
+    maxRetriesPerRequest: 5,
     retryStrategy: (times) => {
-      if (times > 3) {
-        console.error('Redis connection failed after 3 retries');
+      if (times > 5) {
+        console.error('Redis connection failed after 5 retries - giving up');
         return null; // Stop retrying
       }
-      return Math.min(times * 200, 2000);
+      const delay = Math.min(times * 500, 5000);
+      console.log(`Redis retry attempt ${times}/5, waiting ${delay}ms`);
+      return delay;
     },
     enableReadyCheck: true,
     lazyConnect: false,
@@ -86,6 +88,14 @@ const createRedisClient = () => {
     keepAlive: true,
     connectTimeout: 10000,
     commandTimeout: 5000,
+    // Reconnection settings
+    reconnectOnError: (err) => {
+      const targetErrors = ['READONLY', 'ECONNRESET', 'ETIMEDOUT'];
+      if (targetErrors.some(e => err.message.includes(e))) {
+        return true; // Reconnect on these errors
+      }
+      return false;
+    },
   };
 
   // Check if Redis is configured
@@ -96,33 +106,33 @@ const createRedisClient = () => {
   }
 
   // Check for Upstash Redis (serverless Redis with REST API)
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  if (cacheConfig.upstashUrl && cacheConfig.upstashToken) {
     // Prefer the Upstash HTTP client for serverless Upstash endpoints
     if (UpstashRedis) {
       console.log('Using @upstash/redis (REST) client for Upstash');
       return new UpstashRedis({
-        url: process.env.UPSTASH_REDIS_REST_URL,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+        url: cacheConfig.upstashUrl,
+        token: cacheConfig.upstashToken,
       });
     }
 
     // Fallback: if @upstash/redis not available, attempt ioredis with a compatible URL
     console.log('Using ioredis with UPSTASH_REDIS_REST_URL (ensure URL is Redis-compatible)');
-    return new Redis(process.env.UPSTASH_REDIS_REST_URL, {
+    return new Redis(cacheConfig.upstashUrl, {
       ...redisConfig,
-      password: process.env.UPSTASH_REDIS_REST_TOKEN,
+      password: cacheConfig.upstashToken,
     });
   }
 
   // Check for REDIS_URL (Render, Redis Cloud, Upstash legacy, etc.)
-  if (process.env.REDIS_URL) {
+  if (cacheConfig.redisUrl) {
     console.log('Using REDIS_URL for connection (production mode)');
-    return new Redis(process.env.REDIS_URL, redisConfig);
+    return new Redis(cacheConfig.redisUrl, redisConfig);
   }
 
   // Check if running in cluster mode
-  if (process.env.REDIS_CLUSTER_NODES) {
-    const clusterNodes = process.env.REDIS_CLUSTER_NODES.split(',').map(node => {
+  if (cacheConfig.clusterNodes) {
+    const clusterNodes = cacheConfig.clusterNodes.map(node => {
       const [host, port] = node.split(':');
       return { host, port: parseInt(port) };
     });
@@ -130,17 +140,17 @@ const createRedisClient = () => {
     return new Redis.Cluster(clusterNodes, {
       ...redisConfig,
       redisOptions: {
-        password: process.env.REDIS_PASSWORD,
+        password: cacheConfig.redisPassword,
       },
     });
   }
 
   // Single Redis instance configuration (local/development)
   return new Redis({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT) || 6379,
-    password: process.env.REDIS_PASSWORD || undefined,
-    db: parseInt(process.env.REDIS_DB) || 0,
+    host: cacheConfig.redisHost,
+    port: cacheConfig.redisPort,
+    password: cacheConfig.redisPassword,
+    db: cacheConfig.redisDb,
     ...redisConfig,
   });
 };
@@ -209,22 +219,22 @@ module.exports = {
       return createNoOpClient();
     }
     
-    if (process.env.REDIS_URL) {
-      return new Redis(process.env.REDIS_URL, { db });
+    if (cacheConfig.redisUrl) {
+      return new Redis(cacheConfig.redisUrl, { db });
     }
-    if (process.env.REDIS_CLUSTER_NODES) {
+    if (cacheConfig.clusterNodes) {
       return redisClient; // Cluster mode uses same client
     }
 
     // If using Upstash REST and upstash client exists, return a new Upstash client
-    if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN && UpstashRedis) {
-      return new UpstashRedis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN });
+    if (cacheConfig.upstashUrl && cacheConfig.upstashToken && UpstashRedis) {
+      return new UpstashRedis({ url: cacheConfig.upstashUrl, token: cacheConfig.upstashToken });
     }
 
     return new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: parseInt(process.env.REDIS_PORT) || 6379,
-      password: process.env.REDIS_PASSWORD || undefined,
+      host: cacheConfig.redisHost,
+      port: cacheConfig.redisPort,
+      password: cacheConfig.redisPassword,
       db,
     });
   },

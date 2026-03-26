@@ -10,9 +10,13 @@ const {
   resetPassword,
   forgotPassword,
   logout,
-  logoutAll
+  logoutAll,
+  getMySessions,
+  getUserSessions,
+  forceLogoutUser,
+  getAllSessions
 } = require('../controllers/userAuthController');
-const { protect } = require('../middleware/auth');
+const { protect, authorize } = require('../middleware/auth');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 
@@ -44,5 +48,11 @@ router.get('/me', protect, getMe);
 router.put('/change-password', protect, changePassword);
 router.post('/logout', protect, logout);
 router.post('/logout-all', protect, logoutAll);
+
+// Session management routes
+router.get('/my-sessions', protect, getMySessions);
+router.get('/users/:userId/sessions', protect, authorize('platform_admin'), getUserSessions);
+router.post('/users/:userId/force-logout', protect, authorize('platform_admin'), forceLogoutUser);
+router.get('/admin/sessions', protect, authorize('platform_admin'), getAllSessions);
 
 module.exports = router;

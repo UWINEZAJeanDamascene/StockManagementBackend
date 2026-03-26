@@ -1,0 +1,52 @@
+# =============================================================================
+# Docker Compose - Development Override
+# =============================================================================
+# Usage: docker-compose up (automatically loads this file)
+# =============================================================================
+
+services:
+  app:
+    environment:
+      - NODE_ENV=development
+    ports:
+      - "5000:3000"
+    volumes:
+      - ./:/app
+      - /app/node_modules
+    command: npm run dev
+    stdin_open: true
+    tty: true
+
+  # MongoDB for local development (when not using Atlas)
+  mongodb:
+    image: mongo:7.0
+    container_name: stock-mongodb-dev
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=stock-management
+    networks:
+      - stock-dev
+
+  # Redis for local development
+  redis:
+    image: redis:7-alpine
+    container_name: stock-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - stock-dev
+
+networks:
+  stock-dev:
+    driver: bridge
+
+volumes:
+  mongodb-data:
+  redis-data:

@@ -1,45 +1,76 @@
 const express = require('express');
+const { body, param } = require('express-validator');
 const router = express.Router();
 const companyController = require('../controllers/companyController');
-const { protect } = require('../middleware/auth');
+const { protect, authorize } = require('../middleware/auth');
+const validateRequest = require('../middleware/validateRequest');
+const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 
-// All routes require authentication
+const registerValidation = [
+  body('company').isObject().withMessage('company object required'),
+  body('company.name').trim().notEmpty().withMessage('Company name required'),
+  body('company.email').isEmail().normalizeEmail().withMessage('Valid company email required'),
+  body('admin').isObject().withMessage('admin object required'),
+  body('admin.name').trim().notEmpty().withMessage('Admin name required'),
+  body('admin.email').isEmail().normalizeEmail().withMessage('Valid admin email required'),
+  body('admin.password')
+    .isLength({ min: 8 })
+    .withMessage('Password must be at least 8 characters')
+];
+
+/**
+ * Public — must stay before router.use(protect)
+ */
+router.post(
+  '/register',
+  registerValidation,
+  validateRequest,
+  stripUnvalidatedBody,
+  companyController.registerPublic
+);
+
 router.use(protect);
 
 /**
- * Company Routes:
- * POST   /api/companies                    // Create company (super-admin only)
- * GET    /api/companies                   // Get all companies (super-admin only)
- * GET    /api/companies/:id               // Get company profile
- * PUT    /api/companies/:id               // Update company profile
- * POST   /api/companies/:id/logo           // Upload logo
- * GET    /api/companies/:id/setup-status  // Get onboarding completion status
- * POST   /api/companies/:id/setup/:step    // Mark a setup step as complete
- * DELETE /api/companies/:id                // Delete company (super-admin only)
+ * Platform admin — literal paths before /:id
  */
+router.get('/pending', authorize('platform_admin'), companyController.getPendingCompanies);
+router.get('/rejected', authorize('platform_admin'), companyController.getRejectedCompanies);
 
-// Create company (platform admin only)
 router.post('/', companyController.createCompany);
-
-// Get all companies (platform admin only)
 router.get('/', companyController.getAllCompanies);
 
-// Get company profile
-router.get('/:id', companyController.getCompany);
+const approveValidation = [
+  param('id').isMongoId().withMessage('Invalid company id')
+];
 
-// Update company profile
-router.put('/:id', companyController.updateCompany);
+const rejectValidation = [
+  param('id').isMongoId().withMessage('Invalid company id'),
+  body('reason').optional().isString().trim()
+];
 
-// Upload logo
+router.put(
+  '/:id/approve',
+  authorize('platform_admin'),
+  ...approveValidation,
+  validateRequest,
+  companyController.approveCompany
+);
+router.put(
+  '/:id/reject',
+  authorize('platform_admin'),
+  ...rejectValidation,
+  validateRequest,
+  stripUnvalidatedBody,
+  companyController.rejectCompany
+);
+
 router.post('/:id/logo', companyController.uploadLogo);
-
-// Get setup status
 router.get('/:id/setup-status', companyController.getSetupStatus);
-
-// Mark setup step complete
 router.post('/:id/setup/:step', companyController.markSetupStepComplete);
 
-// Delete company (soft delete - platform admin only)
+router.get('/:id', companyController.getCompany);
+router.put('/:id', companyController.updateCompany);
 router.delete('/:id', companyController.deleteCompany);
 
 module.exports = router;
