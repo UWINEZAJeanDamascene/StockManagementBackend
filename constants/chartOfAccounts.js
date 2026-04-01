@@ -16,7 +16,7 @@ const CHART_OF_ACCOUNTS = {
   '1300': { name: 'Accounts Receivable', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
   '1350': { name: 'Other Receivables', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
   '1400': { name: 'Inventory', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
-  '1500': { name: 'VAT Receivable', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
+  '1500': { name: 'VAT Receivable (legacy)', type: 'asset', subtype: 'vat_input', normalBalance: 'debit', allowDirectPosting: true },
   '1600': { name: 'Prepaid Expenses', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
   
   // Fixed Assets
@@ -41,12 +41,16 @@ const CHART_OF_ACCOUNTS = {
   // ── LIABILITIES (2000-2999) ───
   // Current Liabilities
   '2000': { name: 'Accounts Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2100': { name: 'VAT Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2200': { name: 'PAYE Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2300': { name: 'RSSB Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2310': { name: 'Employer Contribution Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2400': { name: 'Income Tax Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
-  '2500': { name: 'Withholding Tax Payable', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
+  '2100': { name: 'VAT Payable (legacy)', type: 'liability', subtype: 'vat_output', normalBalance: 'credit', allowDirectPosting: true },
+  '2200': { name: 'PAYE Payable (legacy)', type: 'liability', subtype: 'paye_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2210': { name: 'VAT Input', type: 'liability', subtype: 'vat_input', normalBalance: 'debit', allowDirectPosting: true },
+  '2220': { name: 'VAT Output', type: 'liability', subtype: 'vat_output', normalBalance: 'credit', allowDirectPosting: true },
+  '2230': { name: 'PAYE Tax Payable', type: 'liability', subtype: 'paye_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2240': { name: 'RSSB Payable', type: 'liability', subtype: 'rssb_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2300': { name: 'RSSB Payable (legacy)', type: 'liability', subtype: 'rssb_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2310': { name: 'Employer Contribution Payable', type: 'liability', subtype: 'rssb_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2400': { name: 'Income Tax Payable', type: 'liability', subtype: 'income_tax_payable', normalBalance: 'credit', allowDirectPosting: true },
+  '2500': { name: 'Withholding Tax Payable', type: 'liability', subtype: 'withholding_tax_payable', normalBalance: 'credit', allowDirectPosting: true },
   '2600': { name: 'Accrued Expenses', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
   '2700': { name: 'Short Term Loans', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
   '2800': { name: 'Accrued Interest', type: 'liability', subtype: 'current', normalBalance: 'credit', allowDirectPosting: true },
@@ -69,14 +73,14 @@ const CHART_OF_ACCOUNTS = {
   '4400': { name: 'Gain on Asset Disposal (legacy)', type: 'revenue', subtype: 'non_operating', normalBalance: 'credit', allowDirectPosting: false },
 
   // ── COST OF GOODS SOLD (5000-5099) ────────
-  '5000': { name: 'Cost of Goods Sold', type: 'expense', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
-  '5100': { name: 'Purchases', type: 'expense', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
-  '5110': { name: 'Freight In', type: 'expense', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
-  '5150': { name: 'Stock Adjustment Loss', type: 'expense', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
-  '5200': { name: 'Purchase Returns', type: 'expense', subtype: 'contra', normalBalance: 'credit', allowDirectPosting: true },
-  '5300': { name: 'Salaries & Wages', type: 'expense', subtype: 'operating', normalBalance: 'debit', allowDirectPosting: true },
+  '5000': { name: 'Cost of Goods Sold', type: 'cogs', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
+  '5100': { name: 'Purchases', type: 'cogs', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
+  '5110': { name: 'Freight In', type: 'cogs', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
+  '5150': { name: 'Stock Adjustment Loss', type: 'cogs', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
+  '5200': { name: 'Purchase Returns', type: 'cogs', subtype: 'contra', normalBalance: 'credit', allowDirectPosting: true },
+  '5300': { name: 'Direct Labor', type: 'cogs', subtype: 'cogs', normalBalance: 'debit', allowDirectPosting: true },
 
-  // ── OPERATING EXPENSES (5100-6999) ────────
+  // ── OPERATING EXPENSES (5400-6999) ────────
   '5400': { name: 'Salaries & Wages', type: 'expense', subtype: 'operating', normalBalance: 'debit', allowDirectPosting: true },
   '5410': { name: 'Payroll Expenses', type: 'expense', subtype: 'operating', normalBalance: 'debit', allowDirectPosting: true },
   '5500': { name: 'Rent', type: 'expense', subtype: 'operating', normalBalance: 'debit', allowDirectPosting: true },
@@ -94,11 +98,50 @@ const CHART_OF_ACCOUNTS = {
   // Additional operating expense codes requested
   '5250': { name: 'Bad Debt Expense', type: 'expense', subtype: 'operating', normalBalance: 'debit', allowDirectPosting: true },
   '6050': { name: 'Loss on Asset Disposal', type: 'expense', subtype: 'non_operating', normalBalance: 'debit', allowDirectPosting: true },
-  '6150': { name: 'Withholding Tax Expense', type: 'expense', subtype: 'tax', normalBalance: 'debit', allowDirectPosting: true },
+  '6150': { name: 'RSSB Employer Cost', type: 'expense', subtype: 'rssb_employer_cost', normalBalance: 'debit', allowDirectPosting: true },
   
   // ── SPECIAL ACCOUNTS ──────────
   '7100': { name: 'Stock Adjustment', type: 'asset', subtype: 'current', normalBalance: 'debit', allowDirectPosting: true },
   '7200': { name: 'Asset Disposal', type: 'asset', subtype: 'fixed', normalBalance: 'debit', allowDirectPosting: true },
+};
+
+// Tax subtypes used for validation
+const TAX_SUBTYPES = [
+  'vat_input',
+  'vat_output',
+  'paye_payable',
+  'rssb_payable',
+  'rssb_employer_cost',
+  'income_tax_payable',
+  'withholding_tax_payable'
+];
+
+// Check if an account code is a tax account
+const isTaxAccount = (code) => {
+  const account = CHART_OF_ACCOUNTS[code];
+  if (!account) return false;
+  return TAX_SUBTYPES.includes(account.subtype);
+};
+
+// Get the tax subtype for an account code (null if not a tax account)
+const getTaxSubtype = (code) => {
+  const account = CHART_OF_ACCOUNTS[code];
+  if (!account) return null;
+  return TAX_SUBTYPES.includes(account.subtype) ? account.subtype : null;
+};
+
+// Validate that an account code is a tax account with the expected subtype
+// Returns { valid: true } or { valid: false, reason: 'TAX_ACCOUNT_MISCONFIGURED', expected, actual }
+const validateTaxAccount = (code, expectedSubtype) => {
+  const account = CHART_OF_ACCOUNTS[code];
+  if (!account) return { valid: false, reason: 'ACCOUNT_NOT_FOUND' };
+  if (!TAX_SUBTYPES.includes(account.subtype)) {
+    return { valid: false, reason: 'TAX_ACCOUNT_MISCONFIGURED', code, actualSubtype: account.subtype };
+  }
+  if (expectedSubtype && account.subtype !== expectedSubtype) {
+    return { valid: false, reason: 'TAX_ACCOUNT_MISCONFIGURED', code, expected: expectedSubtype, actual: account.subtype };
+  }
+  return { valid: true, account };
 };
 
 // Helper function to get account by code
@@ -153,14 +196,18 @@ const DEFAULT_ACCOUNTS = {
   employeeAdvances: '1250',
   otherReceivables: '1350',
   
-  // VAT
+  // VAT (legacy - mapped to old accounts for backward compatibility)
   vatReceivable: '1500',
   vatPayable: '2100',
   taxPayable: '2100',
   
+  // VAT (new separated accounts)
+  vatInput: '2210',
+  vatOutput: '2220',
+  
   // Expenses
-  salaries: '5300',
-  salariesWages: '5300',
+  salaries: '5400',
+  salariesWages: '5400',
   payrollExpenses: '5410',
   rent: '5500',
   utilities: '5600',
@@ -202,10 +249,13 @@ const DEFAULT_ACCOUNTS = {
   // Tax
   incomeTaxPayable: '2400',
   payePayable: '2200',
+  payePayableNew: '2230',
   rssbPayable: '2300',
+  rssbPayableNew: '2240',
   withholdingTaxPayable: '2500',
   corporateTax: '6400',
   withholdingTaxExpense: '6150',
+  rssbEmployerCost: '6150',
   
   // Equity
   shareCapital: '3000',
@@ -229,9 +279,13 @@ const DEFAULT_ACCOUNTS = {
 
 module.exports = {
   CHART_OF_ACCOUNTS,
+  TAX_SUBTYPES,
   getAccount,
   getAccountsByType,
   getAccountsBySubtype,
   canPostToAccount,
+  isTaxAccount,
+  getTaxSubtype,
+  validateTaxAccount,
   DEFAULT_ACCOUNTS
 };

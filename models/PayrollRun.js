@@ -65,19 +65,19 @@ const payrollRunSchema = new mongoose.Schema({
   },
   salary_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     required: true
     // Must be 6100-series Salaries & Wages account
   },
   tax_payable_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     required: true
     // Must be 2200-series Tax Payable account
   },
   other_deductions_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     default: null
     // Required only if total_other_deductions > 0
   },

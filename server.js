@@ -224,6 +224,7 @@ apiRouter.use('/chat', require('./routes/chatRoutes'));
 apiRouter.use('/journal-entries', require('./routes/journalRoutes'));
 apiRouter.use('/accounting', require('./routes/accountingRoutes'));
 apiRouter.use('/account-mappings', require('./routes/accountMappingRoutes'));
+apiRouter.use('/chart-of-accounts', require('./routes/chartOfAccountsRoutes'));
 apiRouter.use('/reconciliation', require('./routes/reconciliationRoutes'));
 apiRouter.use('/gl-financials', require('./routes/glFinancialRoutes'));
 apiRouter.use('/stock-transfers', require('./routes/stockTransferRoutes'));

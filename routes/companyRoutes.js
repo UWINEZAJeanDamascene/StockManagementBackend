@@ -3,6 +3,7 @@ const { body, param } = require('express-validator');
 const router = express.Router();
 const companyController = require('../controllers/companyController');
 const { protect, authorize } = require('../middleware/auth');
+const { attachCompanyId } = require('../middleware/companyContext');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 
@@ -30,6 +31,12 @@ router.post(
 );
 
 router.use(protect);
+
+/**
+ * Current user's company — must be before /:id routes
+ */
+router.get('/me', companyController.getMyCompany);
+router.put('/me', companyController.updateMyCompany);
 
 /**
  * Platform admin — literal paths before /:id

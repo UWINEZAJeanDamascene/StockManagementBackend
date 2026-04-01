@@ -20,8 +20,8 @@ const Category = require('../../../models/Category');
 class ProductImportValidator {
   // Column name mapping (CSV header -> validation field)
   static COLUMN_MAPPING = {
-    'code': 'code',
-    'sku': 'code', // Alternate name
+    'sku': 'sku',
+    'code': 'sku', // Alternate name
     'name': 'name',
     'product_name': 'name',
     'category_name': 'categoryName',
@@ -43,11 +43,21 @@ class ProductImportValidator {
     'minimum_stock': 'reorderPoint',
     'is_stockable': 'isStockable',
     'stockable': 'isStockable',
-    'track_stock': 'isStockable'
+    'track_stock': 'isStockable',
+    'barcode': 'barcode',
+    'barcode_type': 'barcodeType',
+    'tax_code': 'taxCode',
+    'tax_rate': 'taxRate',
+    'brand': 'brand',
+    'location': 'location',
+    'weight': 'weight',
+    'low_stock_threshold': 'lowStockThreshold',
+    'reorder_quantity': 'reorderQuantity',
+    'initial_stock': 'initialStock'
   };
 
   // Required columns
-  static REQUIRED = ['code', 'name', 'unitOfMeasure'];
+  static REQUIRED = ['sku', 'name', 'unitOfMeasure'];
 
   // Valid units of measure
   static VALID_UNITS = [
@@ -68,8 +78,8 @@ class ProductImportValidator {
     'ton', 'tons'
   ];
 
-  // Valid costing methods
-  static COSTING_METHODS = ['fifo', 'wac', 'weighted_average'];
+  // Valid costing methods (matching Product model enum)
+  static COSTING_METHODS = ['fifo', 'weighted', 'wac', 'avg'];
 
   /**
    * Validate a single product record
@@ -82,34 +92,34 @@ class ProductImportValidator {
     const errors = [];
     const normalized = this.normalize(record);
 
-    // 1. Check code is present and not longer than 50 chars
-    if (!normalized.code || normalized.code.trim() === '') {
+    // 1. Check sku is present and not longer than 50 chars
+    if (!normalized.sku || normalized.sku.trim() === '') {
       errors.push({
         row: rowNum,
-        field: 'code',
-        message: 'Product code is required',
-        value: record.code
+        field: 'sku',
+        message: 'Product SKU is required',
+        value: record.sku || record.code
       });
-    } else if (normalized.code.length > 50) {
+    } else if (normalized.sku.length > 50) {
       errors.push({
         row: rowNum,
-        field: 'code',
-        message: 'Product code cannot exceed 50 characters',
-        value: normalized.code
+        field: 'sku',
+        message: 'Product SKU cannot exceed 50 characters',
+        value: normalized.sku
       });
     } else {
-      // Check uniqueness - code must not already exist for this company
+      // Check uniqueness - sku must not already exist for this company
       const existing = await Product.findOne({
         company: companyId,
-        code: normalized.code.trim().toUpperCase()
+        sku: normalized.sku.trim().toUpperCase()
       }).lean();
 
       if (existing) {
         errors.push({
           row: rowNum,
-          field: 'code',
-          message: 'Product code already exists for this company',
-          value: normalized.code
+          field: 'sku',
+          message: 'Product SKU already exists for this company',
+          value: normalized.sku
         });
       }
     }
@@ -136,7 +146,7 @@ class ProductImportValidator {
           row: rowNum,
           field: 'category_name',
           message: `Category "${normalized.categoryName}" does not exist`,
-          value: record.category_name
+          value: record.category_name || record.category
         });
       } else {
         normalized.categoryId = category._id;
@@ -149,7 +159,7 @@ class ProductImportValidator {
         row: rowNum,
         field: 'unit_of_measure',
         message: 'Unit of measure is required',
-        value: record.unit_of_measure
+        value: record.unit_of_measure || record.unit
       });
     } else {
       // Validate unit is in allowed list
@@ -160,7 +170,7 @@ class ProductImportValidator {
           row: rowNum,
           field: 'unit_of_measure',
           message: `Invalid unit. Use: ${this.VALID_UNITS.slice(0, 5).join(', ')}...`,
-          value: record.unit_of_measure
+          value: record.unit_of_measure || record.unit
         });
       }
     }
@@ -173,7 +183,7 @@ class ProductImportValidator {
           row: rowNum,
           field: 'cost_price',
           message: 'Cost price must be a non-negative number',
-          value: record.cost_price
+          value: record.cost_price || record.cost
         });
       } else {
         normalized.costPrice = cost;
@@ -188,14 +198,14 @@ class ProductImportValidator {
           row: rowNum,
           field: 'selling_price',
           message: 'Selling price must be a non-negative number',
-          value: record.selling_price
+          value: record.selling_price || record.price
         });
       } else {
         normalized.sellingPrice = price;
       }
     }
 
-    // 7. Validate costing_method is either fifo or wac
+    // 7. Validate costing_method
     if (normalized.costingMethod && normalized.costingMethod.trim() !== '') {
       const methodLower = normalized.costingMethod.toLowerCase().trim();
       if (!this.COSTING_METHODS.includes(methodLower)) {
@@ -203,7 +213,7 @@ class ProductImportValidator {
           row: rowNum,
           field: 'costing_method',
           message: `Invalid costing method. Use: ${this.COSTING_METHODS.join(', ')}`,
-          value: record.costing_method
+          value: record.costing_method || record.costing
         });
       } else {
         normalized.costingMethod = methodLower;
@@ -227,7 +237,7 @@ class ProductImportValidator {
 
     // 9. Validate is_stockable
     if (normalized.isStockable !== undefined && normalized.isStockable !== '') {
-      const stockable = normalized.isStockable.toLowerCase().trim();
+      const stockable = String(normalized.isStockable).toLowerCase().trim();
       if (!['true', 'false', 'yes', 'no', '1', '0'].includes(stockable)) {
         errors.push({
           row: rowNum,
@@ -237,6 +247,51 @@ class ProductImportValidator {
         });
       } else {
         normalized.isStockable = ['true', 'yes', '1'].includes(stockable);
+      }
+    }
+
+    // 10. Validate tax_rate is non-negative
+    if (normalized.taxRate !== undefined && normalized.taxRate !== '') {
+      const rate = parseFloat(normalized.taxRate);
+      if (isNaN(rate) || rate < 0 || rate > 100) {
+        errors.push({
+          row: rowNum,
+          field: 'tax_rate',
+          message: 'Tax rate must be between 0 and 100',
+          value: record.tax_rate
+        });
+      } else {
+        normalized.taxRate = rate;
+      }
+    }
+
+    // 11. Validate weight is non-negative
+    if (normalized.weight !== undefined && normalized.weight !== '') {
+      const w = parseFloat(normalized.weight);
+      if (isNaN(w) || w < 0) {
+        errors.push({
+          row: rowNum,
+          field: 'weight',
+          message: 'Weight must be a non-negative number',
+          value: record.weight
+        });
+      } else {
+        normalized.weight = w;
+      }
+    }
+
+    // 12. Validate initial_stock is non-negative
+    if (normalized.initialStock !== undefined && normalized.initialStock !== '') {
+      const stock = parseFloat(normalized.initialStock);
+      if (isNaN(stock) || stock < 0) {
+        errors.push({
+          row: rowNum,
+          field: 'initial_stock',
+          message: 'Initial stock must be a non-negative number',
+          value: record.initial_stock
+        });
+      } else {
+        normalized.initialStock = stock;
       }
     }
 
@@ -270,12 +325,12 @@ class ProductImportValidator {
     const normalizedHeaders = headers.map(h => h.toLowerCase().trim());
     
     // Check required columns exist
-    const hasCode = normalizedHeaders.includes('code') || normalizedHeaders.includes('sku');
+    const hasSku = normalizedHeaders.includes('sku') || normalizedHeaders.includes('code');
     const hasName = normalizedHeaders.includes('name') || normalizedHeaders.includes('product_name');
     const hasUnit = normalizedHeaders.includes('unit_of_measure') || normalizedHeaders.includes('unit') || normalizedHeaders.includes('uom');
 
     const missing = [];
-    if (!hasCode) missing.push('code');
+    if (!hasSku) missing.push('sku');
     if (!hasName) missing.push('name');
     if (!hasUnit) missing.push('unit_of_measure');
 

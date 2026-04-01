@@ -19,7 +19,7 @@ const purchaseOrderSchema = new mongoose.Schema({
   orderDate: { type: Date, default: Date.now },
   expectedDeliveryDate: Date,
   status: { type: String, enum: ['draft', 'approved', 'partially_received', 'fully_received', 'cancelled'], default: 'draft' },
-  currencyCode: { type: String, default: 'USD' },
+  currencyCode: { type: String, default: 'FRW' },
   exchangeRate: { type: Number, default: 1 },
   subtotal: { type: Number, default: 0 },
   taxAmount: { type: Number, default: 0 },
@@ -39,6 +39,36 @@ purchaseOrderSchema.index({ company: 1, status: 1, orderDate: 1 });
 purchaseOrderSchema.pre('save', async function(next) {
   if (this.isNew && !this.referenceNo) {
     this.referenceNo = await generateUniqueNumber('PO', mongoose.model('PurchaseOrder'), this.company, 'referenceNo');
+  }
+  next();
+});
+
+// Calculate totals from lines before saving
+purchaseOrderSchema.pre('save', function(next) {
+  if (this.lines && this.lines.length > 0) {
+    let subtotal = 0;
+    let taxAmount = 0;
+
+    this.lines.forEach(line => {
+      const lineSubtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
+      const lineTax = lineSubtotal * ((Number(line.taxRate) || 0) / 100);
+      const lineTotal = lineSubtotal + lineTax;
+
+      // Update line-level calculated fields
+      line.taxAmount = lineTax;
+      line.lineTotal = lineTotal;
+
+      subtotal += lineSubtotal;
+      taxAmount += lineTax;
+    });
+
+    this.subtotal = subtotal;
+    this.taxAmount = taxAmount;
+    this.totalAmount = subtotal + taxAmount;
+  } else {
+    this.subtotal = 0;
+    this.taxAmount = 0;
+    this.totalAmount = 0;
   }
   next();
 });

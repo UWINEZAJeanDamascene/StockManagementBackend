@@ -42,7 +42,7 @@ const journalEntrySchema = new mongoose.Schema({
   // Reference to source document (optional)
   sourceType: {
     type: String,
-    enum: ['manual', 'invoice', 'purchase', 'purchase_order', 'credit_note', 'credit_note_cogs', 'expense', 'asset', 'asset_purchase', 'asset_disposal', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_topup', 'petty_cash_expense', 'petty_cash_replenishment', 'petty_cash_opening', 'purchase_return', 'stock_adjustment', 'payroll', 'payroll_run', 'payroll_reversal', 'tax_payment', 'tax_settlement', 'bank_transfer', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', 'ar_receipt', 'ar_receipt_reversal', 'bad_debt_writeoff', 'ap_payment', 'ap_payment_reversal', 'liability_drawdown', 'liability_repayment', 'liability_interest', null],
+    enum: ['manual', 'invoice', 'purchase', 'purchase_order', 'credit_note', 'credit_note_cogs', 'expense', 'asset', 'asset_purchase', 'asset_disposal', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_topup', 'petty_cash_expense', 'petty_cash_replenishment', 'petty_cash_opening', 'purchase_return', 'stock_adjustment', 'payroll', 'payroll_run', 'payroll_salary', 'payroll_reversal', 'tax_payment', 'tax_settlement', 'vat_settlement', 'paye_settlement', 'rssb_settlement', 'bank_transfer', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', 'ar_receipt', 'ar_receipt_reversal', 'bad_debt_writeoff', 'ap_payment', 'ap_payment_reversal', 'liability_drawdown', 'liability_repayment', 'liability_interest', 'other_income', 'tax_accrual', 'loan_interest', 'bank_charge', 'interest_accrual', 'distribution_cost', 'admin_expense', 'other_expense', 'oci', 'dividend', null],
     default: 'manual'
   },
   sourceId: {
@@ -114,7 +114,7 @@ const journalEntrySchema = new mongoose.Schema({
     default: null
   }
 }, {
-  timestamps: true
+  // timestamps handled by auditSoftDeletePlugin to avoid duplicate field definitions
 });
 
 // Plugin for audit fields and soft-delete

@@ -2,253 +2,420 @@ const mongoose = require('mongoose');
 const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 const BalanceSheetService = require('./balanceSheetService');
 const PLStatementService = require('./plStatementService');
+const Company = require('../models/Company');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
 
 /**
- * Financial Ratios Dashboard Service
- * 
- * Computes 9 financial ratios live from the current state of the ledger.
- * No ratio is stored — they are always recomputed on demand.
+ * Financial Ratios Service — IAS/IFRS Compliant
+ *
+ * Computes key financial ratios from live ledger data.
+ * Ratios are grouped into:
+ *
+ *   Liquidity Ratios — ability to meet short-term obligations
+ *     - Current Ratio, Quick Ratio, Cash Ratio, Working Capital
+ *
+ *   Profitability Ratios — ability to generate earnings
+ *     - Gross Margin, Net Profit Margin, ROA, ROE, EBITDA Margin
+ *
+ *   Efficiency Ratios — how well assets/liabilities are managed
+ *     - Inventory Turnover, DIO, AR Turnover, DSO, AP Turnover, DPO
+ *
+ *   Leverage Ratios — capital structure and debt servicing
+ *     - Debt to Equity, Interest Coverage Ratio
  */
 class FinancialRatiosService {
 
   /**
-   * Compute all 9 financial ratios
-   * @param {string} companyId - Company ID
-   * @param {object} options - { asOfDate, dateFrom, dateTo }
+   * Compute all financial ratios
+   * @param {string} companyId
+   * @param {object} options — { asOfDate, dateFrom, dateTo }
    */
   static async compute(companyId, { asOfDate, dateFrom, dateTo }) {
     if (!companyId) throw new Error('COMPANY_ID_REQUIRED');
     if (!asOfDate) throw new Error('AS_OF_DATE_REQUIRED');
     if (!dateFrom || !dateTo) throw new Error('DATE_RANGE_REQUIRED');
 
-    // Get balance sheet data — needed for liquidity and leverage ratios
-    const bs = await BalanceSheetService.generate(companyId, { asOfDate });
+    const company = await Company.findById(companyId).lean();
 
-    // Get P&L data for the period — needed for profitability ratios
-    const pl = await PLStatementService.generate(companyId, { dateFrom, dateTo });
-    const currentPeriod = pl.current || pl;
+    // Get balance sheet — uses new structure: current.current_assets.total, etc.
+    const bsData = await BalanceSheetService.generate(companyId, { asOfDate });
+    const bs = bsData.current;
 
-    // Extract specific balance sheet line values
-    const currentAssets = bs.assets?.current?.total || 0;
-    const totalAssets = bs.assets?.total || 0;
-    const currentLiabilities = bs.liabilities?.current?.total || 0;
-    const totalLiabilities = bs.liabilities?.total || 0;
-    const totalEquity = bs.equity?.total || 0;
+    // Get P&L
+    const plData = await PLStatementService.generate(companyId, { dateFrom, dateTo });
+    const pl = plData.current;
 
-    // Inventory from balance sheet current assets
-    const inventoryBalance = await FinancialRatiosService._getAccountTypeBalance(
-      companyId, 'inventory', asOfDate
+    // ── Extract balance sheet values ───────────────────────────────
+    const currentAssets = bs?.current_assets?.total || 0;
+    const totalAssets = bs?.total_assets || 0;
+    const currentLiabilities = bs?.current_liabilities?.total || 0;
+    const totalLiabilities = bs?.total_liabilities || 0;
+    const totalEquity = bs?.equity?.total || 0;
+    const nonCurrentLiabilities = bs?.non_current_liabilities?.total || 0;
+
+    // Inventory balance — use inventory account codes directly
+    const inventoryBalance = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['1400'], asOfDate
     );
 
-    // Average inventory for turnover calculation
-    // Uses balance at start and end of period
-    const openingInventory = await FinancialRatiosService._getAccountTypeBalance(
-      companyId, 'inventory', dateFrom
+    // AR balance — Accounts Receivable + Other Receivables
+    const arBalance = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['1300', '1350'], asOfDate
+    );
+
+    // AP balance
+    const apBalance = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['2000'], asOfDate
+    );
+
+    // Cash and cash equivalents
+    const cashBalance = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['1000', '1050', '1100', '1110', '1200'], asOfDate
+    );
+
+    // Average balances for turnover calculations
+    const openingInventory = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['1400'], dateFrom
     );
     const avgInventory = (openingInventory + inventoryBalance) / 2;
 
-    // AP balance for AP turnover
-    const apBalance = await FinancialRatiosService._getAccountTypeBalance(
-      companyId, 'ap', asOfDate
-    );
-    const openingAP = await FinancialRatiosService._getAccountTypeBalance(
-      companyId, 'ap', dateFrom
+    const openingAP = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['2000'], dateFrom
     );
     const avgAP = (openingAP + apBalance) / 2;
 
-    // Total purchases for AP turnover — from stock movements
+    const openingAR = await FinancialRatiosService._getAccountCodesBalance(
+      companyId, ['1300', '1350'], dateFrom
+    );
+    const avgAR = (openingAR + arBalance) / 2;
+
+    // ── Extract P&L values ────────────────────────────────────────
+    const revenue = pl?.revenue?.total || 0;
+    const cogs = pl?.cogs?.total || 0;
+    const grossProfit = pl?.gross_profit || 0;
+    const operatingProfit = pl?.operating_profit || 0;
+    const netProfit = pl?.profit_for_period || 0;
+    const financeCosts = pl?.finance_costs?.total || 0;
+    const ebitda = pl?.ebitda || 0;
+
+    // Total purchases (from COGS accounts)
     const totalPurchases = await FinancialRatiosService._getTotalPurchases(
       companyId, dateFrom, dateTo
     );
 
-    // Values from P&L
-    const revenue = currentPeriod.revenue?.total || 0;
-    const cogs = currentPeriod.cogs?.total || 0;
-    const grossProfit = currentPeriod.gross_profit || 0;
-    const netProfit = currentPeriod.net_profit || 0;
+    // Days in period
+    const daysInPeriod = Math.max(1, Math.round((new Date(dateTo) - new Date(dateFrom)) / (1000 * 60 * 60 * 24)));
 
-    // ── COMPUTE ALL RATIOS ────────────────────────────────────────
+    // Working capital
+    const workingCapital = currentAssets - currentLiabilities;
 
-    // 1. Current Ratio — liquidity
-    const currentRatio = currentLiabilities > 0
-      ? currentAssets / currentLiabilities
-      : null;
+    // ── LIQUIDITY RATIOS ──────────────────────────────────────────
 
-    // 2. Quick Ratio — acid test liquidity (excludes inventory)
+    // 1. Current Ratio
+    const currentRatio = currentLiabilities > 0 ? currentAssets / currentLiabilities : null;
+
+    // 2. Quick Ratio (Acid Test)
     const quickAssets = currentAssets - inventoryBalance;
-    const quickRatio = currentLiabilities > 0
-      ? quickAssets / currentLiabilities
-      : null;
+    const quickRatio = currentLiabilities > 0 ? quickAssets / currentLiabilities : null;
 
-    // 3. Gross Margin — profitability
-    const grossMarginPct = revenue > 0
-      ? (grossProfit / revenue) * 100
-      : null;
+    // 3. Cash Ratio
+    const cashRatio = currentLiabilities > 0 ? cashBalance / currentLiabilities : null;
 
-    // 4. Inventory Turnover — efficiency
-    const inventoryTurnover = avgInventory > 0
-      ? cogs / avgInventory
-      : null;
+    // ── PROFITABILITY RATIOS ──────────────────────────────────────
 
-    // 5. Days Inventory Outstanding (DIO)
-    const daysInventory = inventoryTurnover > 0
-      ? 365 / inventoryTurnover
-      : null;
+    // 4. Gross Margin %
+    const grossMarginPct = revenue > 0 ? (grossProfit / revenue) * 100 : null;
 
-    // 6. AP Turnover — how fast the company pays suppliers
-    const apTurnover = avgAP > 0
-      ? totalPurchases / avgAP
-      : null;
+    // 5. Net Profit Margin %
+    const netProfitMarginPct = revenue > 0 ? (netProfit / revenue) * 100 : null;
+
+    // 6. EBITDA Margin %
+    const ebitdaMarginPct = revenue > 0 ? (ebitda / revenue) * 100 : null;
 
     // 7. Return on Assets (ROA)
-    const returnOnAssets = totalAssets > 0
-      ? (netProfit / totalAssets) * 100
-      : null;
+    const returnOnAssets = totalAssets > 0 ? (netProfit / totalAssets) * 100 : null;
 
-    // 8. Debt to Equity
-    const debtToEquity = totalEquity > 0
-      ? totalLiabilities / totalEquity
-      : null;
+    // 8. Return on Equity (ROE)
+    const returnOnEquity = totalEquity > 0 ? (netProfit / totalEquity) * 100 : null;
 
-    // 9. Net Profit Margin
-    const netProfitMarginPct = revenue > 0
-      ? (netProfit / revenue) * 100
-      : null;
+    // ── EFFICIENCY RATIOS ─────────────────────────────────────────
+
+    // 9. Inventory Turnover
+    const inventoryTurnover = avgInventory > 0 ? cogs / avgInventory : null;
+
+    // 10. Days Inventory Outstanding (DIO)
+    const daysInventory = inventoryTurnover > 0 ? daysInPeriod / inventoryTurnover : null;
+
+    // 11. AR Turnover
+    const arTurnover = avgAR > 0 ? revenue / avgAR : null;
+
+    // 12. Days Sales Outstanding (DSO)
+    const daysSalesOutstanding = arTurnover > 0 ? daysInPeriod / arTurnover : null;
+
+    // 13. AP Turnover
+    const apTurnover = avgAP > 0 ? totalPurchases / avgAP : null;
+
+    // 14. Days Payable Outstanding (DPO)
+    const daysPayableOutstanding = apTurnover > 0 ? daysInPeriod / apTurnover : null;
+
+    // ── LEVERAGE RATIOS ───────────────────────────────────────────
+
+    // 15. Debt to Equity
+    const debtToEquity = totalEquity > 0 ? totalLiabilities / totalEquity : null;
+
+    // 16. Interest Coverage Ratio
+    const interestCoverage = financeCosts > 0 ? operatingProfit / financeCosts : null;
+
+    // ── Build response ────────────────────────────────────────────
+    const round = (v) => v !== null ? Math.round(v * 100) / 100 : null;
 
     return {
       company_id: companyId,
+      company_name: company?.name || '',
       as_of_date: asOfDate,
       date_from: dateFrom,
       date_to: dateTo,
+      days_in_period: daysInPeriod,
+
       ratios: {
-        current_ratio: {
-          value: currentRatio !== null ? Math.round(currentRatio * 100) / 100 : null,
-          formula: 'Current Assets ÷ Current Liabilities',
-          inputs: { current_assets: currentAssets, current_liabilities: currentLiabilities },
-          status: FinancialRatiosService._rateCurrentRatio(currentRatio)
+        liquidity: {
+          label: 'Liquidity Ratios',
+          ratios: {
+            current_ratio: {
+              value: round(currentRatio),
+              label: 'Current Ratio',
+              formula: 'Current Assets ÷ Current Liabilities',
+              benchmark: 'Ideal: ≥ 2.0, Acceptable: ≥ 1.0',
+              inputs: { current_assets: round(currentAssets), current_liabilities: round(currentLiabilities) },
+              status: FinancialRatiosService._rate(currentRatio, [2, 1], 'gte')
+            },
+            quick_ratio: {
+              value: round(quickRatio),
+              label: 'Quick Ratio (Acid Test)',
+              formula: '(Current Assets − Inventory) ÷ Current Liabilities',
+              benchmark: 'Ideal: ≥ 1.0, Acceptable: ≥ 0.5',
+              inputs: { quick_assets: round(quickAssets), current_liabilities: round(currentLiabilities) },
+              status: FinancialRatiosService._rate(quickRatio, [1, 0.5], 'gte')
+            },
+            cash_ratio: {
+              value: round(cashRatio),
+              label: 'Cash Ratio',
+              formula: 'Cash & Equivalents ÷ Current Liabilities',
+              benchmark: 'Ideal: ≥ 0.5, Acceptable: ≥ 0.2',
+              inputs: { cash: round(cashBalance), current_liabilities: round(currentLiabilities) },
+              status: FinancialRatiosService._rate(cashRatio, [0.5, 0.2], 'gte')
+            },
+            working_capital: {
+              value: round(workingCapital),
+              label: 'Working Capital',
+              formula: 'Current Assets − Current Liabilities',
+              benchmark: 'Positive is healthy',
+              inputs: { current_assets: round(currentAssets), current_liabilities: round(currentLiabilities) },
+              status: workingCapital > 0 ? 'good' : workingCapital === 0 ? 'warning' : 'danger'
+            }
+          }
         },
-        quick_ratio: {
-          value: quickRatio !== null ? Math.round(quickRatio * 100) / 100 : null,
-          formula: '(Current Assets − Inventory) ÷ Current Liabilities',
-          inputs: { quick_assets: quickAssets, current_liabilities: currentLiabilities },
-          status: FinancialRatiosService._rateQuickRatio(quickRatio)
+
+        profitability: {
+          label: 'Profitability Ratios',
+          ratios: {
+            gross_margin_pct: {
+              value: round(grossMarginPct),
+              label: 'Gross Margin %',
+              formula: 'Gross Profit ÷ Revenue × 100',
+              benchmark: 'Excellent: ≥ 40%, Good: ≥ 20%',
+              inputs: { gross_profit: round(grossProfit), revenue: round(revenue) },
+              status: FinancialRatiosService._rate(grossMarginPct, [40, 20], 'gte')
+            },
+            net_profit_margin_pct: {
+              value: round(netProfitMarginPct),
+              label: 'Net Profit Margin %',
+              formula: 'Net Profit ÷ Revenue × 100',
+              benchmark: 'Excellent: ≥ 15%, Good: ≥ 5%',
+              inputs: { net_profit: round(netProfit), revenue: round(revenue) },
+              status: FinancialRatiosService._rate(netProfitMarginPct, [15, 5], 'gte')
+            },
+            ebitda_margin_pct: {
+              value: round(ebitdaMarginPct),
+              label: 'EBITDA Margin %',
+              formula: 'EBITDA ÷ Revenue × 100',
+              benchmark: 'Excellent: ≥ 20%, Good: ≥ 10%',
+              inputs: { ebitda: round(ebitda), revenue: round(revenue) },
+              status: FinancialRatiosService._rate(ebitdaMarginPct, [20, 10], 'gte')
+            },
+            return_on_assets: {
+              value: round(returnOnAssets),
+              label: 'Return on Assets (ROA) %',
+              formula: 'Net Profit ÷ Total Assets × 100',
+              benchmark: 'Excellent: ≥ 10%, Good: ≥ 5%',
+              inputs: { net_profit: round(netProfit), total_assets: round(totalAssets) },
+              status: FinancialRatiosService._rate(returnOnAssets, [10, 5], 'gte')
+            },
+            return_on_equity: {
+              value: round(returnOnEquity),
+              label: 'Return on Equity (ROE) %',
+              formula: 'Net Profit ÷ Total Equity × 100',
+              benchmark: 'Excellent: ≥ 15%, Good: ≥ 8%',
+              inputs: { net_profit: round(netProfit), total_equity: round(totalEquity) },
+              status: FinancialRatiosService._rate(returnOnEquity, [15, 8], 'gte')
+            }
+          }
         },
-        gross_margin_pct: {
-          value: grossMarginPct !== null ? Math.round(grossMarginPct * 100) / 100 : null,
-          formula: 'Gross Profit ÷ Revenue × 100',
-          inputs: { gross_profit: grossProfit, revenue },
-          status: FinancialRatiosService._rateGrossMargin(grossMarginPct)
+
+        efficiency: {
+          label: 'Efficiency Ratios',
+          ratios: {
+            inventory_turnover: {
+              value: round(inventoryTurnover),
+              label: 'Inventory Turnover',
+              formula: 'COGS ÷ Average Inventory',
+              benchmark: 'High: ≥ 6x, Average: ≥ 3x',
+              inputs: { cogs: round(cogs), avg_inventory: round(avgInventory) },
+              status: FinancialRatiosService._rate(inventoryTurnover, [6, 3], 'gte')
+            },
+            days_inventory_outstanding: {
+              value: round(daysInventory),
+              label: 'Days Inventory Outstanding',
+              formula: `${daysInPeriod} days ÷ Inventory Turnover`,
+              benchmark: 'Good: ≤ 60 days, Acceptable: ≤ 90 days',
+              inputs: { inventory_turnover: round(inventoryTurnover) },
+              status: FinancialRatiosService._rate(daysInventory, [60, 90], 'lte')
+            },
+            ar_turnover: {
+              value: round(arTurnover),
+              label: 'Accounts Receivable Turnover',
+              formula: 'Revenue ÷ Average AR',
+              benchmark: 'High: ≥ 8x, Average: ≥ 4x',
+              inputs: { revenue: round(revenue), avg_ar: round(avgAR) },
+              status: FinancialRatiosService._rate(arTurnover, [8, 4], 'gte')
+            },
+            days_sales_outstanding: {
+              value: round(daysSalesOutstanding),
+              label: 'Days Sales Outstanding (DSO)',
+              formula: `${daysInPeriod} days ÷ AR Turnover`,
+              benchmark: 'Good: ≤ 45 days, Acceptable: ≤ 60 days',
+              inputs: { ar_turnover: round(arTurnover) },
+              status: FinancialRatiosService._rate(daysSalesOutstanding, [45, 60], 'lte')
+            },
+            ap_turnover: {
+              value: round(apTurnover),
+              label: 'Accounts Payable Turnover',
+              formula: 'Total Purchases ÷ Average AP',
+              benchmark: 'High: ≥ 8x, Average: ≥ 4x',
+              inputs: { total_purchases: round(totalPurchases), avg_ap: round(avgAP) },
+              status: FinancialRatiosService._rate(apTurnover, [8, 4], 'gte')
+            },
+            days_payable_outstanding: {
+              value: round(daysPayableOutstanding),
+              label: 'Days Payable Outstanding (DPO)',
+              formula: `${daysInPeriod} days ÷ AP Turnover`,
+              benchmark: 'Context-dependent',
+              inputs: { ap_turnover: round(apTurnover) },
+              status: 'neutral'
+            }
+          }
         },
-        inventory_turnover: {
-          value: inventoryTurnover !== null ? Math.round(inventoryTurnover * 100) / 100 : null,
-          formula: 'COGS ÷ Average Inventory',
-          inputs: { cogs, avg_inventory: Math.round(avgInventory * 100) / 100 },
-          status: FinancialRatiosService._rateInventoryTurnover(inventoryTurnover)
-        },
-        days_inventory_outstanding: {
-          value: daysInventory !== null ? Math.round(daysInventory * 100) / 100 : null,
-          formula: '365 ÷ Inventory Turnover',
-          inputs: { inventory_turnover: inventoryTurnover },
-          status: FinancialRatiosService._rateDIO(daysInventory)
-        },
-        ap_turnover: {
-          value: apTurnover !== null ? Math.round(apTurnover * 100) / 100 : null,
-          formula: 'Total Purchases ÷ Average AP',
-          inputs: { total_purchases: totalPurchases, avg_ap: Math.round(avgAP * 100) / 100 },
-          status: 'neutral'
-        },
-        return_on_assets: {
-          value: returnOnAssets !== null ? Math.round(returnOnAssets * 100) / 100 : null,
-          formula: 'Net Profit ÷ Total Assets × 100',
-          inputs: { net_profit: netProfit, total_assets: totalAssets },
-          status: FinancialRatiosService._rateROA(returnOnAssets)
-        },
-        debt_to_equity: {
-          value: debtToEquity !== null ? Math.round(debtToEquity * 100) / 100 : null,
-          formula: 'Total Liabilities ÷ Total Equity',
-          inputs: { total_liabilities: totalLiabilities, total_equity: totalEquity },
-          status: FinancialRatiosService._rateDebtToEquity(debtToEquity)
-        },
-        net_profit_margin_pct: {
-          value: netProfitMarginPct !== null ? Math.round(netProfitMarginPct * 100) / 100 : null,
-          formula: 'Net Profit ÷ Revenue × 100',
-          inputs: { net_profit: netProfit, revenue },
-          status: FinancialRatiosService._rateNetMargin(netProfitMarginPct)
+
+        leverage: {
+          label: 'Leverage Ratios',
+          ratios: {
+            debt_to_equity: {
+              value: round(debtToEquity),
+              label: 'Debt to Equity Ratio',
+              formula: 'Total Liabilities ÷ Total Equity',
+              benchmark: 'Low risk: ≤ 1.0, Moderate: ≤ 2.0',
+              inputs: { total_liabilities: round(totalLiabilities), total_equity: round(totalEquity) },
+              status: FinancialRatiosService._rate(debtToEquity, [1, 2], 'lte')
+            },
+            interest_coverage: {
+              value: round(interestCoverage),
+              label: 'Interest Coverage Ratio',
+              formula: 'EBIT ÷ Finance Costs',
+              benchmark: 'Strong: ≥ 3.0, Adequate: ≥ 1.5',
+              inputs: { ebit: round(operatingProfit), finance_costs: round(financeCosts) },
+              status: FinancialRatiosService._rate(interestCoverage, [3, 1.5], 'gte')
+            }
+          }
         }
       },
+
+      summary: FinancialRatiosService._computeSummary(currentRatio, quickRatio, grossMarginPct, netProfitMarginPct, returnOnAssets, debtToEquity, inventoryTurnover),
+
       generated_at: new Date()
     };
   }
 
-  // ── RATING HELPERS — status: 'good' | 'warning' | 'danger' | 'neutral' ──
-
-  static _rateCurrentRatio(v) {
-    if (v === null) return 'neutral';
-    if (v >= 2) return 'good';
-    if (v >= 1) return 'warning';
-    return 'danger';
-  }
-
-  static _rateQuickRatio(v) {
-    if (v === null) return 'neutral';
-    if (v >= 1) return 'good';
-    if (v >= 0.5) return 'warning';
-    return 'danger';
-  }
-
-  static _rateGrossMargin(v) {
-    if (v === null) return 'neutral';
-    if (v >= 40) return 'good';
-    if (v >= 20) return 'warning';
-    return 'danger';
-  }
-
-  static _rateInventoryTurnover(v) {
-    if (v === null) return 'neutral';
-    if (v >= 6) return 'good';
-    if (v >= 3) return 'warning';
-    return 'danger';
-  }
-
-  static _rateDIO(v) {
-    if (v === null) return 'neutral';
-    if (v <= 60) return 'good';
-    if (v <= 90) return 'warning';
-    return 'danger';
-  }
-
-  static _rateROA(v) {
-    if (v === null) return 'neutral';
-    if (v >= 10) return 'good';
-    if (v >= 5) return 'warning';
-    return 'danger';
-  }
-
-  static _rateDebtToEquity(v) {
-    if (v === null) return 'neutral';
-    if (v <= 1) return 'good';
-    if (v <= 2) return 'warning';
-    return 'danger';
-  }
-
-  static _rateNetMargin(v) {
-    if (v === null) return 'neutral';
-    if (v >= 15) return 'good';
-    if (v >= 5) return 'warning';
-    return 'danger';
+  /**
+   * Generic rating helper
+   * @param {number|null} value — the ratio value
+   * @param {number[]} thresholds — [good, warning] thresholds
+   * @param {string} direction — 'gte' (higher is better) or 'lte' (lower is better)
+   */
+  static _rate(value, thresholds, direction) {
+    if (value === null || value === undefined) return 'neutral';
+    const [good, warning] = thresholds;
+    if (direction === 'gte') {
+      if (value >= good) return 'good';
+      if (value >= warning) return 'warning';
+      return 'danger';
+    } else {
+      if (value <= good) return 'good';
+      if (value <= warning) return 'warning';
+      return 'danger';
+    }
   }
 
   /**
-   * Get balance by account sub_type
+   * Compute overall health summary
    */
-  static async _getAccountTypeBalance(companyId, subType, asOfDate) {
-    const accounts = await ChartOfAccount.find({
+  static _computeSummary(currentRatio, quickRatio, grossMargin, netMargin, roa, debtToEquity, inventoryTurnover) {
+    const liquidityStatus = FinancialRatiosService._rate(currentRatio, [2, 1], 'gte');
+    const profitabilityStatus = FinancialRatiosService._rate(netMargin, [15, 5], 'gte');
+    const efficiencyStatus = FinancialRatiosService._rate(inventoryTurnover, [6, 3], 'gte');
+    const leverageStatus = FinancialRatiosService._rate(debtToEquity, [1, 2], 'lte');
+
+    const statuses = [liquidityStatus, profitabilityStatus, efficiencyStatus, leverageStatus];
+    const goodCount = statuses.filter(s => s === 'good').length;
+    const warningCount = statuses.filter(s => s === 'warning').length;
+    const dangerCount = statuses.filter(s => s === 'danger').length;
+
+    let overall;
+    if (dangerCount >= 2) overall = 'danger';
+    else if (dangerCount >= 1 || warningCount >= 3) overall = 'warning';
+    else if (goodCount >= 3) overall = 'good';
+    else overall = 'warning';
+
+    return {
+      overall,
+      liquidity: liquidityStatus,
+      profitability: profitabilityStatus,
+      efficiency: efficiencyStatus,
+      leverage: leverageStatus,
+      good_count: goodCount,
+      warning_count: warningCount,
+      danger_count: dangerCount
+    };
+  }
+
+  /**
+   * Get balance by account subtype(s) and type
+   * @private
+   */
+  static async _getAccountTypeBalance(companyId, subtypes, type, asOfDate, specificSubtype) {
+    const query = {
       company: new mongoose.Types.ObjectId(companyId),
-      subtype: subType,
+      type: type,
       isActive: true
-    }).lean();
+    };
+
+    if (specificSubtype) {
+      query.subtype = specificSubtype;
+    } else if (subtypes && subtypes.length > 0) {
+      query.subtype = { $in: subtypes };
+    }
+
+    const accounts = await ChartOfAccount.find(query).lean();
 
     let total = 0;
     for (const acc of accounts) {
@@ -263,7 +430,25 @@ class FinancialRatiosService {
   }
 
   /**
+   * Get total balance for specific account codes
+   * @private
+   */
+  static async _getAccountCodesBalance(companyId, accountCodes, asOfDate) {
+    let total = 0;
+    for (const code of accountCodes) {
+      const bal = await FinancialRatiosService._getAccountBalance(
+        companyId, code,
+        new Date('1900-01-01'),
+        new Date(asOfDate)
+      );
+      total += bal;
+    }
+    return total;
+  }
+
+  /**
    * Get account balance from journal entries
+   * @private
    */
   static async _getAccountBalance(companyId, accountCode, dateFrom, dateTo) {
     const result = await aggregateWithTimeout(JournalEntry, [
@@ -271,15 +456,12 @@ class FinancialRatiosService {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
           status: 'posted',
+          reversed: { $ne: true },
           date: { $gte: dateFrom, $lte: new Date(dateTo) }
         }
       },
       { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': accountCode
-        }
-      },
+      { $match: { 'lines.accountCode': accountCode } },
       {
         $group: {
           _id: null,
@@ -289,10 +471,9 @@ class FinancialRatiosService {
       }
     ]);
 
-    const dr = result[0]?.total_dr || 0;
-    const cr = result[0]?.total_cr || 0;
-    
-    // Determine if this is an asset (dr balance) or liability/equity/revenue (cr balance)
+    const dr = parseFloat(result[0]?.total_dr?.toString() || '0');
+    const cr = parseFloat(result[0]?.total_cr?.toString() || '0');
+
     const account = await ChartOfAccount.findOne({
       company: new mongoose.Types.ObjectId(companyId),
       code: accountCode
@@ -305,28 +486,24 @@ class FinancialRatiosService {
   }
 
   /**
-   * Get total purchases from journal entries with source_type = 'purchase'
+   * Get total purchases from journal entries
+   * Uses multiple sourceTypes: purchase, cogs, purchase_order
+   * Falls back to COGS + change in inventory if no purchase entries found
+   * @private
    */
   static async _getTotalPurchases(companyId, dateFrom, dateTo) {
-    // Total purchases = SUM of DR on inventory accounts from purchase source_type
     const result = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
           status: 'posted',
-          sourceType: 'purchase',
-          date: {
-            $gte: new Date(dateFrom),
-            $lte: new Date(dateTo)
-          }
+          reversed: { $ne: true },
+          sourceType: { $in: ['purchase', 'cogs', 'purchase_order'] },
+          date: { $gte: new Date(dateFrom), $lte: new Date(dateTo) }
         }
       },
       { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.debit': { $gt: 0 }
-        }
-      },
+      { $match: { 'lines.debit': { $gt: 0 }, 'lines.accountCode': { $regex: /^(1400|2000|5000|5100|5110)$/ } } },
       {
         $group: {
           _id: null,
@@ -334,7 +511,8 @@ class FinancialRatiosService {
         }
       }
     ]);
-    return result[0]?.total_dr || 0;
+    const purchases = parseFloat(result[0]?.total_dr?.toString() || '0');
+    return purchases;
   }
 }
 

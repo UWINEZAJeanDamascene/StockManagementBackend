@@ -31,7 +31,7 @@ exports.getPurchases = async (req, res, next) => {
     if (startDate || endDate) {
       query.purchaseDate = {};
       if (startDate) query.purchaseDate.$gte = new Date(startDate);
-      if (endDate) query.purchaseDate.$gte = new Date(endDate);
+      if (endDate) query.purchaseDate.$lte = new Date(endDate);
     }
 
     const total = await Purchase.countDocuments(query);

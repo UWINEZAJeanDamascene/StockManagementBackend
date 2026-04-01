@@ -5,6 +5,8 @@ const ChartOfAccount = require('../models/ChartOfAccount');
 const { BankAccount } = require('../models/BankAccount');
 const { nextSequence } = require('./sequenceService');
 const PeriodService = require('./periodService');
+const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const TaxAutomationService = require('./taxAutomationService');
 
 class ExpenseService {
 
@@ -192,27 +194,36 @@ class ExpenseService {
   static async _buildJournalLines(companyId, data, expenseAccount, taxAccount) {
     const lines = [];
 
-    // Debit: Expense Account
+    // Use TaxAutomationService for centralized tax computation
+    const expenseTax = await TaxAutomationService.computeExpenseTax(companyId, {
+      expenseAccountCode: expenseAccount.code,
+      netAmount: data.amount,
+      taxRatePct: data.tax_amount > 0 ? ((data.tax_amount / data.amount) * 100) : 0
+    });
+
+    // Debit: Expense Account (net amount)
     lines.push({
       accountCode: expenseAccount.code,
       accountName: expenseAccount.name,
       description: data.description,
-      debit: data.amount,
+      debit: expenseTax.netAmount,
       credit: 0
     });
 
-    // VAT input tax line (if applicable)
-    if (data.tax_amount > 0 && taxAccount) {
+    // VAT input tax line (if applicable) — uses new 2210 account
+    if (data.tax_amount > 0) {
+      const vatInputCode = (taxAccount && taxAccount.code) || DEFAULT_ACCOUNTS.vatInput || '2210';
+      const vatInputName = (taxAccount && taxAccount.name) || 'VAT Input';
       lines.push({
-        accountCode: taxAccount.code,
-        accountName: taxAccount.name,
+        accountCode: vatInputCode,
+        accountName: vatInputName,
         description: 'Input VAT on expense',
-        debit: data.tax_amount,
+        debit: expenseTax.taxAmount,
         credit: 0
       });
     }
 
-    const totalDr = data.amount + (data.tax_amount || 0);
+    const totalDr = expenseTax.netAmount + expenseTax.taxAmount;
 
     // Credit line — depends on payment method
     if (data.payment_method === 'bank') {
@@ -273,9 +284,9 @@ class ExpenseService {
     }
 
     if (data.payment_method === 'credit_card') {
-      // Post to credit card payable
+      // Post to accrued expenses payable
       lines.push({
-        accountCode: '2200',
+        accountCode: DEFAULT_ACCOUNTS.accruedExpenses || '2600',
         accountName: 'Credit Card Payable',
         description: 'Credit card payment for expense',
         debit: 0,

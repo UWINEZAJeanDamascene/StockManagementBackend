@@ -30,12 +30,12 @@ const taxRateSchema = new mongoose.Schema({
   },
   input_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     required: true
   },
   output_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     required: true
   },
   // Account code strings for quick lookup in journal entries

@@ -2,6 +2,7 @@ const mongoose = require('mongoose')
 const { aggregateWithTimeout } = require('../../utils/mongoAggregation')
 const PurchaseOrder = require('../../models/PurchaseOrder')
 const GRN = require('../../models/GoodsReceivedNote')
+const PurchaseReturn = require('../../models/PurchaseReturn')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
 
@@ -29,12 +30,13 @@ class PurchaseDashboardService {
 
     const thisMonth = dateHelpers.currentMonth()
 
-    const [poSummary, grnPending, apBundle, topSuppliers, posByStatus] = await Promise.all([
+    const [poSummary, grnPending, apBundle, topSuppliers, posByStatus, purchaseReturns] = await Promise.all([
       PurchaseDashboardService._getPOSummary(companyId, thisMonth),
       PurchaseDashboardService._getGRNPending(companyId),
       PurchaseDashboardService._getAPSummaryAndAging(companyId),
       PurchaseDashboardService._getTopSuppliers(companyId, TOP_SUPPLIERS_LIMIT),
-      PurchaseDashboardService._getPOsByStatus(companyId)
+      PurchaseDashboardService._getPOsByStatus(companyId),
+      PurchaseDashboardService._getPurchaseReturnsSummary(companyId)
     ])
 
     const { apSummary, apAging } = apBundle
@@ -60,7 +62,8 @@ class PurchaseDashboardService {
       ap_aging: apAging,
       top_suppliers: topSuppliers,
       by_status: posByStatus.map,
-      by_status_list: posByStatus.list
+      by_status_list: posByStatus.list,
+      purchase_returns: purchaseReturns
     }
 
     dashboardCache.set(companyId, 'purchase', result)
@@ -390,6 +393,40 @@ class PurchaseDashboardService {
     }))
 
     return { map, list }
+  }
+
+  static async _getPurchaseReturnsSummary(companyId) {
+    const companyOid = new mongoose.Types.ObjectId(companyId)
+
+    const result = await aggregateWithTimeout(PurchaseReturn, [
+      { $match: { company: companyOid } },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          total_amount: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } }
+        }
+      }
+    ], 'dashboard')
+
+    let totalCount = 0
+    let totalAmount = 0
+    let draftCount = 0
+    let confirmedCount = 0
+
+    for (const row of result) {
+      totalCount += row.count
+      totalAmount += row.total_amount || 0
+      if (row._id === 'draft') draftCount = row.count
+      if (row._id === 'confirmed') confirmedCount = row.count
+    }
+
+    return {
+      total_count: totalCount,
+      total_amount: dateHelpers.round2(totalAmount),
+      draft_count: draftCount,
+      confirmed_count: confirmedCount
+    }
   }
 }
 

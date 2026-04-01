@@ -6,7 +6,7 @@ const SystemSettingsService = require('../services/systemSettingsService')
  */
 exports.getSettings = async (req, res) => {
   try {
-    const companyId = req.user.company_id
+    const companyId = req.companyId
 
     const settings = await SystemSettingsService.get(companyId)
 
@@ -30,8 +30,8 @@ exports.getSettings = async (req, res) => {
  */
 exports.updateSettings = async (req, res) => {
   try {
-    const companyId = req.user.company_id
-    const userId = req.user.id || req.user._id
+    const companyId = req.companyId
+    const userId = req.user._id
     const data = req.body
 
     // Validate allowed fields

@@ -1,6 +1,7 @@
 const Payroll = require('../models/Payroll');
 const User = require('../models/User');
 const JournalService = require('../services/journalService');
+const TaxAutomationService = require('../services/taxAutomationService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // @desc    Get all payroll records for a company
@@ -328,8 +329,16 @@ exports.processPayment = async (req, res, next) => {
       const occupationalHazard = payroll.contributions.occupationalHazard || 0;
       const employerContribTotal = rssbEmployerPension + rssbEmployerMaternity + occupationalHazard;
       
+      // Use TaxAutomationService to compute payroll tax (validates amounts and uses new accounts)
+      const payrollTax = await TaxAutomationService.computePayrollTax(companyId, {
+        grossSalary,
+        payeAccountId: DEFAULT_ACCOUNTS.payePayableNew || DEFAULT_ACCOUNTS.payePayable,
+        rssbAccountId: DEFAULT_ACCOUNTS.rssbPayableNew || DEFAULT_ACCOUNTS.rssbPayable,
+        employerRssbAccountId: DEFAULT_ACCOUNTS.rssbEmployerCost || DEFAULT_ACCOUNTS.employerContributionPayable
+      });
+      
       // Entry 1: Salary Payment (Pay employee)
-      // DR Salaries & Wages, CR PAYE, CR RSSB, CR Cash/Bank
+      // DR Salaries & Wages, CR PAYE (2230), CR RSSB (2240), CR Cash/Bank
       const lines1 = [];
       if (grossSalary > 0) {
         lines1.push(JournalService.createDebitLine(
@@ -341,7 +350,7 @@ exports.processPayment = async (req, res, next) => {
       
       if (paye > 0) {
         lines1.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.payePayable,
+          DEFAULT_ACCOUNTS.payePayableNew || DEFAULT_ACCOUNTS.payePayable,
           paye,
           `PAYE deduction - ${payroll.employee.firstName} ${payroll.employee.lastName}`
         ));
@@ -349,7 +358,7 @@ exports.processPayment = async (req, res, next) => {
       
       if (rssbEmployeeTotal > 0) {
         lines1.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.rssbPayable,
+          DEFAULT_ACCOUNTS.rssbPayableNew || DEFAULT_ACCOUNTS.rssbPayable,
           rssbEmployeeTotal,
           `RSSB deduction (Pension + Maternity) - ${payroll.employee.firstName} ${payroll.employee.lastName}`
         ));
@@ -376,12 +385,12 @@ exports.processPayment = async (req, res, next) => {
       }
       
       // Entry 2: Tax Payment to RRA (Pay PAYE + RSSB to tax authority)
-      // DR PAYE, DR RSSB, CR Cash/Bank
+      // DR PAYE (2230), DR RSSB (2240), CR Cash/Bank
       const lines2 = [];
       
       if (paye > 0) {
         lines2.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.payePayable,
+          DEFAULT_ACCOUNTS.payePayableNew || DEFAULT_ACCOUNTS.payePayable,
           paye,
           `PAYE payment - ${payroll.period.monthName} ${payroll.period.year}`
         ));
@@ -389,7 +398,7 @@ exports.processPayment = async (req, res, next) => {
       
       if (rssbEmployeeTotal > 0) {
         lines2.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.rssbPayable,
+          DEFAULT_ACCOUNTS.rssbPayableNew || DEFAULT_ACCOUNTS.rssbPayable,
           rssbEmployeeTotal,
           `RSSB payment (Pension + Maternity) - ${payroll.period.monthName} ${payroll.period.year}`
         ));
@@ -420,16 +429,16 @@ exports.processPayment = async (req, res, next) => {
       if (employerContribTotal > 0) {
         const lines3 = [];
         
-        // DR Employer Contributions Expense
+        // DR RSSB Employer Cost (6150)
         lines3.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.payrollExpenses,
+          DEFAULT_ACCOUNTS.rssbEmployerCost || DEFAULT_ACCOUNTS.payrollExpenses,
           employerContribTotal,
           `Employer contributions - ${payroll.period.monthName} ${payroll.period.year}`
         ));
         
-        // CR Employer Contributions Payable (Pension + Maternity + Occupational Hazard)
+        // CR RSSB Payable (2240)
         lines3.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.employerContributionPayable,
+          DEFAULT_ACCOUNTS.rssbPayableNew || DEFAULT_ACCOUNTS.rssbPayable,
           employerContribTotal,
           `Employer contributions payable (Pension + Maternity + Occ. Hazard) - ${payroll.period.monthName} ${payroll.period.year}`
         ));

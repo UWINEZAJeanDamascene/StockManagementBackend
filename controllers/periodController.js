@@ -1,4 +1,6 @@
 const PeriodService = require('../services/periodService');
+const Company = require('../models/Company');
+const mongoose = require('mongoose');
 
 /**
  * Period Controller
@@ -8,25 +10,27 @@ const PeriodService = require('../services/periodService');
 // Generate 12 monthly periods for a fiscal year
 exports.generateFiscalYear = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { fiscal_year: fiscalYear } = req.body;
 
     if (!fiscalYear) {
-      return res.status(400).json({
+      return res.status(422).json({
         success: false,
-        error: 'FISCAL_YEAR_REQUIRED'
+        error: 'FISCAL_YEAR_REQUIRED',
+        message: 'fiscal_year is required in request body'
       });
     }
 
     const periods = await PeriodService.generateFiscalYear(
-      company,
-      fiscalYear,
+      companyId,
+      parseInt(fiscalYear),
       req.user._id
     );
 
     res.status(201).json({
       success: true,
-      data: periods
+      data: periods,
+      message: `Generated ${periods.length} periods for fiscal year ${fiscalYear}`
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -37,22 +41,36 @@ exports.generateFiscalYear = async (req, res) => {
   }
 };
 
-// Get all periods
+// Get all periods with optional stats
 exports.getAllPeriods = async (req, res) => {
   try {
-    const { company } = req.user;
-    const { fiscal_year: fiscalYear, status, period_type: periodType } = req.query;
+    const companyId = req.companyId;
+    const { fiscal_year: fiscalYear, status, period_type: periodType, include_stats } = req.query;
 
     const filters = {};
     if (fiscalYear) filters.fiscal_year = parseInt(fiscalYear);
     if (status) filters.status = status;
     if (periodType) filters.period_type = periodType;
 
-    const periods = await PeriodService.getAll(company, filters);
+    const periods = await PeriodService.getAll(companyId, filters);
+
+    const companyDoc = await Company.findById(companyId).lean();
+
+    let periodsWithStats = periods;
+    if (include_stats === 'true') {
+      periodsWithStats = await Promise.all(
+        periods.map(async (period) => {
+          const stats = await exports._getPeriodStats(companyId, period);
+          return { ...period, stats };
+        })
+      );
+    }
 
     res.json({
       success: true,
-      data: periods
+      data: periodsWithStats,
+      company_name: companyDoc?.name || '',
+      count: periodsWithStats.length
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -66,14 +84,15 @@ exports.getAllPeriods = async (req, res) => {
 // Get period by ID
 exports.getPeriod = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { id } = req.params;
 
-    const period = await PeriodService.getById(company, id);
+    const period = await PeriodService.getById(companyId, id);
+    const stats = await exports._getPeriodStats(companyId, period);
 
     res.json({
       success: true,
-      data: period
+      data: { ...period, stats }
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -88,14 +107,17 @@ exports.getPeriod = async (req, res) => {
 // Close a period
 exports.closePeriod = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { id } = req.params;
 
-    const result = await PeriodService.closePeriod(company, id, req.user._id);
+    const result = await PeriodService.closePeriod(companyId, id, req.user._id);
 
     res.json({
       success: true,
-      data: result
+      data: result,
+      message: result.warnings?.length > 0
+        ? `Period closed with ${result.warnings.length} warning(s)`
+        : 'Period closed successfully'
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -110,14 +132,15 @@ exports.closePeriod = async (req, res) => {
 // Reopen a closed period
 exports.reopenPeriod = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { id } = req.params;
 
-    const result = await PeriodService.reopenPeriod(company, id, req.user._id);
+    const result = await PeriodService.reopenPeriod(companyId, id, req.user._id);
 
     res.json({
       success: true,
-      data: result
+      data: result,
+      message: 'Period reopened successfully'
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -132,14 +155,15 @@ exports.reopenPeriod = async (req, res) => {
 // Lock a period permanently
 exports.lockPeriod = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { id } = req.params;
 
-    const result = await PeriodService.lockPeriod(company, id, req.user._id);
+    const result = await PeriodService.lockPeriod(companyId, id, req.user._id);
 
     res.json({
       success: true,
-      data: result
+      data: result,
+      message: 'Period locked permanently'
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -154,25 +178,27 @@ exports.lockPeriod = async (req, res) => {
 // Perform year-end close
 exports.performYearEndClose = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
     const { fiscal_year: fiscalYear } = req.body;
 
     if (!fiscalYear) {
-      return res.status(400).json({
+      return res.status(422).json({
         success: false,
-        error: 'FISCAL_YEAR_REQUIRED'
+        error: 'FISCAL_YEAR_REQUIRED',
+        message: 'fiscal_year is required in request body'
       });
     }
 
     const result = await PeriodService.performYearEndClose(
-      company,
-      fiscalYear,
+      companyId,
+      parseInt(fiscalYear),
       req.user._id
     );
 
     res.json({
       success: true,
-      data: result
+      data: result,
+      message: `Year-end close completed for FY${fiscalYear}. Net profit: ${result.net_profit}`
     });
   } catch (error) {
     const errorMessage = error.message || 'Unknown error';
@@ -186,14 +212,15 @@ exports.performYearEndClose = async (req, res) => {
 // Get current period
 exports.getCurrentPeriod = async (req, res) => {
   try {
-    const { company } = req.user;
+    const companyId = req.companyId;
 
-    const period = await PeriodService.getCurrentPeriod(company);
+    const period = await PeriodService.getCurrentPeriod(companyId);
 
     if (!period) {
       return res.status(404).json({
         success: false,
-        error: 'NO_OPEN_PERIOD'
+        error: 'NO_OPEN_PERIOD',
+        message: 'No open accounting period found for today'
       });
     }
 
@@ -207,5 +234,42 @@ exports.getCurrentPeriod = async (req, res) => {
       success: false,
       error: errorMessage
     });
+  }
+};
+
+// Get period summary stats
+exports._getPeriodStats = async (companyId, period) => {
+  try {
+    const JournalEntry = require('../models/JournalEntry');
+    const stats = await JournalEntry.aggregate([
+      {
+        $match: {
+          company: new mongoose.Types.ObjectId(companyId),
+          status: 'posted',
+          reversed: { $ne: true },
+          date: {
+            $gte: new Date(period.start_date),
+            $lte: new Date(period.end_date)
+          }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          entry_count: { $sum: 1 },
+          total_debit: { $sum: '$debitTotal' },
+          total_credit: { $sum: '$creditTotal' }
+        }
+      }
+    ]);
+
+    const s = stats[0] || { entry_count: 0, total_debit: 0, total_credit: 0 };
+    return {
+      entry_count: s.entry_count,
+      total_debit: parseFloat(s.total_debit?.toString() || '0'),
+      total_credit: parseFloat(s.total_credit?.toString() || '0')
+    };
+  } catch {
+    return { entry_count: 0, total_debit: 0, total_credit: 0 };
   }
 };

@@ -49,7 +49,7 @@ const expenseSchema = new mongoose.Schema({
   // Expense account (ChartOfAccounts reference)
   expense_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     required: true
   },
 
@@ -75,14 +75,14 @@ const expenseSchema = new mongoose.Schema({
   // Tax account for input VAT
   tax_account_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccounts',
+    ref: 'ChartOfAccount',
     default: null
   },
 
   // Payment method: bank, petty_cash, credit_card, payable
   payment_method: {
     type: String,
-    enum: ['bank', 'petty_cash', 'credit_card', 'payable'],
+    enum: ['bank', 'cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit_card', 'petty_cash', 'payable'],
     required: true
   },
 
@@ -113,11 +113,35 @@ const expenseSchema = new mongoose.Schema({
     default: null
   },
 
-  // Status: posted, reversed
+  // Status: pending, approved, rejected, posted, reversed, cancelled
   status: {
     type: String,
-    enum: ['posted', 'reversed'],
-    default: 'posted'
+    enum: ['pending', 'approved', 'rejected', 'posted', 'reversed', 'cancelled'],
+    default: 'pending'
+  },
+
+  // Approval tracking
+  approvedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  approvedAt: {
+    type: Date,
+    default: null
+  },
+  rejectedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  rejectedAt: {
+    type: Date,
+    default: null
+  },
+  rejectionReason: {
+    type: String,
+    default: null
   },
 
   // Journal entry for the expense
@@ -187,8 +211,8 @@ const expenseSchema = new mongoose.Schema({
   // Payment info (legacy)
   paymentMethod: {
     type: String,
-    enum: ['cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit'],
-    default: 'cash'
+    enum: ['bank', 'cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit_card', 'petty_cash', 'payable'],
+    default: 'bank'
   },
   paid: {
     type: Boolean,
@@ -209,10 +233,6 @@ const expenseSchema = new mongoose.Schema({
 
   // User tracking (legacy)
   createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-  approvedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },

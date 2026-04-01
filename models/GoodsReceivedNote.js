@@ -4,7 +4,10 @@ const grnLineSchema = new mongoose.Schema({
   purchaseOrderLine: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaseOrder.lines' },
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   qtyReceived: { type: Number, required: true, min: 0.01 },
-  unitCost: { type: Number, default: 0, min: 0 }
+  unitCost: { type: Number, default: 0, min: 0 },
+  taxRate: { type: Number, default: 0, min: 0 },
+  batchNo: { type: String },
+  serialNumbers: [{ type: String }]
 }, { _id: true });
 
 const grnSchema = new mongoose.Schema({

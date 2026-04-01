@@ -1,6 +1,9 @@
 const mongoose = require('mongoose');
 const Company = require('../models/Company');
+const Role = require('../models/Role');
 const AuditLogService = require('./AuditLogService');
+const ChartOfAccount = require('../models/ChartOfAccount');
+const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
 
 class CompanyService {
 
@@ -33,6 +36,26 @@ class CompanyService {
       entity_id: company._id,
       changes: data
     });
+
+    // Seed chart of accounts for the new company
+    try {
+      const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
+        company: company._id,
+        code,
+        name: account.name,
+        type: account.type,
+        subtype: account.subtype,
+        normal_balance: account.normalBalance,
+        allow_direct_posting: account.allowDirectPosting,
+        isActive: true,
+        createdBy: createdByUserId,
+      }));
+      await ChartOfAccount.insertMany(accounts);
+      console.log(`Seeded ${accounts.length} chart of accounts for company ${company._id}`);
+    } catch (seedError) {
+      console.error('Error seeding chart of accounts:', seedError);
+      // Don't fail company creation if seeding fails
+    }
 
     return company;
   }
@@ -79,13 +102,36 @@ class CompanyService {
       registration_rejection_reason: null
     });
 
+    // Seed chart of accounts for the new company
     try {
+      const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
+        company: company._id,
+        code,
+        name: account.name,
+        type: account.type,
+        subtype: account.subtype,
+        normal_balance: account.normalBalance,
+        allow_direct_posting: account.allowDirectPosting,
+        isActive: true,
+        createdBy: null,
+      }));
+      await ChartOfAccount.insertMany(accounts);
+      console.log(`Seeded ${accounts.length} chart of accounts for registered company ${company._id}`);
+    } catch (seedError) {
+      console.error('Error seeding chart of accounts for registered company:', seedError);
+    }
+
+    try {
+      // Look up the admin Role document to link it to the user
+      const adminRole = await Role.findOne({ name: 'admin', is_system_role: true });
+
       const user = await User.create({
         name: a.name.trim(),
         email: emailAdmin,
         password: a.password,
         company: company._id,
         role: 'admin',
+        roles: adminRole ? [adminRole._id] : [],
         isActive: true
       });
       return { company, user };

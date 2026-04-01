@@ -10,7 +10,11 @@ const {
   updateRole, 
   deleteRole 
 } = require('../controllers/roleController');
-const { setup2FA, verify2FA, disable2FA } = require('../controllers/securityController');
+const { 
+  setup2FA, verify2FA, disable2FA,
+  getSecurityOverview, getLoginHistory, getActiveSessions,
+  terminateAllSessions, getPasswordStatus, getLockStatus
+} = require('../controllers/securityController');
 const IPWhitelist = require('../models/IPWhitelist');
 
 // All routes require authentication
@@ -20,6 +24,14 @@ router.use(protect);
 router.post('/2fa/setup', setup2FA);
 router.post('/2fa/verify', verify2FA);
 router.post('/2fa/disable', disable2FA);
+
+// Security overview & user security endpoints - before IP whitelist
+router.get('/security-overview', getSecurityOverview);
+router.get('/login-history', getLoginHistory);
+router.get('/active-sessions', getActiveSessions);
+router.post('/terminate-sessions', terminateAllSessions);
+router.get('/password-status', getPasswordStatus);
+router.get('/lock-status', getLockStatus);
 
 // IP whitelist should be enforced for admin-only routes
 router.use(ipWhitelist);

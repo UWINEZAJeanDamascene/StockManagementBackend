@@ -44,7 +44,7 @@ class PayrollRunService {
         credit: 0
       },
       {
-        accountCode: taxPayableAccount?.code || '2200',
+        accountCode: taxPayableAccount?.code || '2230',
         accountName: taxPayableAccount?.name || 'PAYE Payable',
         description: 'PAYE tax withheld',
         debit: 0,

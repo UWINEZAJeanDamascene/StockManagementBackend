@@ -21,7 +21,8 @@ const notificationSchema = new mongoose.Schema({
       'quotation_created', 'quotation_approved', 'quotation_expired',
       'user_created', 'company_approved', 'password_changed', 'failed_login',
       'backup_success', 'backup_failed',
-      'invoice_generated', 'recurring_paused',
+      'invoice_generated', 'recurring_paused', 'recurring_failed',
+      'account_locked',
       'system', 'alert'
     ],
     required: true

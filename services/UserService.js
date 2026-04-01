@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
+const Role = require('../models/Role');
 const CompanyUser = require('../models/CompanyUser');
 const Company = require('../models/Company');
 const SessionService = require('./sessionService');
@@ -67,6 +68,9 @@ class UserService {
       throw error;
     }
 
+    // Look up the Role document by name to link it to the user
+    const roleDoc = await Role.findOne({ name: role, is_system_role: true });
+
     // Create user (password will be hashed by pre-save hook)
     const user = await User.create({
       name,
@@ -74,6 +78,7 @@ class UserService {
       password,
       company: companyId,
       role,
+      roles: roleDoc ? [roleDoc._id] : [],
       isActive: true,
       failed_login_attempts: 0,
       locked_until: null
@@ -215,6 +220,9 @@ class UserService {
 
     let isNewUser = false;
     if (!user) {
+      // Look up the Role document by name to link it to the user
+      const roleDoc = await Role.findOne({ name: role, is_system_role: true });
+
       // Create new user
       const tempPassword = crypto.randomBytes(8).toString('hex');
       user = await User.create({
@@ -223,6 +231,7 @@ class UserService {
         password: tempPassword,
         company: companyId,
         role,
+        roles: roleDoc ? [roleDoc._id] : [],
         isActive: true,
         mustChangePassword: true,
         createdBy: inviterId,
@@ -231,6 +240,9 @@ class UserService {
       });
       isNewUser = true;
     } else {
+      // Look up the Role document by name to link it to the user
+      const roleDoc = await Role.findOne({ name: role, is_system_role: true });
+
       // Link existing user to company using CompanyUser
       await CompanyUser.create({
         user: user._id,
@@ -240,6 +252,13 @@ class UserService {
         approvedBy: inviterId,
         approvedAt: new Date()
       });
+
+      // Also update the user's role and roles array if they don't have one
+      if (!user.roles || user.roles.length === 0) {
+        user.role = role;
+        user.roles = roleDoc ? [roleDoc._id] : [];
+        await user.save();
+      }
     }
 
     // Log to audit trail
@@ -392,11 +411,83 @@ class UserService {
    * Get user by ID
    */
   static async getUserById(userId) {
-    const user = await User.findById(userId);
+    const user = await User.findById(userId)
+      .populate('company', 'name email')
+      .populate('roles');
     if (!user) {
       throw new Error('User not found');
     }
-    return user.toJSON();
+
+    const userObj = user.toJSON();
+
+    // Compute flat permissions array from populated roles
+    const permissionsSet = new Set();
+
+    // Admin and platform_admin get wildcard permissions
+    if (user.role === 'admin' || user.role === 'platform_admin') {
+      permissionsSet.add('*');
+    }
+
+    if (user.roles && user.roles.length > 0) {
+      for (const role of user.roles) {
+        if (role.permissions && role.permissions.length > 0) {
+          for (const perm of role.permissions) {
+            if (perm.resource === '*') {
+              const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+              for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+                permissionsSet.add(`*:${action}`);
+              }
+              if (perm.actions.includes('*')) {
+                permissionsSet.add('*');
+              }
+            } else {
+              for (const action of perm.actions) {
+                if (action === '*') {
+                  permissionsSet.add(`${perm.resource}:*`);
+                  const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                  for (const a of allActions) {
+                    permissionsSet.add(`${perm.resource}:${a}`);
+                  }
+                } else {
+                  permissionsSet.add(`${perm.resource}:${action}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
+      // Fallback: look up the Role document by the legacy role string name
+      const legacyRole = await Role.findOne({ name: user.role, is_system_role: true });
+      if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
+        for (const perm of legacyRole.permissions) {
+          if (perm.resource === '*') {
+            const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+            for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+              permissionsSet.add(`*:${action}`);
+            }
+            if (perm.actions.includes('*')) {
+              permissionsSet.add('*');
+            }
+          } else {
+            for (const action of perm.actions) {
+              if (action === '*') {
+                permissionsSet.add(`${perm.resource}:*`);
+                const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                for (const a of allActions) {
+                  permissionsSet.add(`${perm.resource}:${a}`);
+                }
+              } else {
+                permissionsSet.add(`${perm.resource}:${action}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    userObj.permissions = Array.from(permissionsSet);
+    return userObj;
   }
 
   /**

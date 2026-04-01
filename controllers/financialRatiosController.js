@@ -3,8 +3,13 @@ const cacheService = require('../services/cacheService');
 
 /**
  * Financial Ratios Controller
- * 
- * Computes 9 financial ratios from the current ledger state.
+ *
+ * Computes financial ratios from the current ledger state.
+ */
+
+/**
+ * GET /api/reports/financial-ratios
+ * Query params: as_of_date (required), date_from (required), date_to (required)
  */
 const getFinancialRatios = async (req, res) => {
   try {
@@ -12,14 +17,14 @@ const getFinancialRatios = async (req, res) => {
     const { as_of_date, date_from, date_to } = req.query;
 
     if (!as_of_date) {
-      return res.status(400).json({ 
+      return res.status(422).json({
         error: 'AS_OF_DATE_REQUIRED',
         message: 'as_of_date query parameter is required'
       });
     }
 
     if (!date_from || !date_to) {
-      return res.status(400).json({ 
+      return res.status(422).json({
         error: 'DATE_RANGE_REQUIRED',
         message: 'date_from and date_to query parameters are required'
       });
@@ -42,7 +47,7 @@ const getFinancialRatios = async (req, res) => {
     res.json({ ...cached.data, from_cache: cached.fromCache });
   } catch (error) {
     console.error('Error computing financial ratios:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: error.message || 'INTERNAL_ERROR',
       message: 'Failed to compute financial ratios'
     });

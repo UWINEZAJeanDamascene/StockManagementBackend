@@ -212,6 +212,8 @@ router.route('/purchase-returns/:id')
   .get(authorize('admin', 'stock_manager'), getPurchaseReturn)
   .put(authorize('admin', 'stock_manager'), logAction('stock'), updatePurchaseReturn);
 
-router.post('/purchase-returns/:id/confirm', authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn);
+router.route('/purchase-returns/:id/confirm')
+  .post(authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn)
+  .put(authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn);
 
 module.exports = router;

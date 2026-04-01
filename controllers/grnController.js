@@ -8,6 +8,7 @@ const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const JournalService = require('../services/journalService');
+const TaxAutomationService = require('../services/taxAutomationService');
 const transactionService = require('../services/transactionService');
 const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
@@ -16,13 +17,14 @@ const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNT
 exports.createGRN = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { purchaseOrderId, warehouse, lines, referenceNo, supplierInvoiceNo } = req.body;
+    const { purchaseOrderId, warehouse, lines, referenceNo, supplierInvoiceNo, receivedDate } = req.body;
 
     const po = await PurchaseOrder.findOne({ _id: purchaseOrderId, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found' });
     if (po.status !== 'approved') return res.status(409).json({ success: false, message: 'PO must be approved before creating GRN' });
 
-    // Validate qtyReceived against remaining qty for each line
+    // Validate qtyReceived against remaining qty for each line and enrich with taxRate from PO
+    const enrichedLines = [];
     for (const line of lines) {
       const poLine = po.lines.id(line.purchaseOrderLine);
       if (poLine) {
@@ -33,6 +35,13 @@ exports.createGRN = async (req, res, next) => {
             message: `Qty received (${line.qtyReceived}) exceeds remaining qty (${remainingQty}) for product` 
           });
         }
+        // Enrich line with taxRate from PO line for frontend display
+        enrichedLines.push({
+          ...line,
+          taxRate: line.taxRate != null ? line.taxRate : (poLine.taxRate || 0)
+        });
+      } else {
+        enrichedLines.push(line);
       }
     }
 
@@ -43,7 +52,8 @@ exports.createGRN = async (req, res, next) => {
       warehouse,
       supplier: po.supplier,
       supplierInvoiceNo: supplierInvoiceNo || null,
-      lines,
+      receivedDate: receivedDate ? new Date(receivedDate) : undefined,
+      lines: enrichedLines,
       createdBy: req.user.id
     });
 
@@ -74,6 +84,7 @@ exports.confirmGRN = async (req, res, next) => {
     let vatTotal = 0;
     let apTotal = 0;
     const productTotals = new Map();
+    const purchaseTaxLines = [];
 
     // Track created resources for manual rollback when not using DB transactions
     const createdBatches = [];
@@ -206,12 +217,11 @@ exports.confirmGRN = async (req, res, next) => {
       }
       product.currentStock = (Number(product.currentStock || 0) + Number(line.qtyReceived));
 
-      if (product.costingMethod === 'weighted') {
-        const existingValue = (Number(product.averageCost) || 0) * previousStock;
-        const receivedValue = Number(line.unitCost) * Number(line.qtyReceived);
-        const newQty = previousStock + Number(line.qtyReceived);
-        product.averageCost = newQty > 0 ? ((existingValue + receivedValue) / newQty) : product.averageCost;
-      }
+      // Always update averageCost using weighted average formula for display purposes
+      const existingValue = (Number(product.averageCost) || 0) * previousStock;
+      const receivedValue = Number(line.unitCost) * Number(line.qtyReceived);
+      const newQty = previousStock + Number(line.qtyReceived);
+      product.averageCost = newQty > 0 ? ((existingValue + receivedValue) / newQty) : product.averageCost;
 
       await product.save(useSession ? { session: sess } : {});
 
@@ -243,9 +253,8 @@ exports.confirmGRN = async (req, res, next) => {
       }
 
       const lineNet = Number(line.unitCost) * line.qtyReceived;
-      const lineTax = (poLine && poLine.taxRate) ? (lineNet * (poLine.taxRate / 100)) : 0;
-      vatTotal += lineTax;
-      apTotal += (lineNet + lineTax);
+      const lineTaxRate = (poLine && poLine.taxRate) ? poLine.taxRate : 0;
+      purchaseTaxLines.push({ netAmount: lineNet, taxRatePct: lineTaxRate });
 
       const prev = productTotals.get(String(line.product)) || 0;
       productTotals.set(String(line.product), prev + lineNet);
@@ -256,19 +265,28 @@ exports.confirmGRN = async (req, res, next) => {
     po.status = totalReceived >= totalOrdered ? 'fully_received' : 'partially_received';
     await po.save(useSession ? { session: sess } : {});
 
+    // Use TaxAutomationService for centralized tax computation
+    const purchaseTax = await TaxAutomationService.computePurchaseTax(companyId, purchaseTaxLines);
+
+    // Build journal lines from TaxAutomationService output
+    // Inventory lines (per product)
     for (const [prodId, amt] of productTotals.entries()) {
       const product = await Product.findById(prodId).lean();
       const invAcct = product.inventoryAccount || (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: grn.warehouse }));
       journalLines.push(JournalService.createDebitLine(invAcct || DEFAULT_ACCOUNTS.inventory, amt, `Purchase ${po.referenceNo} - ${grn.referenceNo}`));
     }
 
-    if (vatTotal > 0) {
-      const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
-      journalLines.push(JournalService.createDebitLine(vatAcct, vatTotal, `VAT for ${grn.referenceNo}`));
+    // VAT Input line from TaxAutomationService
+    if (purchaseTax.totals.tax > 0) {
+      journalLines.push(JournalService.createDebitLine(
+        DEFAULT_ACCOUNTS.vatInput || '2210',
+        purchaseTax.totals.tax,
+        `VAT Input for ${grn.referenceNo}`
+      ));
     }
 
     const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
-    journalLines.push(JournalService.createCreditLine(apAcct, apTotal, `AP for ${po.referenceNo} / ${grn.referenceNo}`));
+    journalLines.push(JournalService.createCreditLine(apAcct, purchaseTax.totals.gross, `AP for ${po.referenceNo} / ${grn.referenceNo}`));
 
     const supplier = await Supplier.findById(po.supplier).lean();
     const narration = `Purchase - ${supplier ? supplier.name : ''} - PO#${po.referenceNo} - GRN#${grn.referenceNo}`;
@@ -415,7 +433,7 @@ exports.getGRN = async (req, res, next) => {
           select: 'name sku'
         }
       })
-      .populate('supplier', 'name code email phone address')
+      .populate('supplier', 'name code contact')
       .populate('warehouse', 'name code')
       .populate('createdBy', 'name email')
       .populate('confirmedBy', 'name email')

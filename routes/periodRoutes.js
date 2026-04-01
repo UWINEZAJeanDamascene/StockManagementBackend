@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const periodController = require('../controllers/periodController');
+const { protect } = require('../middleware/auth');
+const { attachCompanyId } = require('../middleware/companyContext');
+
+// All period routes require auth and company context
+router.use(protect);
+router.use(attachCompanyId);
 
 // POST /api/periods/generate - Generate 12 monthly periods for a fiscal year
 router.post('/generate', periodController.generateFiscalYear);

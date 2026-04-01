@@ -26,10 +26,16 @@ exports.healthCheck = async (req, res, next) => {
       healthy: report.healthy, 
       totalDebit, 
       totalCredit, 
-      journal_balanced: report.journal && report.journal.healthy === true, 
-      stock_reconciled: report.stock && report.stock.healthy === true,
+      journal_balanced: report.journal_balanced,
+      stock_reconciled: report.stock_reconciled,
+      vat_reconciled: report.vat_reconciled,
+      paye_reconciled: report.paye_reconciled,
+      rssb_reconciled: report.rssb_reconciled,
       journal: report.journal, 
-      stock: report.stock 
+      stock: report.stock,
+      vat: report.vat,
+      paye: report.paye,
+      rssb: report.rssb
     });
   } catch (err) {
     next(err);

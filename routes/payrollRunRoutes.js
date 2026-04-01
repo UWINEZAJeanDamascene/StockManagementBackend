@@ -19,6 +19,14 @@ router.route('/')
   .get(getPayrollRuns)
   .post(authorize('admin', 'manager'), createPayrollRun);
 
+// Preview journal entry before posting (MUST be before /:id)
+router.route('/preview')
+  .get(authorize('admin', 'manager'), previewPayrollRun);
+
+// Create payroll run from finalised employee records (MUST be before /:id)
+router.route('/from-records')
+  .post(authorize('admin', 'manager'), createFromRecords);
+
 router.route('/:id')
   .get(getPayrollRunById)
   .delete(authorize('admin'), deletePayrollRun);
@@ -30,13 +38,5 @@ router.route('/:id/post')
 // Reverse payroll run
 router.route('/:id/reverse')
   .post(authorize('admin'), reversePayrollRun);
-
-// Preview journal entry before posting
-router.route('/preview')
-  .get(authorize('admin', 'manager'), previewPayrollRun);
-
-// Create payroll run from finalised employee records
-router.route('/from-records')
-  .post(authorize('admin', 'manager'), createFromRecords);
 
 module.exports = router;

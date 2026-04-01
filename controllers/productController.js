@@ -27,7 +27,8 @@ exports.getProducts = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });
 
     // Multi-tenancy: Filter by company
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
 
     const query = { 
       company: companyId,
@@ -76,6 +77,20 @@ exports.getProducts = async (req, res, next) => {
       .skip(skip)
       .limit(limit);
 
+    // Backfill: if averageCost is 0 but costPrice is set, use costPrice and persist
+    const backfillOps = [];
+    const data = products.map(p => {
+      const obj = p.toJSON();
+      if ((!p.averageCost || Number(p.averageCost) === 0) && p.costPrice && Number(p.costPrice) > 0) {
+        obj.averageCost = p.costPrice;
+        backfillOps.push({ updateOne: { filter: { _id: p._id }, update: { $set: { averageCost: p.costPrice } } } });
+      }
+      return obj;
+    });
+    if (backfillOps.length > 0) {
+      Product.bulkWrite(backfillOps).catch(err => console.error('Average cost backfill error:', err));
+    }
+
     res.json({
       success: true,
       count: products.length,
@@ -83,7 +98,7 @@ exports.getProducts = async (req, res, next) => {
       pagination: paginationMeta(page, limit, total),
       pages: Math.ceil(total / limit) || 0,
       currentPage: page,
-      data: products
+      data
     });
   } catch (error) {
     console.error('getProduct error:', error);
@@ -96,7 +111,8 @@ exports.getProducts = async (req, res, next) => {
 // @access  Private
 exports.getProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     let product;
     try {
@@ -134,7 +150,8 @@ exports.getProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.createProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
@@ -168,6 +185,11 @@ exports.createProduct = async (req, res, next) => {
     if (req.body.inventory_account_id) req.body.inventoryAccount = req.body.inventory_account_id;
     if (req.body.cogs_account_id) req.body.cogsAccount = req.body.cogs_account_id;
     if (req.body.revenue_account_id) req.body.revenueAccount = req.body.revenue_account_id;
+
+    // If averageCost is not provided or is 0, use costPrice as default
+    if ((!req.body.averageCost || Number(req.body.averageCost) === 0) && req.body.costPrice && Number(req.body.costPrice) > 0) {
+      req.body.averageCost = req.body.costPrice;
+    }
 
     const product = await Product.create(req.body);
 
@@ -210,7 +232,8 @@ exports.createProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.updateProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     let product = await Product.findOne({ _id: req.params.id, company: companyId });
 
@@ -237,6 +260,11 @@ exports.updateProduct = async (req, res, next) => {
 
     // Update product
     Object.assign(product, req.body);
+
+    // If averageCost is 0 but costPrice is set, use costPrice as averageCost
+    if ((!product.averageCost || Number(product.averageCost) === 0) && product.costPrice && Number(product.costPrice) > 0) {
+      product.averageCost = product.costPrice;
+    }
 
     // Add history entry
     product.history.push({
@@ -270,6 +298,20 @@ exports.updateProduct = async (req, res, next) => {
     // Handle supplier linking
     // If supplier changed or newly assigned
     if (newSupplierId && newSupplierId !== oldSupplierId) {
+      // Remove from old supplier's productsSupplied
+      if (oldSupplierId) {
+        try {
+          const oldSupplier = await Supplier.findOne({ _id: oldSupplierId, company: companyId });
+          if (oldSupplier) {
+            oldSupplier.productsSupplied = oldSupplier.productsSupplied.filter(
+              (p) => p.toString() !== product._id.toString()
+            );
+            await oldSupplier.save();
+          }
+        } catch (err) {
+          console.error('Failed to remove product from old supplier:', err);
+        }
+      }
       // Add to new supplier
       const newSupplier = await Supplier.findOne({ _id: newSupplierId, company: companyId });
       if (newSupplier) {
@@ -306,7 +348,8 @@ exports.updateProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.deleteProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
@@ -352,7 +395,8 @@ exports.deleteProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.archiveProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
@@ -395,7 +439,8 @@ exports.archiveProduct = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.restoreProduct = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
@@ -438,7 +483,8 @@ exports.restoreProduct = async (req, res, next) => {
 // @access  Private
 exports.getProductHistory = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const product = await Product.findOne({ _id: req.params.id, company: companyId })
       .populate('history.changedBy', 'name email');
@@ -464,7 +510,8 @@ exports.getProductHistory = async (req, res, next) => {
 // @access  Private
 exports.getProductLifecycle = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const product = await Product.findOne({ _id: req.params.id, company: companyId })
       .populate('category', 'name')
@@ -561,7 +608,8 @@ const buildTimeline = (product, stockMovements, quotations, invoices) => {
 // @access  Private
 exports.getLowStockProducts = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     const products = await Product.find({
       company: companyId,
@@ -586,7 +634,8 @@ exports.getLowStockProducts = async (req, res, next) => {
 // @access  Private (admin)
 exports.checkLowStockAndNotify = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     
     // Find all products that are low stock or out of stock
     const products = await Product.find({
@@ -635,7 +684,8 @@ exports.checkLowStockAndNotify = async (req, res, next) => {
 // @access  Private
 exports.getProductBarcode = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
     if (!product) {
@@ -693,7 +743,8 @@ exports.getProductBarcode = async (req, res, next) => {
 // @access  Private
 exports.getProductQRCode = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
     const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
     if (!product) {

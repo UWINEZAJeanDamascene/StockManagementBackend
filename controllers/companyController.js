@@ -81,7 +81,37 @@ exports.getAllCompanies = async (req, res) => {
   } catch (error) {
     res.status(400).json({
       success: false,
-      error: error.message || 'Unknown error'
+      error: errorMessage
+    });
+  }
+};
+
+// Update current user's company
+exports.updateMyCompany = async (req, res) => {
+  try {
+    const companyRef = req.user.company;
+    const companyId = req.companyId || (companyRef ? (companyRef._id ? companyRef._id.toString() : companyRef.toString()) : null);
+
+    if (!companyId) {
+      return res.status(400).json({
+        success: false,
+        error: 'NO_COMPANY',
+        message: 'User is not associated with a company'
+      });
+    }
+
+    const company = await CompanyService.update(companyId, req.body, req.user._id);
+
+    res.json({
+      success: true,
+      data: company
+    });
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+    const statusCode = errorMessage.includes('NOT_FOUND') ? 404 : 400;
+    res.status(statusCode).json({
+      success: false,
+      error: errorMessage
     });
   }
 };
@@ -343,5 +373,45 @@ exports.rejectCompany = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Company is not awaiting approval' });
     }
     res.status(500).json({ success: false, message: error.message || 'Rejection failed' });
+  }
+};
+
+// Get current user's company
+exports.getMyCompany = async (req, res) => {
+  try {
+    // Get company ID from user's company field (works for both regular and platform admin users)
+    const companyRef = req.user.company;
+    const companyId = req.companyId || (companyRef ? (companyRef._id ? companyRef._id.toString() : companyRef.toString()) : null);
+
+    if (!companyId) {
+      return res.status(400).json({
+        success: false,
+        error: 'NO_COMPANY',
+        message: 'User is not associated with a company'
+      });
+    }
+
+    const company = await CompanyService.getById(companyId);
+
+    // Get system settings
+    const SystemSettingsService = require('../services/systemSettingsService');
+    let settings = null;
+    try {
+      settings = await SystemSettingsService.get(companyId);
+    } catch {
+      // Settings may not exist yet
+    }
+
+    res.json({
+      success: true,
+      data: company,
+      settings: settings
+    });
+  } catch (error) {
+    const errorMessage = error.message || 'Unknown error';
+    res.status(400).json({
+      success: false,
+      error: errorMessage
+    });
   }
 };

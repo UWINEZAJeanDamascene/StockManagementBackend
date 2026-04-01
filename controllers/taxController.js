@@ -6,6 +6,7 @@ const Payroll = require('../models/Payroll');
 const mongoose = require('mongoose');
 const JournalService = require('../services/journalService');
 const TaxService = require('../services/taxService');
+const TaxAutomationService = require('../services/taxAutomationService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 // =====================================================
@@ -391,20 +392,27 @@ exports.addPayment = async (req, res) => {
         : DEFAULT_ACCOUNTS.cashInHand;
       
       // Determine the tax payable account based on tax type
+      // Uses new separated accounts where available, falls back to legacy
       let taxPayableAccount;
       switch (tax.taxType) {
         case 'vat':
-          taxPayableAccount = DEFAULT_ACCOUNTS.vatPayable;
+          taxPayableAccount = DEFAULT_ACCOUNTS.vatOutput || DEFAULT_ACCOUNTS.vatPayable;
           break;
         case 'paye':
-          taxPayableAccount = DEFAULT_ACCOUNTS.payePayable;
+          taxPayableAccount = DEFAULT_ACCOUNTS.payePayableNew || DEFAULT_ACCOUNTS.payePayable;
           break;
         case 'income_tax':
         case 'corporate_income_tax':
           taxPayableAccount = DEFAULT_ACCOUNTS.incomeTaxPayable;
           break;
+        case 'rssb':
+          taxPayableAccount = DEFAULT_ACCOUNTS.rssbPayableNew || DEFAULT_ACCOUNTS.rssbPayable;
+          break;
+        case 'withholding':
+          taxPayableAccount = DEFAULT_ACCOUNTS.withholdingTaxPayable;
+          break;
         default:
-          taxPayableAccount = DEFAULT_ACCOUNTS.vatPayable; // Default
+          taxPayableAccount = DEFAULT_ACCOUNTS.vatOutput || DEFAULT_ACCOUNTS.vatPayable; // Default
       }
       
       await JournalService.createEntry(companyId, req.user._id, {
@@ -668,6 +676,329 @@ exports.generateCalendar = async (req, res) => {
       success: true,
       data: newEntries,
       message: `Generated calendar entries for ${year}`
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// =====================================================
+// TAX DASHBOARD - Auto-detected from all sources
+// =====================================================
+
+// Get consolidated tax dashboard data - auto-detected from invoices, expenses, payroll
+exports.getTaxDashboard = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const { year, month } = req.query;
+    
+    // Build date filter
+    let dateFilter = {};
+    if (year && month) {
+      const startDate = new Date(parseInt(year), parseInt(month) - 1, 1);
+      const endDate = new Date(parseInt(year), parseInt(month), 0, 23, 59, 59);
+      dateFilter = { $gte: startDate, $lte: endDate };
+    } else if (year) {
+      const startDate = new Date(parseInt(year), 0, 1);
+      const endDate = new Date(parseInt(year), 11, 31, 23, 59, 59);
+      dateFilter = { $gte: startDate, $lte: endDate };
+    }
+
+    // 1. Get VAT Output from Invoices (auto-detected)
+    const invoiceVatMatch = { 
+      company: new mongoose.Types.ObjectId(companyId),
+      status: { $in: ['sent', 'paid'] }
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      invoiceVatMatch.invoiceDate = dateFilter;
+    }
+    
+    const vatOutput = await Invoice.aggregate([
+      { $match: invoiceVatMatch },
+      { $group: { 
+        _id: null, 
+        total: { $sum: '$taxAmount' },
+        count: { $sum: 1 },
+        subtotal: { $sum: { $subtract: ['$totalAmount', '$taxAmount'] } }
+      }}
+    ]);
+
+    // 2. Get VAT Input from Expenses (auto-detected)
+    const expenseVatMatch = { 
+      company: new mongoose.Types.ObjectId(companyId),
+      taxType: 'vat'
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      expenseVatMatch.date = dateFilter;
+    }
+    
+    const vatInput = await Expense.aggregate([
+      { $match: expenseVatMatch },
+      { $group: { 
+        _id: null, 
+        total: { $sum: '$taxAmount' },
+        count: { $sum: 1 },
+        subtotal: { $sum: { $subtract: ['$totalAmount', '$taxAmount'] } }
+      }}
+    ]);
+
+    // 3. Get PAYE from Payroll (auto-detected)
+    const payrollMatch = { 
+      company: new mongoose.Types.ObjectId(companyId),
+      record_status: { $in: ['finalised', 'paid'] }
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      payrollMatch.pay_period_start = dateFilter;
+    }
+    
+    const payeData = await Payroll.aggregate([
+      { $match: payrollMatch },
+      { $group: { 
+        _id: null, 
+        totalPaye: { $sum: '$deductions.paye' },
+        totalGross: { $sum: '$salary.grossSalary' },
+        totalRssbEmployee: { $sum: { $add: ['$deductions.rssbEmployeePension', '$deductions.rssbEmployeeMaternity'] } },
+        totalRssbEmployer: { $sum: { $add: ['$contributions.rssbEmployerPension', '$contributions.rssbEmployerMaternity', '$contributions.occupationalHazard'] } },
+        employeeCount: { $addToSet: '$employee.employeeId' }
+      }}
+    ]);
+
+    // 4. Get Withholding Tax from Journal Entries (auto-detected)
+    const whtMatch = {
+      company: new mongoose.Types.ObjectId(companyId),
+      status: 'posted',
+      'lines.accountCode': { $in: ['2500'] } // Withholding Tax Payable
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      whtMatch.date = dateFilter;
+    }
+    
+    const withholdingTax = await JournalEntry.aggregate([
+      { $match: whtMatch },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: ['2500'] }, 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
+
+    // 5. Get Corporate Income Tax accruals from Journal Entries
+    const citMatch = {
+      company: new mongoose.Types.ObjectId(companyId),
+      status: 'posted',
+      'lines.accountCode': '2400' // Income Tax Payable
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      citMatch.date = dateFilter;
+    }
+    
+    const corporateTax = await JournalEntry.aggregate([
+      { $match: citMatch },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': '2400', 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
+
+    // 6. Get PAYE Payable balance from Journal Entries (legacy 2200 + new 2230)
+    const payePayableCodes = ['2200', '2230'];
+    const payePayableMatch = {
+      company: new mongoose.Types.ObjectId(companyId),
+      status: 'posted',
+      'lines.accountCode': { $in: payePayableCodes }
+    };
+    if (Object.keys(dateFilter).length > 0) {
+      payePayableMatch.date = dateFilter;
+    }
+    
+    const payePayable = await JournalEntry.aggregate([
+      { $match: payePayableMatch },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: payePayableCodes } } },
+      { $group: { 
+        _id: null, 
+        totalCredit: { $sum: '$lines.credit' },
+        totalDebit: { $sum: '$lines.debit' }
+      }}
+    ]);
+
+    // Calculate totals
+    const vatOutputTotal = vatOutput[0]?.total || 0;
+    const vatInputTotal = vatInput[0]?.total || 0;
+    const netVat = vatOutputTotal - vatInputTotal;
+    const payeTotal = payeData[0]?.totalPaye || 0;
+    const whtTotal = withholdingTax[0]?.total || 0;
+    const citTotal = corporateTax[0]?.total || 0;
+    
+    // Calculate PAYE payable balance (credit - debit = outstanding)
+    const payePayableBalance = (payePayable[0]?.totalCredit || 0) - (payePayable[0]?.totalDebit || 0);
+
+    // Get tax rates for reference
+    const taxRates = await TaxRate.find({ company: companyId, is_active: true }).sort({ code: 1 });
+
+    // Get upcoming deadlines
+    const taxes = await Tax.find({ company: companyId });
+    const now = new Date();
+    const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    
+    const upcomingDeadlines = taxes.flatMap(t => 
+      t.calendar.filter(c => 
+        new Date(c.dueDate) >= now && 
+        new Date(c.dueDate) <= thirtyDaysFromNow &&
+        c.status !== 'paid'
+      ).map(c => ({
+        ...c.toObject(),
+        taxType: t.taxType
+      }))
+    ).sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+
+    const overdue = taxes.flatMap(t => 
+      t.calendar.filter(c => 
+        new Date(c.dueDate) < now && 
+        c.status !== 'paid'
+      ).map(c => ({
+        ...c.toObject(),
+        taxType: t.taxType
+      }))
+    );
+
+    res.json({
+      success: true,
+      data: {
+        // VAT
+        vat: {
+          output: vatOutputTotal,
+          input: vatInputTotal,
+          net: netVat,
+          isPayable: netVat > 0,
+          refund: netVat < 0 ? Math.abs(netVat) : 0,
+          invoiceCount: vatOutput[0]?.count || 0,
+          expenseCount: vatInput[0]?.count || 0
+        },
+        // PAYE
+        paye: {
+          collected: payeTotal,
+          payableBalance: payePayableBalance,
+          grossSalaries: payeData[0]?.totalGross || 0,
+          employeeCount: payeData[0]?.employeeCount?.length || 0
+        },
+        // Withholding Tax
+        withholding: {
+          total: whtTotal
+        },
+        // Corporate Income Tax
+        corporateIncome: {
+          total: citTotal,
+          rate: 30
+        },
+        // Totals
+        totals: {
+          vat: netVat > 0 ? netVat : 0,
+          paye: payeTotal,
+          withholding: whtTotal,
+          corporate: citTotal,
+          grandTotal: (netVat > 0 ? netVat : 0) + payeTotal + whtTotal + citTotal
+        },
+        // Tax rates for configuration
+        taxRates,
+        // Calendar
+        upcomingDeadlines,
+        overdue,
+        // Period info
+        period: {
+          year: year ? parseInt(year) : null,
+          month: month ? parseInt(month) : null
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// =====================================================
+// TAX PREVIEW — Live tax calculation without posting
+// =====================================================
+
+// Preview a tax calculation (no journal entry created)
+exports.previewTax = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const { transactionType, ...data } = req.body;
+
+    if (!transactionType) {
+      return res.status(400).json({
+        success: false,
+        message: 'transactionType is required (purchase, sale, expense, payroll, vat_settlement, paye_settlement, rssb_settlement)'
+      });
+    }
+
+    const result = await TaxAutomationService.preview(companyId, transactionType, data);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// =====================================================
+// SEPARATE SETTLEMENT ENDPOINTS
+// =====================================================
+
+// Post VAT settlement
+exports.postVatSettlement = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+
+    const result = await TaxService.postSettlement(companyId, {
+      ...req.body,
+      settlement_type: 'vat'
+    }, userId);
+
+    res.status(201).json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Post PAYE settlement
+exports.postPayeSettlement = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+
+    const result = await TaxService.postSettlement(companyId, {
+      ...req.body,
+      settlement_type: 'paye'
+    }, userId);
+
+    res.status(201).json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Post RSSB settlement
+exports.postRssbSettlement = async (req, res) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+
+    const result = await TaxService.postSettlement(companyId, {
+      ...req.body,
+      settlement_type: 'rssb'
+    }, userId);
+
+    res.status(201).json({
+      success: true,
+      data: result
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

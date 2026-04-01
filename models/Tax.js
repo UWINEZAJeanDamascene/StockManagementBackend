@@ -227,11 +227,11 @@ taxSchema.statics.calculateCorporateTax = function(taxableIncome, rate = 30) {
 };
 
 taxSchema.statics.calculatePAYE = function(grossSalaries) {
-  // PAYE is calculated on individual employees, this aggregates
-  return {
-    totalGrossSalaries: grossSalaries,
-    payeCollected: grossSalaries // This would be calculated per employee
-  };
+  // PAYE is calculated on individual employees
+  // This method is deprecated, use Payroll.calculatePAYE instead
+  // Keeping for backward compatibility but delegating to Payroll model logic
+  const Payroll = require('./Payroll');
+  return Payroll.calculatePAYE(grossSalaries);
 };
 
 taxSchema.statics.getDefaultDueDates = function(taxType) {

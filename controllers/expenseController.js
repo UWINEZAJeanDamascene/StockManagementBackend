@@ -113,9 +113,44 @@ exports.getExpense = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Expense not found' });
     }
     
+    // Transform expense to include account info
+    const transformedExpense = {
+      _id: expense._id,
+      reference: expense.reference_no || expense.expenseNumber,
+      date: expense.expenseDate || expense.expense_date,
+      description: expense.description,
+      account: expense.expense_account_id ? {
+        _id: expense.expense_account_id._id,
+        code: expense.expense_account_id.code,
+        name: expense.expense_account_id.name
+      } : null,
+      method: expense.payment_method || expense.paymentMethod,
+      amount: expense.amount,
+      taxAmount: expense.tax_amount || expense.vatAmount,
+      totalAmount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
+      status: expense.status,
+      type: expense.type,
+      category: expense.category,
+      notes: expense.notes,
+      bankAccount: expense.bank_account_id ? {
+        _id: expense.bank_account_id._id,
+        code: expense.bank_account_id.accountCode,
+        name: expense.bank_account_id.accountName
+      } : null,
+      pettyCashFund: expense.petty_cash_fund_id ? {
+        _id: expense.petty_cash_fund_id._id,
+        name: expense.petty_cash_fund_id.name
+      } : null,
+      receiptRef: expense.receipt_ref,
+      createdBy: expense.createdBy,
+      approvedBy: expense.approvedBy,
+      createdAt: expense.createdAt,
+      updatedAt: expense.updatedAt
+    };
+    
     res.json({
       success: true,
-      data: expense
+      data: transformedExpense
     });
   } catch (error) {
     next(error);
@@ -128,18 +163,63 @@ exports.getExpense = async (req, res, next) => {
 exports.createExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { bankAccountId, paid, paymentMethod } = req.body;
+    const { 
+      bankAccountId, 
+      paid, 
+      paymentMethod, 
+      payment_method,
+      expense_account_id,
+      expenseAccountId,
+      expense_date,
+      expenseDate,
+      total_amount,
+      amount,
+      tax_amount,
+      taxAmount,
+      type,
+      description,
+      reference,
+      notes,
+      status, // Allow setting status (e.g. if admin wants to create directly as 'posted')
+      isRecurring,
+      recurringFrequency
+    } = req.body;
+    
+    // Normalize payment method - use payment_method if sent from frontend
+    const normalizedPaymentMethod = payment_method || paymentMethod || 'bank';
+    // Use snake_case for backend fields
+    const normalizedExpenseAccountId = expense_account_id || expenseAccountId;
+    const normalizedExpenseDate = expense_date || expenseDate || new Date();
+    const normalizedTotalAmount = total_amount || (amount + (tax_amount || taxAmount || 0));
+    const normalizedTaxAmount = tax_amount || taxAmount || 0;
     
     const expense = new Expense({
-      ...req.body,
       company: companyId,
-      createdBy: req.user._id
+      createdBy: req.user._id,
+      posted_by: req.user._id,
+      // Use snake_case field names to match the schema
+      payment_method: normalizedPaymentMethod,
+      expense_account_id: normalizedExpenseAccountId,
+      expense_date: normalizedExpenseDate,
+      total_amount: normalizedTotalAmount,
+      tax_amount: normalizedTaxAmount,
+      // Other fields
+      type,
+      description,
+      reference,
+      notes,
+      amount: amount,
+      status: status || 'pending', // Default to pending
+      isRecurring: isRecurring || false,
+      recurringFrequency: recurringFrequency || 'monthly'
     });
     
     await expense.save();
     
     // If expense is paid immediately, create journal entry and bank transaction
-    if (paid && paymentMethod) {
+    // Only do this if status is 'posted' or 'approved' (if auto-posting is allowed)
+    // For now, let's only create journals if explicitly paid and status allows it
+    if (paid && paymentMethod && (expense.status === 'posted' || expense.status === 'approved')) {
       const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
       let bankAccountCode = null;
       let bankAccount = null;
@@ -524,6 +604,40 @@ exports.getExpenseSummary = async (req, res, next) => {
   }
 };
 
+// @desc    Get expense accounts for dropdown
+// @route   GET /api/expenses/accounts
+// @access  Private
+exports.getExpenseAccounts = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    
+    // Debug: Log company ID
+    console.log(`[ExpenseController] Fetching accounts for company: ${companyId}`);
+    
+    // Fetch ALL active accounts for debugging
+    const allAccounts = await ChartOfAccount.find({
+      company: companyId,
+      isActive: true
+    }).select('_id code name type').sort({ code: 1 });
+    
+    console.log(`[ExpenseController] Total active accounts: ${allAccounts.length}`);
+    
+    // Filter for expense accounts
+    const accounts = allAccounts.filter(acc => acc.type === 'expense' || acc.type === 'cogs');
+
+    // Debug: Log count
+    console.log(`[ExpenseController] Found ${accounts.length} expense accounts`);
+
+    res.json({
+      success: true,
+      data: accounts
+    });
+  } catch (error) {
+    console.error('[ExpenseController] Error fetching expense accounts:', error);
+    next(error);
+  }
+};
+
 // @desc    Bulk create expenses
 // @route   POST /api/expenses/bulk
 // @access  Private
@@ -553,6 +667,183 @@ exports.bulkCreateExpenses = async (req, res, next) => {
       count: createdExpenses.length,
       data: createdExpenses
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Approve an expense
+// @route   PUT /api/expenses/:id/approve
+// @access  Private
+exports.approveExpense = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const expenseId = req.params.id;
+
+    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+
+    if (expense.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Expense is already ${expense.status}` });
+    }
+
+    expense.status = 'approved';
+    expense.approvedBy = req.user._id;
+    expense.approvedAt = new Date();
+
+    // If the expense was paid on creation, we might want to post it now (create journal entries)
+    // Or we might want to wait for a separate "Post" action. For now, let's just mark it approved.
+    // If you want to auto-post upon approval:
+    // await postExpenseInternal(expense, req.user.id); 
+
+    await expense.save();
+
+    res.json({
+      success: true,
+      data: expense,
+      message: 'Expense approved successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Reject an expense
+// @route   PUT /api/expenses/:id/reject
+// @access  Private
+exports.rejectExpense = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const expenseId = req.params.id;
+    const { reason } = req.body;
+
+    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+
+    if (expense.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Expense is already ${expense.status}` });
+    }
+
+    expense.status = 'rejected';
+    expense.rejectedBy = req.user._id;
+    expense.rejectedAt = new Date();
+    expense.rejectionReason = reason || 'No reason provided';
+
+    await expense.save();
+
+    res.json({
+      success: true,
+      data: expense,
+      message: 'Expense rejected successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Post an approved expense (create journal entries)
+// @route   PUT /api/expenses/:id/post
+// @access  Private
+exports.postExpense = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const expenseId = req.params.id;
+    const { bankAccountId } = req.body;
+
+    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+
+    if (!expense) {
+      return res.status(404).json({ success: false, message: 'Expense not found' });
+    }
+
+    if (expense.status !== 'approved' && expense.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Cannot post expense with status: ${expense.status}` });
+    }
+
+    // Create Journal Entry
+    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+    let bankAccountCode = null;
+    let bankAccount = null;
+
+    if (bankAccountId && bankPaymentMethods.includes(expense.payment_method)) {
+      try {
+        bankAccount = await BankAccount.findOne({
+          _id: bankAccountId,
+          company: companyId,
+          isActive: true
+        });
+        if (bankAccount) {
+          bankAccountCode = bankAccount.accountCode;
+        }
+      } catch (err) {
+        console.error('Error fetching bank account for posting:', err);
+      }
+    }
+
+    try {
+      await JournalService.createExpenseEntry(companyId, req.user.id, {
+        _id: expense._id,
+        description: expense.description || expense.type,
+        date: expense.expenseDate || new Date(),
+        amount: expense.amount,
+        vatAmount: expense.tax_amount || 0,
+        category: expense.type,
+        paymentMethod: expense.payment_method,
+        bankAccountCode: bankAccountCode
+      });
+    } catch (journalError) {
+      console.error('Error creating journal entry for expense:', journalError);
+      return res.status(500).json({ success: false, message: 'Failed to create journal entry' });
+    }
+
+    // Create Bank Transaction
+    if (bankAccount && bankPaymentMethods.includes(expense.payment_method)) {
+      try {
+        const currentBalance = bankAccount.currentBalance;
+        
+        const transaction = new BankTransaction({
+          company: companyId,
+          account: bankAccount._id,
+          type: 'withdrawal',
+          amount: expense.amount,
+          balanceAfter: currentBalance - expense.amount,
+          description: `Expense paid: ${expense.description || expense.type}`,
+          date: new Date(),
+          referenceNumber: expense.reference || '',
+          paymentMethod: expense.payment_method,
+          status: 'completed',
+          reference: expense._id,
+          referenceType: 'Expense',
+          createdBy: req.user._id,
+          notes: `Payment for expense: ${expense.description || expense.type}`
+        });
+        
+        await transaction.save();
+        
+        // Update bank account balance
+        bankAccount.currentBalance = currentBalance - expense.amount;
+        await bankAccount.save();
+      } catch (bankError) {
+        console.error('Error creating bank transaction for expense:', bankError);
+        // We might want to rollback journal entry here, but for now just log
+      }
+    }
+
+    expense.status = 'posted';
+    await expense.save();
+
+    res.json({
+      success: true,
+      data: expense,
+      message: 'Expense posted successfully'
+    });
+
   } catch (error) {
     next(error);
   }

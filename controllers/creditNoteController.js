@@ -5,6 +5,7 @@ const StockMovement = require('../models/StockMovement');
 const Client = require('../models/Client');
 const SerialNumber = require('../models/SerialNumber');
 const JournalService = require('../services/journalService');
+const TaxAutomationService = require('../services/taxAutomationService');
 
 // List credit notes
 exports.getCreditNotes = async (req, res, next) => {
@@ -615,7 +616,14 @@ exports.confirmCreditNote = async (req, res, next) => {
       const totalAmount = totalSubtotal + totalTax;
       const narration = 'Credit Note - ' + (creditNote.client?.name || 'Client') + ' - CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber) + ' - Ref INV#' + (invoice.invoiceNumber || invoice._id);
       
-      // Get revenue account from first product
+      console.log('DEBUG: Creating revenue + COGS entries with totalSubtotal =', totalSubtotal, 'totalTax =', totalTax, 'totalAmount =', totalAmount);
+
+      // Use TaxAutomationService for centralized tax reversal
+      const reversalTax = await TaxAutomationService.reverseSalesTax(companyId, [
+        { netAmount: totalSubtotal, originalTaxAmount: totalTax }
+      ]);
+
+      // Get revenue account from first product (override default if product has one)
       let revenueAccount = DEFAULT_ACCOUNTS.salesRevenue;
       if (lineArray[0] && lineArray[0].product) {
         const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
@@ -623,15 +631,14 @@ exports.confirmCreditNote = async (req, res, next) => {
           revenueAccount = firstProduct.revenueAccount;
         }
       }
-      
-      console.log('DEBUG: Creating revenue + COGS entries with totalSubtotal =', totalSubtotal, 'totalTax =', totalTax, 'totalAmount =', totalAmount);
 
-      // Build revenue lines
-      const revenueLines = [
-        { accountCode: revenueAccount, accountName: 'Sales Revenue', debit: totalSubtotal, credit: 0, description: narration },
-        { accountCode: DEFAULT_ACCOUNTS.vatPayable, accountName: 'VAT Output', debit: totalTax || 0, credit: 0, description: narration },
-        { accountCode: DEFAULT_ACCOUNTS.accountsReceivable, accountName: 'Accounts Receivable', debit: 0, credit: totalAmount || (totalSubtotal + (totalTax || 0)), description: narration }
-      ];
+      // Build revenue lines — use TaxAutomationService output but with product-specific revenue account
+      const revenueLines = reversalTax.journalLines.map(l => {
+        if (l.accountCode === DEFAULT_ACCOUNTS.salesRevenue) {
+          return { ...l, accountCode: revenueAccount, description: narration };
+        }
+        return { ...l, description: narration };
+      });
 
       // Build COGS lines if goods return
       let cogsLines = null;

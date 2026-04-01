@@ -7,6 +7,11 @@ const { protect, authorize } = require('../middleware/auth');
 router.use(protect);
 
 // =====================================================
+// TAX DASHBOARD - Auto-detected from all sources
+// =====================================================
+router.get('/dashboard', taxController.getTaxDashboard);
+
+// =====================================================
 // TAX RATE CONFIGURATION (Module 9: Taxes)
 // =====================================================
 // Tax rate CRUD
@@ -19,8 +24,16 @@ router.delete('/rates/:id', taxController.deleteTaxRate);
 // Tax liability report - computed from journal entries
 router.get('/liability-report', taxController.getLiabilityReport);
 
-// Tax settlement - post payment to authorities
+// Tax settlement - post payment to authorities (supports settlement_type: vat, paye, rssb)
 router.post('/settlements', taxController.postSettlement);
+
+// Separate settlement endpoints
+router.post('/settlements/vat', taxController.postVatSettlement);
+router.post('/settlements/paye', taxController.postPayeSettlement);
+router.post('/settlements/rssb', taxController.postRssbSettlement);
+
+// Tax preview - live calculation without posting
+router.post('/preview', taxController.previewTax);
 
 // =====================================================
 // TAX TRACKING (existing - for filings, payments, calendar)

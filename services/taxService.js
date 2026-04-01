@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const TaxRate = require('../models/TaxRate');
 const JournalEntry = require('../models/JournalEntry');
 const JournalService = require('./journalService');
+const TaxAutomationService = require('./taxAutomationService');
 const SequenceService = require('./sequenceService');
 const PeriodService = require('./periodService');
 const { BankAccount } = require('../models/BankAccount');
@@ -103,132 +104,172 @@ class TaxService {
 
   // ── TAX LIABILITY REPORT ─────────────────────────────────────────────
   /**
-   * Computed entirely from posted journal lines — no separate tax table
-   * Uses account codes to identify VAT input/output positions
+   * Computed entirely from posted journal lines — no separate tax table.
+   * Covers VAT, PAYE, and RSSB sections.
+   *
+   * Every figure is computed live from journal entry lines filtered by company_id and date range.
+   * Accounts queried are explicitly reported so an auditor can verify independently.
    */
   static async getLiabilityReport(companyId, { periodStart, periodEnd, taxCode }) {
-    const query = { company: companyId, is_active: true };
-    if (taxCode) {
-      query.code = taxCode.toUpperCase();
-    }
+    const dateFilter = {
+      $gte: new Date(periodStart),
+      $lte: new Date(periodEnd)
+    };
 
-    const taxRates = await TaxRate.find(query);
+    const matchBase = {
+      company: new mongoose.Types.ObjectId(companyId),
+      status: 'posted',
+      reversed: { $ne: true },
+      date: dateFilter
+    };
 
-    const results = [];
+    // ── VAT SECTION ────────────────────────────────────────────────
+    // Query both legacy and new VAT account codes
+    const vatOutputCodes = ['2100', '2220'];
+    const vatInputCodes = ['1500', '2210'];
 
-    for (const tax of taxRates) {
-      // Output VAT — sum of credit lines on output_account_code in period
-      // Excludes: draft, voided, reversed entries, and original entries that have been reversed
-      // First, find all entry IDs that have been reversed (appear in reversalOf field)
-      const reversedEntryIds = await JournalEntry.distinct('reversalOf', {
-        company: new mongoose.Types.ObjectId(companyId),
-        reversalOf: { $exists: true, $ne: null }
-      });
-      
-      const outputResult = await aggregateWithTimeout(JournalEntry, [
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: { $nin: ['draft', 'voided', 'reversed'] },
-            _id: { $nin: reversedEntryIds },
-            date: {
-              $gte: new Date(periodStart),
-              $lte: new Date(periodEnd)
-            }
-          }
-        },
-        { $unwind: '$lines' },
-        {
-          $match: {
-            'lines.accountCode': tax.output_account_code,
-            'lines.credit': { $gt: 0 }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            output_vat: { $sum: '$lines.credit' }
-          }
-        }
-      ]);
+    // Output VAT — sum of credit lines on VAT Output accounts
+    const outputVatResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: vatOutputCodes }, 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
 
-      // Input VAT — sum of debit lines on input_account_code in period
-      // Excludes draft, reversed, and cancelled entries
-      const inputResult = await aggregateWithTimeout(JournalEntry, [
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: 'posted',
-            reversed: { $ne: true },
-            date: {
-              $gte: new Date(periodStart),
-              $lte: new Date(periodEnd)
-            }
-          }
-        },
-        { $unwind: '$lines' },
-        {
-          $match: {
-            'lines.accountCode': tax.input_account_code,
-            'lines.debit': { $gt: 0 }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            input_vat: { $sum: '$lines.debit' }
-          }
-        }
-      ]);
+    // Output VAT reversed — sum of debit lines on VAT Output accounts (credit notes)
+    const outputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: vatOutputCodes }, 'lines.debit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+    ]);
 
-      // Convert Decimal128 to numbers
-      const outputVat = outputResult[0]?.output_vat ? Number(outputResult[0].output_vat.toString()) : 0;
-      const inputVat = inputResult[0]?.input_vat ? Number(inputResult[0].input_vat.toString()) : 0;
-      const netPayable = outputVat - inputVat;
+    // Input VAT — sum of debit lines on VAT Input accounts
+    const inputVatResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: vatInputCodes }, 'lines.debit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+    ]);
 
-      results.push({
-        tax_code: tax.code,
-        tax_name: tax.name,
-        rate_pct: tax.rate_pct,
-        tax_type: tax.type,
-        output_vat: outputVat,
-        input_vat: inputVat,
-        net_payable: netPayable
-      });
-    }
+    // Input VAT reversed — sum of credit lines on VAT Input accounts (purchase returns)
+    const inputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: vatInputCodes }, 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
 
-    const totalOutputVat = results.reduce((s, r) => s + r.output_vat, 0);
-    const totalInputVat = results.reduce((s, r) => s + r.input_vat, 0);
-    const totalNetPayable = results.reduce((s, r) => s + r.net_payable, 0);
+    const outputVat = outputVatResult[0]?.total ? Number(outputVatResult[0].total.toString()) : 0;
+    const outputVatReversed = outputVatReversedResult[0]?.total ? Number(outputVatReversedResult[0].total.toString()) : 0;
+    const inputVat = inputVatResult[0]?.total ? Number(inputVatResult[0].total.toString()) : 0;
+    const inputVatReversed = inputVatReversedResult[0]?.total ? Number(inputVatReversedResult[0].total.toString()) : 0;
+
+    const netOutputVat = outputVat - outputVatReversed;
+    const netInputVat = inputVat - inputVatReversed;
+    const netVatPayable = netOutputVat - netInputVat;
+
+    // ── PAYE SECTION ───────────────────────────────────────────────
+    const payePayableCodes = ['2200', '2230'];
+
+    // PAYE withheld — sum of credit lines on PAYE accounts
+    const payeWithheldResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: payePayableCodes }, 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
+
+    // PAYE remitted — sum of debit lines on PAYE accounts (settlements)
+    const payeRemittedResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: { ...matchBase, sourceType: { $in: ['paye_settlement', 'payroll_tax'] } } },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: payePayableCodes }, 'lines.debit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+    ]);
+
+    const payeWithheld = payeWithheldResult[0]?.total ? Number(payeWithheldResult[0].total.toString()) : 0;
+    const payeRemitted = payeRemittedResult[0]?.total ? Number(payeRemittedResult[0].total.toString()) : 0;
+    const payeOutstanding = payeWithheld - payeRemitted;
+
+    // ── RSSB SECTION ───────────────────────────────────────────────
+    const rssbPayableCodes = ['2300', '2240'];
+
+    // RSSB contributions — sum of credit lines on RSSB accounts
+    const rssbContributedResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: matchBase },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: rssbPayableCodes }, 'lines.credit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+    ]);
+
+    // RSSB remitted — sum of debit lines on RSSB accounts (settlements)
+    const rssbRemittedResult = await aggregateWithTimeout(JournalEntry, [
+      { $match: { ...matchBase, sourceType: { $in: ['rssb_settlement', 'payroll_tax'] } } },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: rssbPayableCodes }, 'lines.debit': { $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+    ]);
+
+    const rssbContributed = rssbContributedResult[0]?.total ? Number(rssbContributedResult[0].total.toString()) : 0;
+    const rssbRemitted = rssbRemittedResult[0]?.total ? Number(rssbRemittedResult[0].total.toString()) : 0;
+    const rssbOutstanding = rssbContributed - rssbRemitted;
 
     return {
       company_id: companyId,
       period_start: periodStart,
       period_end: periodEnd,
-      total_output_vat: totalOutputVat,
-      total_input_vat: totalInputVat,
-      net_vat_payable: totalNetPayable,
-      breakdown: results,
-      computed_at: new Date()
+      computed_at: new Date(),
+
+      // VAT Section
+      vat: {
+        output_vat_collected: outputVat,
+        output_vat_reversed: outputVatReversed,
+        net_output_vat: netOutputVat,
+        input_vat_claimed: inputVat,
+        input_vat_reversed: inputVatReversed,
+        net_input_vat: netInputVat,
+        net_vat_payable: netVatPayable,
+        is_payable: netVatPayable > 0,
+        refund_due: netVatPayable < 0 ? Math.abs(netVatPayable) : 0,
+        accounts_queried: {
+          output: vatOutputCodes,
+          input: vatInputCodes
+        }
+      },
+
+      // PAYE Section
+      paye: {
+        total_withheld: payeWithheld,
+        total_remitted: payeRemitted,
+        outstanding: payeOutstanding,
+        accounts_queried: payePayableCodes
+      },
+
+      // RSSB Section
+      rssb: {
+        total_contributions: rssbContributed,
+        total_remitted: rssbRemitted,
+        outstanding: rssbOutstanding,
+        accounts_queried: rssbPayableCodes
+      },
+
+      // Grand totals
+      totals: {
+        total_tax_liability: Math.max(0, netVatPayable) + payeOutstanding + rssbOutstanding,
+        total_remitted: payeRemitted + rssbRemitted
+      }
     };
   }
 
   // ── TAX SETTLEMENT ─────────────────────────────────────────────────
   /**
    * Post tax settlement - pays tax liability to authorities
-   * Dr: VAT Payable (output)
-   * Cr: Bank/Cash
+   * Supports VAT, PAYE, and RSSB settlement types.
+   *
+   * Uses TaxAutomationService for journal line computation.
    */
   static async postSettlement(companyId, data, userId) {
-    const taxRate = await TaxRate.findOne({ 
-      company: companyId, 
-      code: data.tax_code.toUpperCase() 
-    });
-
-    if (!taxRate) {
-      throw new Error('TAX_RATE_NOT_FOUND');
-    }
-
     // Get bank account
     let bankAccount;
     if (data.bank_account_id) {
@@ -242,58 +283,61 @@ class TaxService {
     }
 
     const refNo = await SequenceService.nextSequence(companyId, 'TXST');
-    const periodId = await PeriodService.getOpenPeriodId(companyId, data.settlement_date);
 
-    // Determine cash account based on payment method
+    // Determine cash account code
     let cashAccountCode;
     if (bankAccount && bankAccount.ledgerAccountId) {
       cashAccountCode = bankAccount.ledgerAccountId;
     } else if (data.payment_method === 'bank' || data.bank_account_id) {
-      cashAccountCode = '1100'; // Cash at Bank default
+      cashAccountCode = '1100';
     } else {
-      cashAccountCode = '1000'; // Cash in Hand default
+      cashAccountCode = '1000';
     }
 
-    // Journal Entry:
-    // Debit: Output VAT (clear the liability)
-    // Credit: Bank/Cash (payment)
-    const lines = [
-      {
-        accountCode: taxRate.output_account_code,
-        accountName: 'VAT Payable',
-        description: 'VAT output cleared on settlement',
-        debit: data.amount,
-        credit: 0,
-        reference: ''
-      },
-      {
-        accountCode: cashAccountCode,
-        accountName: 'Bank/Cash',
-        description: 'Bank payment to tax authority',
-        debit: 0,
-        credit: data.amount,
-        reference: ''
-      }
-    ];
+    // Determine settlement type and compute journal lines via TaxAutomationService
+    const settlementType = (data.settlement_type || 'vat').toLowerCase();
+    let settlement;
+    let sourceType = 'tax_settlement';
 
-    const narration = `VAT Settlement - ${data.period_description || 'Tax Period'} - TXST#${refNo}`;
+    switch (settlementType) {
+      case 'paye':
+        settlement = TaxAutomationService.computePayeSettlement(companyId, data.amount, cashAccountCode);
+        sourceType = 'paye_settlement';
+        break;
+      case 'rssb':
+        settlement = TaxAutomationService.computeRssbSettlement(companyId, data.amount, cashAccountCode);
+        sourceType = 'rssb_settlement';
+        break;
+      case 'vat':
+      default:
+        settlement = TaxAutomationService.computeVatSettlement(companyId, data.amount, cashAccountCode);
+        sourceType = 'vat_settlement';
+        break;
+    }
+
+    // Validate journal lines are balanced
+    TaxAutomationService.assertBalanced(settlement.journalLines, `${settlementType} settlement`);
+
+    const periodId = await PeriodService.getOpenPeriodId(companyId, data.settlement_date);
+    const narration = `${settlementType.toUpperCase()} Settlement - ${data.period_description || 'Tax Period'} - TXST#${refNo}`;
 
     const journalEntry = await JournalService.createEntry(companyId, userId, {
       date: data.settlement_date,
       description: narration,
-      sourceType: 'tax_settlement',
+      sourceType,
       sourceId: `taxsettlement_${companyId}_${refNo}`,
       sourceReference: `TXST#${refNo}`,
-      lines,
+      lines: settlement.journalLines,
       isAutoGenerated: true,
       periodId
     });
 
     return {
       settlement_reference: refNo,
+      settlement_type: settlementType,
       journal_entry_id: journalEntry._id,
       amount: data.amount,
-      tax_code: taxRate.code,
+      tax_code: data.tax_code || settlementType.toUpperCase(),
       settlement_date: data.settlement_date,
       journal_entry: journalEntry
     };

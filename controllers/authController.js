@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const Role = require('../models/Role');
 const Company = require('../models/Company');
 const { notifyPasswordChanged, notifyFailedLogin } = require('../services/notificationHelper');
 const sessionService = require('../services/sessionService');
@@ -165,11 +166,86 @@ exports.login = async (req, res, next) => {
 // @access  Private
 exports.getMe = async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id).populate('company', 'name email');
+    const user = await User.findById(req.user.id)
+      .populate('company', 'name email')
+      .populate('roles');
+
+    const userObj = user.toJSON();
+
+    // Compute flat permissions array from populated roles
+    // Format: ["products:read", "products:create", "stock:read", ...]
+    const permissionsSet = new Set();
+
+    // Admin and platform_admin get wildcard permissions
+    if (user.role === 'admin' || user.role === 'platform_admin') {
+      permissionsSet.add('*');
+    }
+
+    if (user.roles && user.roles.length > 0) {
+      for (const role of user.roles) {
+        if (role.permissions && role.permissions.length > 0) {
+          for (const perm of role.permissions) {
+            if (perm.resource === '*') {
+              // Wildcard resource - add all common actions
+              const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+              for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+                permissionsSet.add(`*:${action}`);
+              }
+              if (perm.actions.includes('*')) {
+                permissionsSet.add('*');
+              }
+            } else {
+              for (const action of perm.actions) {
+                if (action === '*') {
+                  // Wildcard action - add all actions for this resource
+                  permissionsSet.add(`${perm.resource}:*`);
+                  const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                  for (const a of allActions) {
+                    permissionsSet.add(`${perm.resource}:${a}`);
+                  }
+                } else {
+                  permissionsSet.add(`${perm.resource}:${action}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
+      // Fallback: look up the Role document by the legacy role string name
+      const legacyRole = await Role.findOne({ name: user.role, is_system_role: true });
+      if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
+        for (const perm of legacyRole.permissions) {
+          if (perm.resource === '*') {
+            const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+            for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+              permissionsSet.add(`*:${action}`);
+            }
+            if (perm.actions.includes('*')) {
+              permissionsSet.add('*');
+            }
+          } else {
+            for (const action of perm.actions) {
+              if (action === '*') {
+                permissionsSet.add(`${perm.resource}:*`);
+                const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                for (const a of allActions) {
+                  permissionsSet.add(`${perm.resource}:${a}`);
+                }
+              } else {
+                permissionsSet.add(`${perm.resource}:${action}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    userObj.permissions = Array.from(permissionsSet);
 
     res.json({
       success: true,
-      data: user
+      data: userObj
     });
   } catch (error) {
     next(error);

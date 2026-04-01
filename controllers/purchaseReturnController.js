@@ -242,6 +242,9 @@ exports.listPurchaseReturns = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query);
     const total = await PurchaseReturn.countDocuments(q);
     const list = await PurchaseReturn.find(q)
+      .populate('grn', 'referenceNo')
+      .populate('supplier', 'name code')
+      .populate('warehouse', 'name code')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -257,7 +260,13 @@ exports.listPurchaseReturns = async (req, res, next) => {
 exports.getPurchaseReturn = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId });
+    const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId })
+      .populate('grn', 'referenceNo')
+      .populate('supplier', 'name code')
+      .populate('warehouse', 'name code')
+      .populate('lines.product', 'name sku')
+      .populate('confirmedBy', 'name email')
+      .populate('createdBy', 'name email');
     if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
     res.json({ success: true, data: pr });
   } catch (err) { next(err); }

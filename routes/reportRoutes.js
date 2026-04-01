@@ -19,10 +19,15 @@ const { getCashFlow } = require('../controllers/cashFlowController');
 // Financial Ratios controller
 const { getFinancialRatios } = require('../controllers/financialRatiosController');
 
-const { protect, authorize } = require('../middleware/auth');
+// Budget vs Actual report
+const BudgetService = require('../services/budgetService');
+
+const { protect } = require('../middleware/auth');
+const { attachCompanyId } = require('../middleware/companyContext');
 const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
 
 router.use(protect);
+router.use(attachCompanyId);
 router.use(sessionMiddleware);
 
 // General Ledger routes
@@ -47,5 +52,25 @@ router.get('/cash-flow', cacheMiddleware({ type: 'report', ttl: 900 }), getCashF
 
 // Financial Ratios route
 router.get('/financial-ratios', cacheMiddleware({ type: 'report', ttl: 300 }), getFinancialRatios);
+
+// Budget vs Actual route
+router.get('/budget-vs-actual', async (req, res) => {
+  try {
+    const companyId = req.companyId;
+    const { budgetId } = req.query;
+
+    if (!budgetId) {
+      return res.status(400).json({ success: false, error: 'budgetId is required' });
+    }
+
+    const comparison = await BudgetService.getComparison(companyId, budgetId);
+    res.json({ success: true, data: comparison });
+  } catch (error) {
+    if (error.message === 'NOT_FOUND') {
+      return res.status(404).json({ success: false, error: 'Budget not found' });
+    }
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
 
 module.exports = router;

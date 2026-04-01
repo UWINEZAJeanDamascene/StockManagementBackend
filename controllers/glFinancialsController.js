@@ -1,5 +1,6 @@
 const AccountBalance = require('../models/AccountBalance');
 const accountMappingService = require('../services/accountMappingService');
+const PLStatementService = require('../services/plStatementService');
 const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS, getAccountsByType, getAccountsBySubtype } = require('../constants/chartOfAccounts');
 
 // Helper: resolve mapping value into array of account codes
@@ -79,45 +80,20 @@ async function sumAccountNets(companyId, accountCodes) {
 exports.getProfitAndLoss = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { startDate, endDate } = req.query; // currently ignored - snapshot is point-in-time
+    const { startDate, endDate } = req.query;
 
-    // Resolve main accounts via mappings (allow multi-account mappings/ranges)
-    const salesCodes = await resolveAccountCodes(companyId, 'report', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue);
-    const salesReturnsCodes = await resolveAccountCodes(companyId, 'report', 'salesReturns', DEFAULT_ACCOUNTS.salesReturns);
-    const cogsCodes = await resolveAccountCodes(companyId, 'report', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold || DEFAULT_ACCOUNTS.costOfGoodsSold);
+    // Use PLStatementService for proper P&L with all sections
+    const dateFrom = startDate || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0];
+    const dateTo = endDate || new Date().toISOString().split('T')[0];
 
-    // Expense keys to sum (common expense buckets)
-    const expenseKeys = ['salariesWages','payrollExpenses','rent','utilities','transport','marketing','depreciation','interestExpense','otherExpenses','bankCharges','badDebt','corporateTax'];
-
-    // Gather values by summing all mapped codes
-    const salesNet = await sumAccountNets(companyId, salesCodes);
-    const salesReturnsNet = await sumAccountNets(companyId, salesReturnsCodes);
-    const sales = Math.max(0, salesNet - salesReturnsNet);
-    const cogs = Math.max(0, await sumAccountNets(companyId, cogsCodes));
-
-    const expenses = {};
-    let totalExpenses = 0;
-    for (const k of expenseKeys) {
-      const codes = await resolveAccountCodes(companyId, 'report', k, DEFAULT_ACCOUNTS[k]);
-      const net = await sumAccountNets(companyId, codes);
-      const value = net > 0 ? net : 0;
-      expenses[k] = Math.round(value * 100) / 100;
-      totalExpenses += value;
-    }
-
-    const grossProfit = Math.round((sales - cogs) * 100) / 100;
-    const netProfit = Math.round((grossProfit - totalExpenses) * 100) / 100;
+    const plData = await PLStatementService.generate(companyId, {
+      dateFrom,
+      dateTo
+    });
 
     res.json({
       success: true,
-      data: {
-        sales: Math.round(sales * 100) / 100,
-        cogs: Math.round(cogs * 100) / 100,
-        grossProfit,
-        expenses,
-        totalExpenses: Math.round(totalExpenses * 100) / 100,
-        netProfit
-      }
+      data: plData.current
     });
   } catch (error) {
     next(error);
@@ -132,7 +108,7 @@ exports.getBalanceSheet = async (req, res, next) => {
 
     // Assets keys
     const assetKeys = ['cashAtBank','cashInHand','pettyCash','mtnMoMo','accountsReceivable','inventory','prepaidExpenses','equipment','computers','vehicles','furniture','buildings','land','machinery'];
-    const liabilityKeys = ['accountsPayable','vatPayable','shortTermLoans','longTermLoans','accruedExpenses','incomeTaxPayable','payePayable','rssbPayable','withholdingTaxPayable'];
+    const liabilityKeys = ['accountsPayable','vatPayable','vatInput','vatOutput','shortTermLoans','longTermLoans','accruedExpenses','incomeTaxPayable','payePayable','payePayableNew','rssbPayable','rssbPayableNew','withholdingTaxPayable'];
     const equityKeys = ['shareCapital','retainedEarnings','currentProfit'];
 
     const assets = {};

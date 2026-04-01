@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const Role = require('../models/Role');
 const ActionLog = require('../models/ActionLog');
 const { notifyUserCreated, notifyPasswordChanged } = require('../services/notificationHelper');
 
@@ -98,12 +99,17 @@ exports.createUser = async (req, res, next) => {
     const tempPassword = generateTemp ? generateTempPassword() : req.body.password || generateTempPassword();
     const mustChangePassword = generateTemp || !req.body.password;
 
+    // Look up the Role document by name to link it to the user
+    const userRole = role || 'viewer';
+    const roleDoc = await Role.findOne({ name: userRole, is_system_role: true });
+
     const user = await User.create({
       name,
       email: email.toLowerCase(),
       password: tempPassword,
       company: companyId,
-      role: role || 'viewer',
+      role: userRole,
+      roles: roleDoc ? [roleDoc._id] : [],
       createdBy: req.user.id,
       mustChangePassword,
       tempPassword: mustChangePassword
@@ -137,6 +143,14 @@ exports.updateUser = async (req, res, next) => {
     delete req.body.password;
     // Don't allow changing company
     delete req.body.company;
+
+    // If role is being updated, also update the roles array with the corresponding Role document
+    if (req.body.role) {
+      const roleDoc = await Role.findOne({ name: req.body.role, is_system_role: true });
+      if (roleDoc) {
+        req.body.roles = [roleDoc._id];
+      }
+    }
 
     const user = await User.findOneAndUpdate(
       { _id: req.params.id, company: companyId },

@@ -33,7 +33,11 @@ const NOTIFICATION_TYPES = {
   
   // Recurring Invoice Alerts
   INVOICE_GENERATED: 'invoice_generated',
-  RECURRING_PAUSED: 'recurring_paused'
+  RECURRING_PAUSED: 'recurring_paused',
+  RECURRING_FAILED: 'recurring_failed',
+
+  // Security Alerts
+  ACCOUNT_LOCKED: 'account_locked'
 };
 
 // Severity levels
@@ -337,6 +341,31 @@ const notifyInvoiceSent = async (companyId, invoice) => {
   });
 };
 
+const notifyRecurringFailed = async (companyId, template, error) => {
+  return createNotification({
+    companyId,
+    type: NOTIFICATION_TYPES.RECURRING_FAILED,
+    title: 'Recurring Invoice Failed',
+    message: `Recurring template ${template.name || template._id} failed: ${error}`,
+    severity: SEVERITY.CRITICAL,
+    link: `/recurring-invoices`,
+    metadata: { templateId: template._id, error }
+  });
+};
+
+const notifyAccountLocked = async (companyId, userId, email, ip) => {
+  return createNotification({
+    companyId,
+    userId,
+    type: NOTIFICATION_TYPES.ACCOUNT_LOCKED,
+    title: 'Account Locked',
+    message: `Account locked due to multiple failed login attempts${ip ? ` from IP ${ip}` : ''}`,
+    severity: SEVERITY.CRITICAL,
+    link: `/security`,
+    metadata: { email, ip }
+  });
+};
+
 module.exports = {
   NOTIFICATION_TYPES,
   SEVERITY,
@@ -359,10 +388,12 @@ module.exports = {
   notifyCompanyApproved,
   notifyPasswordChanged,
   notifyFailedLogin,
+  notifyAccountLocked,
   // Backup
   notifyBackupSuccess,
   notifyBackupFailed,
   // Recurring
   notifyInvoiceGenerated,
-  notifyRecurringPaused
+  notifyRecurringPaused,
+  notifyRecurringFailed
 };
