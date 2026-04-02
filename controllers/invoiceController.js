@@ -74,7 +74,7 @@ exports.getInvoices = async (req, res, next) => {
       .populate('client', 'name code contact')
       .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
-      .populate('quotation', 'quotationNumber referenceNo')
+      .populate('quotation', 'referenceNo')
       .populate('revenueJournalEntry')
       .populate('cogsJournalEntry')
       .sort({ createdAt: -1 })
@@ -104,7 +104,7 @@ exports.getInvoice = async (req, res, next) => {
       .populate('client', 'name code contact type taxId')
       .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
-      .populate('quotation', 'quotationNumber referenceNo')
+      .populate('quotation', 'referenceNo')
       .populate('payments.recordedBy', 'name email')
       .populate('revenueJournalEntry')
       .populate('cogsJournalEntry')
@@ -226,7 +226,7 @@ exports.createInvoice = async (req, res, next) => {
         taxAmount: taxAmount,  // backwards compat
         lineTotal: totalWithTax,
         totalWithTax: totalWithTax,  // backwards compat
-        warehouse: line.warehouse
+        ...(line.warehouse && line.warehouse.toString() !== '' ? { warehouse: line.warehouse } : {})
       };
     });
 
@@ -915,10 +915,52 @@ exports.confirmInvoice = async (req, res, next) => {
     }
 
     // Step 6: Update invoice status - Module 6
+    // Also deduct stock and create stock movements
     invoice.status = 'confirmed';
     invoice.confirmedDate = new Date();
     invoice.confirmedBy = req.user.id;
     invoice.stockReserved = true;
+    
+    // Deduct stock for each line
+    for (const line of invoice.lines) {
+      const product = await Product.findOne({ _id: line.product._id, company: companyId });
+      if (product && product.isStockable) {
+        const qty = line.qty || line.quantity || 0;
+        if (qty > 0) {
+          const previousStock = product.currentStock || 0;
+          const newStock = Math.max(0, previousStock - qty);
+          
+          // Create stock movement
+          const StockMovement = require('../models/StockMovement');
+          const sm = new StockMovement({
+            company: companyId,
+            product: product._id,
+            type: 'out',
+            reason: 'sale',
+            quantity: qty,
+            previousStock,
+            newStock,
+            unitCost: line.unitCost || 0,
+            totalCost: line.cogsAmount || 0,
+            referenceType: 'invoice',
+            referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
+            referenceDocument: invoice._id,
+            referenceModel: 'Invoice',
+            notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
+            performedBy: req.user.id,
+            movementDate: new Date()
+          });
+          await sm.save();
+          
+          // Update product stock
+          product.currentStock = newStock;
+          product.lastSaleDate = new Date();
+          await product.save();
+        }
+      }
+    }
+    
+    invoice.stockDeducted = true;
     await invoice.save();
 
     // Update client outstanding balance

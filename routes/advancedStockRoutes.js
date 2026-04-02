@@ -72,7 +72,8 @@ const {
   approvePurchaseOrder,
   cancelPurchaseOrder,
   getPurchaseOrders,
-  getPurchaseOrder
+  getPurchaseOrder,
+  recordPOPayment
 } = require('../controllers/purchaseOrderController');
 
 const {
@@ -196,6 +197,7 @@ router.route('/purchase-orders/:id')
 
 router.post('/purchase-orders/:id/approve', authorize('admin', 'stock_manager'), logAction('stock'), approvePurchaseOrder);
 router.post('/purchase-orders/:id/cancel', authorize('admin', 'stock_manager'), logAction('stock'), cancelPurchaseOrder);
+router.post('/purchase-orders/:id/payment', authorize('admin', 'stock_manager'), logAction('stock'), recordPOPayment);
 
 // ========== GRN ROUTES ==========
 router.get('/grn', authorize('admin', 'stock_manager'), listGRNs);

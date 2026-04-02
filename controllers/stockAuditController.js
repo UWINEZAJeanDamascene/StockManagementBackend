@@ -84,8 +84,8 @@ exports.createStockAudit = async (req, res, next) => {
         unitCost = qtySystem > 0 ? (totalValue / qtySystem) : 0;
       } else {
         // Fall back to product currentStock
-        qtySystem = product.currentStock || 0;
-        unitCost = product.averageCost || 0;
+        qtySystem = product.currentStock && product.currentStock.toString ? Number(product.currentStock.toString()) : Number(product.currentStock || 0);
+        unitCost = product.averageCost && product.averageCost.toString ? Number(product.averageCost.toString()) : Number(product.averageCost || 0);
       }
 
       auditLines.push({
@@ -385,9 +385,16 @@ exports.postStockAudit = async (req, res, next) => {
         const varianceValue = parseFloat(line.varianceValue) || 0;
         const product = line.product;
         
-        // Get product's inventory account
+        // Get product's inventory account code (resolve ObjectId to code if needed)
         const productDoc = await Product.findById(product._id).session(trx || undefined);
-        const invAccount = productDoc?.inventoryAccount || defaultInv;
+        let invAccountId = productDoc?.inventoryAccount || defaultInv;
+        // If it's an ObjectId, look up the account code
+        let invAccount = invAccountId;
+        if (invAccountId && typeof invAccountId === 'object' || (typeof invAccountId === 'string' && invAccountId.length === 24 && /^[0-9a-fA-F]{24}$/.test(invAccountId))) {
+          const ChartOfAccounts = require('../models/ChartOfAccount');
+          const acctDoc = await ChartOfAccounts.findById(invAccountId).session(trx || undefined);
+          invAccount = acctDoc ? acctDoc.code : DEFAULT_ACCOUNTS.inventory;
+        }
 
         // Step 2: Create stock movement
         const movementReason = variance > 0 ? 'audit_surplus' : 'audit_shortage';

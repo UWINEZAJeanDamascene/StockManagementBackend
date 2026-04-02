@@ -24,6 +24,18 @@ exports.createPurchaseReturn = async (req, res, next) => {
     if (grn.status !== 'confirmed') return res.status(409).json({ success: false, message: 'Can only return against confirmed GRN' });
 
     const pr = await PurchaseReturn.create(payload);
+
+    // Calculate totals from lines
+    if (pr.lines && pr.lines.length > 0) {
+      let subtotal = 0;
+      for (const line of pr.lines) {
+        subtotal += (Number(line.qtyReturned) || 0) * (Number(line.unitCost) || 0);
+      }
+      pr.subtotal = subtotal;
+      pr.totalAmount = subtotal;
+      await pr.save();
+    }
+
     res.status(201).json({ success: true, data: pr });
   } catch (err) { next(err); }
 };
@@ -163,7 +175,18 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     }
     for (const [prodId, amt] of productSums.entries()) {
       const product = await Product.findById(prodId).lean();
-      const invAcct = product && product.inventoryAccount ? product.inventoryAccount : (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: pr.warehouse }));
+      let invAcct = DEFAULT_ACCOUNTS.inventory;
+      if (product && product.inventoryAccount) {
+        if (typeof product.inventoryAccount === 'string' && product.inventoryAccount.length === 24 && /^[0-9a-fA-F]{24}$/.test(product.inventoryAccount)) {
+          const ChartOfAccounts = require('../models/ChartOfAccount');
+          const acctDoc = await ChartOfAccounts.findById(product.inventoryAccount).lean();
+          invAcct = acctDoc ? acctDoc.code : DEFAULT_ACCOUNTS.inventory;
+        } else {
+          invAcct = product.inventoryAccount;
+        }
+      } else {
+        invAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: pr.warehouse });
+      }
       journalLines.push(JournalService.createCreditLine(invAcct || DEFAULT_ACCOUNTS.inventory, amt, `Inventory reversal ${pr.referenceNo || pr.referenceNo}`));
     }
 
@@ -188,6 +211,9 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       pr.status = 'confirmed';
       pr.confirmedBy = req.user.id;
       pr.confirmedAt = new Date();
+      pr.subtotal = totalReturnNet;
+      pr.taxAmount = totalReturnTax;
+      pr.totalAmount = totalReturnNet + totalReturnTax;
       await pr.save(opts);
 
       return pr;

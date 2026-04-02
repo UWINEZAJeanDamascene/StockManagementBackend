@@ -1,6 +1,7 @@
 const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
+const Client = require('../models/Client');
 const PDFDocument = require('pdfkit');
 const {
   notifyQuotationCreated,
@@ -566,13 +567,20 @@ exports.convertToInvoice = async (req, res, next) => {
 
     const invoice = await Invoice.create(invoicePayload);
 
+    // Update client outstanding balance
+    const client = await Client.findById(quotation.client);
+    if (client) {
+      client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
+      await client.save();
+    }
+
     // Update quotation
     quotation.status = 'converted';
     quotation.convertedToInvoice = invoice._id;
     quotation.conversionDate = new Date();
     await quotation.save();
 
-    await invoice.populate('client items.product createdBy');
+     await invoice.populate('client lines.product createdBy');
     res.status(201).json({
       success: true,
       message: 'Quotation converted to invoice successfully',

@@ -108,7 +108,7 @@ exports.getStockTransfers = async (req, res, next) => {
       .populate('fromWarehouse', 'name code')
       .populate('toWarehouse', 'name code')
       .populate('createdBy', 'name')
-      .populate('approvedBy', 'name')
+      .populate('confirmedBy', 'name')
       .populate('receivedBy', 'name')
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -139,7 +139,7 @@ exports.getStockTransfer = async (req, res, next) => {
       .populate('toWarehouse', 'name code')
       .populate('items.product', 'name sku')
       .populate('createdBy', 'name')
-      .populate('approvedBy', 'name')
+      .populate('confirmedBy', 'name')
       .populate('receivedBy', 'name');
 
     if (!transfer) {
@@ -343,17 +343,19 @@ exports.approveStockTransfer = async (req, res, next) => {
         const lineValue = qty * unitCost;
         totalTransferValue += lineValue;
 
+        // Get current stock before modification
+        const prevStock = product.currentStock && product.currentStock.toString ? Number(product.currentStock.toString()) : Number(product.currentStock || 0);
+        const newStock = Math.max(0, prevStock - qty);
+
         // Create transfer out movement
-        const prevSrc = product.currentStock && product.currentStock.toString ? Number(product.currentStock.toString()) : Number(product.currentStock || 0);
-        const newSrc = Math.max(0, prevSrc - qty);
         const outMovement = await StockMovement.create({
           company: companyId,
           product: item.product,
           type: 'out',
           reason: 'transfer_out',
           quantity: qty,
-          previousStock: prevSrc,
-          newStock: newSrc,
+          previousStock: prevStock,
+          newStock: newStock,
           unitCost,
           totalCost: lineValue,
           warehouse: transfer.fromWarehouse,
@@ -367,17 +369,15 @@ exports.approveStockTransfer = async (req, res, next) => {
         });
         createdMovementIds.push(outMovement._id);
 
-        // Create transfer in movement
-        const prevDest = product.currentStock && product.currentStock.toString ? Number(product.currentStock.toString()) : Number(product.currentStock || 0);
-        const newDest = prevDest + qty;
+        // Create transfer in movement (for destination warehouse tracking)
         const inMovement = await StockMovement.create({
           company: companyId,
           product: item.product,
           type: 'in',
           reason: 'transfer_in',
           quantity: qty,
-          previousStock: prevDest,
-          newStock: newDest,
+          previousStock: newStock,
+          newStock: newStock,
           unitCost,
           totalCost: lineValue,
           warehouse: transfer.toWarehouse,
@@ -390,6 +390,10 @@ exports.approveStockTransfer = async (req, res, next) => {
           movementDate: new Date()
         });
         createdMovementIds.push(inMovement._id);
+
+        // Update product stock
+        product.currentStock = newStock;
+        await product.save({ session: trx });
       }
 
       // Resolve inventory accounts for both warehouses (fallback to product inventoryAccount)
@@ -397,12 +401,9 @@ exports.approveStockTransfer = async (req, res, next) => {
       const fromInv = fromWarehouse.inventoryAccount || null;
       const toInv = toWarehouse.inventoryAccount || null;
 
-      // 2.6.3: When source and destination share the same inventory account, no journal entry is posted
-      const postJournal = fromInv !== toInv;
-
-      if (postJournal) {
-        const debitAcct = toInv || (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', defaultInv, { warehouseId: transfer.toWarehouse }));
-        const creditAcct = fromInv || (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', defaultInv, { warehouseId: transfer.fromWarehouse }));
+      // Always post journal entry for stock transfers (accounting standard)
+      const debitAcct = toInv || (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', defaultInv, { warehouseId: transfer.toWarehouse }));
+      const creditAcct = fromInv || (await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', defaultInv, { warehouseId: transfer.fromWarehouse }));
 
         const debitLine = JournalService.createDebitLine(debitAcct, totalTransferValue, `Stock Transfer ${transfer.transferNumber} - to ${toWarehouse.name}`);
         const creditLine = JournalService.createCreditLine(creditAcct, totalTransferValue, `Stock Transfer ${transfer.transferNumber} - from ${fromWarehouse.name}`);
@@ -426,11 +427,10 @@ exports.approveStockTransfer = async (req, res, next) => {
           const je = await JournalService.createEntry(companyId, req.user.id, entryOptions, trx ? { session: trx } : undefined);
           if (je && je._id) transfer.journalEntry = je._id;
         }
-      }
 
       transfer.status = 'in_transit';
-      transfer.approvedBy = req.user.id;
-      transfer.approvedDate = new Date();
+      transfer.confirmedBy = req.user.id;
+      transfer.confirmedAt = new Date();
       await transfer.save(trx ? { session: trx } : undefined);
     }).catch(async (err) => {
       // Manual rollback: delete created movements if journal failed
@@ -611,22 +611,7 @@ exports.completeStockTransfer = async (req, res, next) => {
               });
             }
           } else {
-            // No batches - use Product.currentStock
-            const srcCurrentStock = product.currentStock ? Number(product.currentStock.toString()) : 0;
-            
-            // Deduct from source
-            if (product) {
-              product.currentStock = Math.max(0, srcCurrentStock - qty);
-              await product.save({ session: trx });
-            }
-
-            // Add to destination
-            const destProduct = await Product.findOne({ _id: item.product, company: companyId }).session(trx || undefined);
-            if (destProduct) {
-              const destCurrentStock = destProduct.currentStock ? Number(destProduct.currentStock.toString()) : 0;
-              destProduct.currentStock = destCurrentStock + qty;
-              await destProduct.save({ session: trx });
-            }
+            // No batches - stock was already updated during approval, no action needed here
           }
         }
       }

@@ -11,6 +11,15 @@ const poLineSchema = new mongoose.Schema({
   lineTotal: { type: Number, default: 0, min: 0 }
 }, { _id: true });
 
+const purchaseOrderPaymentSchema = new mongoose.Schema({
+  amount: { type: Number, required: true },
+  paymentMethod: { type: String, enum: ['cash', 'card', 'bank_transfer', 'cheque', 'mobile_money', 'credit'], required: true },
+  reference: String,
+  notes: String,
+  paidDate: { type: Date, default: Date.now },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+}, { _id: true });
+
 const purchaseOrderSchema = new mongoose.Schema({
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
   referenceNo: { type: String, uppercase: true },
@@ -24,6 +33,10 @@ const purchaseOrderSchema = new mongoose.Schema({
   subtotal: { type: Number, default: 0 },
   taxAmount: { type: Number, default: 0 },
   totalAmount: { type: Number, default: 0 },
+  amountPaid: { type: Number, default: 0 },
+  balance: { type: Number, default: 0 },
+  paymentStatus: { type: String, enum: ['unpaid', 'partial', 'paid'], default: 'unpaid' },
+  payments: [purchaseOrderPaymentSchema],
   notes: String,
   approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   approvedAt: Date,

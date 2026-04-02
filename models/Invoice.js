@@ -580,7 +580,7 @@ invoiceSchema.virtual('balance').get(function() {
   return 0;
 });
 invoiceSchema.virtual('currency').get(function() {
-  return this.currencyCode || this.currency;
+  return this.currencyCode || 'USD';
 });
 
 module.exports = mongoose.model('Invoice', invoiceSchema);

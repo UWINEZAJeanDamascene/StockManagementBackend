@@ -109,7 +109,8 @@ exports.getSerialByNumber = async (req, res, next) => {
 exports.createStockSerialNumber = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { serialNo, product, warehouse, grn, batch, unitCost, status, notes } = req.body;
+    const { serialNo, serialNumber, product, warehouse, grn, batch, unitCost, status, notes } = req.body;
+    const sn = (serialNo || serialNumber || '').toString().trim();
 
     // Validate product exists and tracks serial numbers
     const productDoc = await Product.findOne({ _id: product, company: companyId });
@@ -130,7 +131,7 @@ exports.createStockSerialNumber = async (req, res, next) => {
     const existingSerial = await StockSerialNumber.findOne({
       company: companyId,
       product,
-      serialNo: serialNo.toUpperCase()
+      serialNo: sn.toUpperCase()
     });
 
     if (existingSerial) {
@@ -147,7 +148,7 @@ exports.createStockSerialNumber = async (req, res, next) => {
 
     const serial = await StockSerialNumber.create({
       company: companyId,
-      serialNo: serialNo.toUpperCase(),
+      serialNo: sn.toUpperCase(),
       product,
       warehouse,
       grn: grn || null,
@@ -204,9 +205,9 @@ exports.createStockSerialNumbers = async (req, res, next) => {
     }
 
     // Prepare serial number documents
-    const serialDocs = serials.map(sn => ({
+    const serialDocs = serials.map(s => ({
       company: companyId,
-      serialNo: sn.toUpperCase(),
+      serialNo: s.toUpperCase(),
       product,
       warehouse,
       grn: grn || null,

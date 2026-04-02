@@ -145,6 +145,18 @@ exports.updateClient = async (req, res, next) => {
 exports.deleteClient = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    
+    // Check if client has invoices before deleting
+    const Invoice = require('../models/Invoice');
+    const invoiceCount = await Invoice.countDocuments({ client: req.params.id, company: companyId });
+    
+    if (invoiceCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete client with existing invoices'
+      });
+    }
+    
     const client = await Client.findOneAndDelete({ _id: req.params.id, company: companyId });
 
     if (!client) {
@@ -305,33 +317,63 @@ exports.getClientsWithStats = async (req, res, next) => {
         $match: {
           client: { $in: clientIds },
           company: companyId,
-          status: { $in: ['pending', 'partial', 'overdue'] }
+          status: { $in: ['draft', 'confirmed', 'partially_paid'] }
         }
       },
       {
         $group: {
           _id: '$client',
           outstandingCount: { $sum: 1 },
-          totalOutstanding: { $sum: '$balance' }
+          totalOutstanding: { $sum: '$amountOutstanding' }
+        }
+      }
+    ]);
+
+    // Get overdue amounts (invoices with due date in the past, not fully paid or cancelled)
+    const overdueStats = await Invoice.aggregate([
+      {
+        $match: {
+          client: { $in: clientIds },
+          company: companyId,
+          status: { $nin: ['fully_paid', 'cancelled'] },
+          dueDate: { $lt: new Date() }
+        }
+      },
+      {
+        $group: {
+          _id: '$client',
+          overdueAmount: { $sum: '$amountOutstanding' }
         }
       }
     ]);
 
     const statsMap = {};
+    const overdueMap = {};
     invoiceStats.forEach(stat => {
       statsMap[stat._id.toString()] = {
         outstandingCount: stat.outstandingCount,
         totalOutstanding: stat.totalOutstanding
       };
     });
+    overdueStats.forEach(stat => {
+      overdueMap[stat._id.toString()] = stat.overdueAmount;
+    });
 
     // Add outstanding count to each client
     const clientsWithStats = clients.map(client => {
       const stats = statsMap[client._id.toString()] || { outstandingCount: 0, totalOutstanding: 0 };
+      const overdueRaw = overdueMap[client._id.toString()] || 0;
+      const overdue = typeof overdueRaw === 'object' && overdueRaw !== null 
+        ? parseFloat(overdueRaw.toString()) 
+        : overdueRaw;
+      const totalOut = typeof stats.totalOutstanding === 'object' && stats.totalOutstanding !== null 
+        ? parseFloat(stats.totalOutstanding.toString()) 
+        : stats.totalOutstanding;
       return {
         ...client.toObject(),
         outstandingInvoices: stats.outstandingCount,
-        totalOutstanding: stats.totalOutstanding
+        totalOutstanding: totalOut,
+        overdueAmount: overdue
       };
     });
 
@@ -460,9 +502,16 @@ exports.getClientInvoices = async (req, res, next) => {
 
     // Calculate totals
     const allInvoices = await Invoice.find(query);
-    const totalAmount = allInvoices.reduce((sum, inv) => sum + inv.grandTotal, 0);
-    const totalPaid = allInvoices.reduce((sum, inv) => sum + inv.amountPaid, 0);
-    const totalBalance = allInvoices.reduce((sum, inv) => sum + inv.balance, 0);
+    const getVal = (inv, field) => {
+      const raw = inv._doc[field];
+      if (raw && typeof raw === 'object' && raw.toString) {
+        return parseFloat(raw.toString()) || 0;
+      }
+      return raw || 0;
+    };
+    const totalAmount = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'totalAmount'), 0);
+    const totalPaid = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'amountPaid'), 0);
+    const totalBalance = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'amountOutstanding'), 0);
 
     res.json({
       success: true,

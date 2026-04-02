@@ -305,6 +305,7 @@ exports.adjustStock = async (req, res, next) => {
       }
 
       // Create stock movement
+      const unitCost = Number(product.averageCost || 0);
       const movement = await StockMovement.create({
         company: companyId,
         product: productId,
@@ -313,6 +314,9 @@ exports.adjustStock = async (req, res, next) => {
         quantity,
         previousStock,
         newStock,
+        unitCost,
+        totalCost: unitCost * Number(quantity),
+        warehouse: req.body.warehouse || undefined,
         referenceType: 'adjustment',
         notes,
         performedBy: req.user.id,
