@@ -597,6 +597,117 @@ exports.convertToInvoice = async (req, res, next) => {
   }
 };
 
+// @desc    Convert quotation to sales order (NEW WORKFLOW)
+// @route   POST /api/quotations/:id/convert-to-so
+// @access  Private (admin, stock_manager, sales)
+exports.convertToSalesOrder = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { expectedDate, notes, terms } = req.body;
+    
+    const quotation = await Quotation.findOne({ _id: req.params.id, company: companyId })
+      .populate('lines.product');
+
+    if (!quotation) {
+      return res.status(404).json({
+        success: false,
+        error: ERR_QUOTATION_NOT_FOUND,
+        message: 'Quotation not found'
+      });
+    }
+
+    // Check if quotation is expired
+    if (isQuotationExpired(quotation)) {
+      quotation.status = 'expired';
+      await quotation.save();
+      return res.status(409).json({
+        success: false,
+        error: ERR_QUOTATION_EXPIRED,
+        message: 'Expired quotations cannot be converted'
+      });
+    }
+
+    // Check if quotation is rejected
+    if (quotation.status === 'rejected') {
+      return res.status(409).json({
+        success: false,
+        error: ERR_QUOTATION_REJECTED,
+        message: 'Rejected quotations cannot be converted'
+      });
+    }
+
+    // Check if quotation is already converted
+    if (quotation.status === 'converted' || quotation.convertedToSalesOrder || quotation.convertedToInvoice) {
+      return res.status(400).json({
+        success: false,
+        error: ERR_QUOTATION_ALREADY_CONVERTED,
+        message: 'Quotation has already been converted'
+      });
+    }
+
+    // Only accepted quotations can be converted
+    if (quotation.status !== 'accepted') {
+      return res.status(400).json({
+        success: false,
+        error: ERR_INVALID_STATUS_TRANSITION,
+        message: 'Only accepted quotations can be converted to sales order'
+      });
+    }
+
+    const SalesOrder = require('../models/SalesOrder');
+    
+    // Create sales order lines from quotation lines
+    const salesOrderLines = (quotation.lines || []).map(line => ({
+      product: line.product?._id || line.product,
+      description: line.description || (line.product && line.product.name) || '',
+      qty: parseFloat(line.qty || line.quantity || 0),
+      unitPrice: parseFloat(line.unitPrice || 0),
+      discountPct: parseFloat(line.discountPct || line.discount || 0),
+      taxRate: parseFloat(line.taxRate != null ? line.taxRate : (line.product?.taxRate != null ? line.product.taxRate : 0)),
+      taxCode: line.taxCode || line.product?.taxCode || 'A',
+      unit: line.unit || (line.product && line.product.unit) || ''
+    }));
+
+    // Create sales order
+    const salesOrder = await SalesOrder.create({
+      company: companyId,
+      client: quotation.client,
+      quotation: quotation._id,
+      lines: salesOrderLines,
+      orderDate: new Date(),
+      expectedDate: expectedDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days default
+      terms: terms || quotation.terms,
+      notes: notes || quotation.notes,
+      currencyCode: quotation.currencyCode || 'USD',
+      createdBy: req.user.id,
+      status: 'draft' // Start as draft, needs to be confirmed to reserve stock
+    });
+
+    // Update quotation
+    quotation.status = 'converted';
+    quotation.convertedToSalesOrder = salesOrder._id;
+    quotation.conversionDate = new Date();
+    await quotation.save();
+
+    await salesOrder.populate('client lines.product createdBy');
+
+    res.status(201).json({
+      success: true,
+      message: 'Quotation converted to sales order successfully',
+      data: salesOrder
+    });
+
+    // Notify
+    try {
+      await notifyQuotationApproved(companyId, quotation, salesOrder.referenceNo);
+    } catch (e) {
+      console.error('notifyQuotationApproved (convert to SO) failed', e);
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Get quotations for a specific client
 // @route   GET /api/quotations/client/:clientId
 // @access  Private

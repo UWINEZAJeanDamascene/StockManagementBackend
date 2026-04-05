@@ -153,12 +153,19 @@ class ExecutiveDashboardService {
     const chartAccounts = await ChartOfAccounts.find({ company: companyId, isActive: true }).select('code type allow_direct_posting').lean()
     if (!chartAccounts || chartAccounts.length === 0) return 0
 
-    const codeToType = new Map()
-    for (const c of chartAccounts) {
-      // Respect allow_direct_posting when present
-      if (c.allow_direct_posting === false) continue
-      if (c.code) codeToType.set(String(c.code), c.type)
-    }
+      const codeToType = new Map()
+      for (const c of chartAccounts) {
+        // Respect allow_direct_posting when present
+        if (c.allow_direct_posting === false) continue
+        const code = c.code ? String(c.code).trim() : null
+        if (code) {
+          codeToType.set(code, c.type)
+          // also add a normalized variant (strip leading zeros and lowercase)
+          codeToType.set(code.replace(/^0+/, '').toLowerCase(), c.type)
+        }
+        // map by id string too - some journal lines store account _id instead of code
+        if (c._id) codeToType.set(String(c._id), c.type)
+      }
 
     // Allow a small timezone-safe margin so entries created at local midnight
     // aren't excluded when comparing against UTC month boundaries used elsewhere.
@@ -185,14 +192,23 @@ class ExecutiveDashboardService {
     for (const e of entries) {
       const lines = e.lines || []
       for (const l of lines) {
-        const code = l.accountCode == null ? null : String(l.accountCode)
-        const t = codeToType.get(code)
-        if (!t) continue
-        if (t !== accountType) continue
-        const debit = l.debit && l.debit.toString ? parseFloat(l.debit.toString()) : Number(l.debit || 0)
-        const credit = l.credit && l.credit.toString ? parseFloat(l.credit.toString()) : Number(l.credit || 0)
-        totalDr += debit
-        totalCr += credit
+          let code = l.accountCode == null ? null : String(l.accountCode).trim()
+          if (!code) continue
+
+          // try direct match
+          let t = codeToType.get(code)
+          // try normalized match
+          if (!t) t = codeToType.get(code.replace(/^0+/, '').toLowerCase())
+          // try id match (code may be an ObjectId string)
+          if (!t && mongoose.Types.ObjectId.isValid(code)) t = codeToType.get(code)
+
+          if (!t) continue
+          if (t !== accountType) continue
+
+          const debit = l.debit && l.debit.toString ? parseFloat(l.debit.toString()) : Number(l.debit || 0)
+          const credit = l.credit && l.credit.toString ? parseFloat(l.credit.toString()) : Number(l.credit || 0)
+          totalDr += debit
+          totalCr += credit
       }
     }
 
@@ -210,12 +226,17 @@ class ExecutiveDashboardService {
     ])
 
     const cashAccountCodes = [
-      ...banks.map(b => b.ledgerAccountId),
-      ...pettyCash.map(p => p.ledgerAccountId)
-    ].filter(Boolean)
+        ...banks.map(b => b.ledgerAccountId).filter(Boolean),
+        ...pettyCash.map(p => p.ledgerAccountId).filter(Boolean)
+      ].map(c => String(c))
+
 
     // Ensure commonly-used cash account code is included when no chart accounts exist (test data uses '1000')
+    // include common fallback code
     if (!cashAccountCodes.includes('1000')) cashAccountCodes.push('1000')
+
+    // Normalize for matching in aggregation
+    const normalizedCashCodes = cashAccountCodes.map(c => String(c))
 
     if (cashAccountCodes.length === 0) return 0
 
@@ -230,7 +251,7 @@ class ExecutiveDashboardService {
       { $unwind: '$lines' },
       {
         $match: {
-          'lines.accountCode': { $in: cashAccountCodes }
+          'lines.accountCode': { $in: normalizedCashCodes }
         }
       },
       {
@@ -319,7 +340,7 @@ class ExecutiveDashboardService {
     })
       .sort({ date: -1, createdAt: -1 })
       .limit(limit)
-      .select('referenceNo description date sourceType totalDebit totalCredit')
+      .select('entryNumber description date sourceType totalDebit totalCredit')
       .lean()
   }
 }

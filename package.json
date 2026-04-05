@@ -10,7 +10,8 @@
     "drop-category-unique-index": "node scripts/removeCategoryUniqueIndex.js",
     "test": "jest --runInBand",
     "migrate:journal": "node scripts/migrate_journal_engine.js",
-    "seed:platform-admin": "node scripts/seedPlatformAdmin.js"
+    "seed:platform-admin": "node scripts/seedPlatformAdmin.js",
+    "delivery-notes:backfill": "node scripts/backfillDeliveryNotes.js"
   },
   "keywords": [
     "stock",

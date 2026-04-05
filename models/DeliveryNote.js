@@ -5,7 +5,6 @@ const { generateUniqueNumber } = require('./utils/autoIncrement');
 const deliveryNoteLineSchema = new mongoose.Schema({
   invoiceLineId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Invoice.lines'
     // Not required - optional for backwards compatibility
   },
   product: {
@@ -54,6 +53,14 @@ const deliveryNoteLineSchema = new mongoose.Schema({
     type: Number,
     default: 0
   }, // Actual cost consumed - may differ from invoice line estimate
+  unitPrice: {
+    type: Number,
+    default: 0
+  }, // Selling price for customer invoice
+  lineTotal: {
+    type: Number,
+    default: 0
+  }, // unitPrice * qtyToDeliver
   notes: String
 });
 
@@ -81,15 +88,21 @@ const deliveryNoteSchema = new mongoose.Schema({
     uppercase: true
   },
   
-  // References
-  quotation: {
+  // References - Invoice is now optional (new workflow: SO → PickPack → DeliveryNote)
+  salesOrder: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Quotation'
+    ref: 'SalesOrder',
+    default: null
+  },
+  pickPack: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'PickPack',
+    default: null
   },
   invoice: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Invoice',
-    required: true // Module 7: NOT NULL
+    default: null // Changed from required - invoice created after delivery now
   },
   
   // Module 7: Denormalised client for reporting
@@ -106,10 +119,24 @@ const deliveryNoteSchema = new mongoose.Schema({
     required: true
   },
   
+  // Source of delivery - 'pick_pack' for new workflow, 'invoice' for legacy
+  sourceType: {
+    type: String,
+    enum: ['pick_pack', 'invoice', 'manual'],
+    default: 'pick_pack'
+  },
+  
+  quotation: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Quotation',
+    default: null
+  },
+  
   // Supplier (for purchase deliveries - keep for backwards compatibility)
   supplier: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company'
+    ref: 'Company',
+    default: null
   },
   
   // Client details captured at delivery time
@@ -238,6 +265,18 @@ deliveryNoteSchema.pre('save', async function(next) {
   }
   
   next();
+});
+
+// Virtual for grand total (based on unitPrice)
+deliveryNoteSchema.virtual('grandTotal').get(function() {
+  const lineArray = this.lines && this.lines.length > 0 ? this.lines : this.items;
+  if (!lineArray || lineArray.length === 0) return 0;
+  
+  return lineArray.reduce((sum, item) => {
+    const qty = item.qtyToDeliver || item.deliveredQty || 0;
+    const price = item.unitPrice || 0;
+    return sum + (qty * price);
+  }, 0);
 });
 
 // Calculate totals helper

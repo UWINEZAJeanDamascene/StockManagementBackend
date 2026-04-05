@@ -174,6 +174,11 @@ const quotationSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Invoice'
   },
+  // Converted to sales order reference (NEW WORKFLOW)
+  convertedToSalesOrder: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SalesOrder'
+  },
   // Conversion date
   conversionDate: Date
 }, {

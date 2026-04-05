@@ -24,6 +24,9 @@ router.put('/payments/:id', apController.updatePayment);
 // POST /api/ap/payments/:id/post - Post payment
 router.post('/payments/:id/post', apController.postPayment);
 
+// POST /api/ap/payments/:id/save-and-post - Save and post without journal entry
+router.post('/payments/:id/save-and-post', apController.saveAndPostPayment);
+
 // POST /api/ap/payments/:id/reverse - Reverse payment
 router.post('/payments/:id/reverse', apController.reversePayment);
 

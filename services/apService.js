@@ -7,6 +7,7 @@ const { BankAccount } = require('../models/BankAccount');
 const JournalService = require('./journalService');
 const periodService = require('./periodService');
 const cacheService = require('./cacheService');
+const APTrackingService = require('./apTrackingService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { nextSequence } = require('./sequenceService');
 const { aggregateWithTimeout } = require('../utils/mongoAggregation');
@@ -257,17 +258,95 @@ class APService {
     // Calculate unallocated amount
     const unallocatedAmount = amountNum - totalAllocated;
 
-    // Step 3: Update GRN balances for each allocation
-    for (const alloc of allocations) {
-      await this.updateGRNBalanceOnPost(alloc.grn, parseFloat(alloc.amountAllocated));
-    }
+    // Note: GRN balances are already updated when allocations are created via allocateToGRN
+    // Do NOT update them again here to avoid double-counting
 
     // Update payment status
     payment.status = 'posted';
     payment.journalEntry = journalEntry._id;
     payment.postedBy = userId;
     payment.postedAt = new Date();
+    payment.unallocatedAmount = mongoose.Types.Decimal128.fromString(unallocatedAmount.toFixed(2));
     await payment.save();
+
+    // Record in AP Transaction Ledger
+    await APTrackingService.recordPaymentPosted(payment, userId);
+
+    // Invalidate cache
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+    } catch (e) {
+      console.error('Cache invalidation failed:', e);
+    }
+
+    return payment;
+  }
+
+  /**
+   * Save and Post payment without creating journal entry
+   * This changes status from draft to posted but skips journal posting
+   */
+  static async saveAndPostPayment(companyId, userId, paymentId) {
+    const payment = await APPayment.findOne({ _id: paymentId, company: companyId });
+    if (!payment) {
+      throw new Error('Payment not found');
+    }
+
+    if (payment.status !== 'draft') {
+      throw new Error('Only draft payments can be posted');
+    }
+
+    // Check period is open
+    if (await periodService.isDateInClosedPeriod(companyId, payment.paymentDate)) {
+      throw new Error('Target accounting period is closed');
+    }
+
+    // Get allocations for this payment
+    const allocations = await APPaymentAllocation.find({ payment: payment._id });
+
+    // Validate SUM(allocations) <= amount_paid
+    const paymentAmount = parseFloat(payment.amountPaid);
+    let totalAllocated = 0;
+
+    if (allocations.length > 0) {
+      for (const alloc of allocations) {
+        totalAllocated += parseFloat(alloc.amountAllocated);
+
+        // Validate each GRN belongs to same supplier
+        const grn = await GoodsReceivedNote.findById(alloc.grn);
+        if (!grn) {
+          throw new Error('Allocated GRN not found');
+        }
+        if (grn.supplier.toString() !== payment.supplier.toString()) {
+          throw new Error('Allocated GRN must belong to the same supplier as the payment');
+        }
+
+        // Validate allocation <= GRN balance
+        const grnBalance = parseFloat(grn.balance) || 0;
+        const allocAmount = parseFloat(alloc.amountAllocated);
+
+        if (allocAmount > grnBalance) {
+          throw new Error(`Allocation amount ${allocAmount} exceeds GRN balance ${grnBalance}`);
+        }
+      }
+
+      if (totalAllocated > paymentAmount) {
+        throw new Error('Total allocated amount cannot exceed payment amount');
+      }
+    }
+
+    // Calculate unallocated amount
+    const unallocatedAmount = paymentAmount - totalAllocated;
+
+    // Update payment status to posted (NO journal entry created)
+    payment.status = 'posted';
+    payment.postedBy = userId;
+    payment.postedAt = new Date();
+    payment.unallocatedAmount = mongoose.Types.Decimal128.fromString(unallocatedAmount.toFixed(2));
+    await payment.save();
+
+    // Record in AP Transaction Ledger
+    await APTrackingService.recordPaymentPosted(payment, userId);
 
     // Invalidate cache
     try {
@@ -345,6 +424,9 @@ class APService {
     payment.reversalReason = reason || 'Reversed';
     payment.reverseJournalEntry = reverseEntry._id;
     await payment.save();
+
+    // Record in AP Transaction Ledger
+    await APTrackingService.recordPaymentReversed(payment, userId, reason);
 
     // Invalidate cache
     try {
@@ -577,13 +659,19 @@ class APService {
       allocMap[grnId] += parseFloat(alloc.amountAllocated);
     });
 
+    console.log(`[AP Aging] Found ${grns.length} GRNs with outstanding balance`);
+    console.log(`[AP Aging] Date boundaries - today: ${today.toISOString()}, todayMinus1: ${todayMinus1.toISOString()}`);
+
     // Group by supplier
     const supplierData = {};
+    let currentCount = 0, overdueCount = 0;
 
     grns.forEach(grn => {
       // Subtract allocated amounts from balance
       const allocated = allocMap[grn._id.toString()] || 0;
-      const effectiveBalance = (parseFloat(grn.balance) || 0) - allocated;
+      // FIX: Convert Decimal128 to string before parseFloat
+      const balance = grn.balance ? parseFloat(grn.balance.toString()) : 0;
+      const effectiveBalance = balance - allocated;
 
       if (effectiveBalance <= 0) return;
 
@@ -596,14 +684,24 @@ class APService {
       // Per Section 2.4 bucket definitions (same as AR aging)
       if (dueDateOnly >= today) {
         bucket = 'current';
+        currentCount++;
       } else if (dueDateOnly >= todayMinus30 && dueDateOnly <= todayMinus1) {
         bucket = '1-30';
+        overdueCount++;
       } else if (dueDateOnly >= todayMinus60 && dueDateOnly <= todayMinus31) {
         bucket = '31-60';
+        overdueCount++;
       } else if (dueDateOnly >= todayMinus90 && dueDateOnly <= todayMinus61) {
         bucket = '61-90';
+        overdueCount++;
       } else {
         bucket = '90+';
+        overdueCount++;
+      }
+
+      // Debug log for first few GRNs
+      if (currentCount + overdueCount <= 5) {
+        console.log(`[AP Aging] GRN ${grn.referenceNo || grn._id}: dueDate=${dueDateOnly.toISOString()}, bucket=${bucket}, balance=${effectiveBalance.toFixed(2)}`);
       }
 
       const supplierKey = grn.supplier?._id?.toString();
@@ -613,40 +711,39 @@ class APService {
         supplierData[supplierKey] = {
           supplier_id: grn.supplier._id,
           supplier_name: grn.supplier?.name || 'Unknown',
-          not_yet_due: 0,
-          days_1_30: 0,
-          days_31_60: 0,
-          days_61_90: 0,
-          days_90_plus: 0,
+          current: 0,
+          '1-30': 0,
+          '31-60': 0,
+          '61-90': 0,
+          '90+': 0,
           total_outstanding: 0
         };
       }
-
-      // Map bucket to response field names
-      const fieldMap = {
-        'current': 'not_yet_due',
-        '1-30': 'days_1_30',
-        '31-60': 'days_31_60',
-        '61-90': 'days_61_90',
-        '90+': 'days_90_plus'
-      };
-
-      const field = fieldMap[bucket];
-      supplierData[supplierKey][field] += effectiveBalance;
+      // Add to appropriate bucket
+      supplierData[supplierKey][bucket] += effectiveBalance;
       supplierData[supplierKey].total_outstanding += effectiveBalance;
     });
 
     // Format amounts as strings with 2 decimal places
     const result = Object.values(supplierData).map(s => ({
-      supplier_id: s.supplier_id,
-      supplier_name: s.supplier_name,
-      not_yet_due: s.not_yet_due.toFixed(2),
-      days_1_30: s.days_1_30.toFixed(2),
-      days_31_60: s.days_31_60.toFixed(2),
-      days_61_90: s.days_61_90.toFixed(2),
-      days_90_plus: s.days_90_plus.toFixed(2),
-      total_outstanding: s.total_outstanding.toFixed(2)
+      supplier: { _id: s.supplier_id, name: s.supplier_name },
+      current: s.current.toFixed(2),
+      '1-30': s['1-30'].toFixed(2),
+      '31-60': s['31-60'].toFixed(2),
+      '61-90': s['61-90'].toFixed(2),
+      '90+': s['90+'].toFixed(2),
+      totalBalance: s.total_outstanding.toFixed(2)
     }));
+
+    // Calculate summary for debug
+    const totals = result.reduce((acc, r) => ({
+      current: acc.current + parseFloat(r.current),
+      '1-30': acc['1-30'] + parseFloat(r['1-30']),
+      '31-60': acc['31-60'] + parseFloat(r['31-60']),
+      '61-90': acc['61-90'] + parseFloat(r['61-90']),
+      '90+': acc['90+'] + parseFloat(r['90+'])
+    }), { current: 0, '1-30': 0, '31-60': 0, '61-90': 0, '90+': 0 });
+    console.log(`[AP Aging] Summary - current: ${totals.current.toFixed(2)}, 1-30: ${totals['1-30'].toFixed(2)}, 31-60: ${totals['31-60'].toFixed(2)}, 61-90: ${totals['61-90'].toFixed(2)}, 90+: ${totals['90+'].toFixed(2)}`);
 
     return {
       success: true,

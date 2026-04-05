@@ -5,7 +5,6 @@ const { generateUniqueNumber } = require('./utils/autoIncrement');
 const creditNoteLineSchema = new mongoose.Schema({
   invoiceLineId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Invoice.lines',
     required: true
   },
   product: {

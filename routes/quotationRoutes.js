@@ -11,6 +11,7 @@ const {
   rejectQuotation,
   approveQuotation,
   convertToInvoice,
+  convertToSalesOrder,
   getClientQuotations,
   getProductQuotations,
   generateQuotationPDF
@@ -38,9 +39,11 @@ router.post('/:id/accept', authorize('admin'), logAction('quotation'), acceptQuo
 router.post('/:id/reject', authorize('admin'), logAction('quotation'), rejectQuotation);
 // Deprecated - kept for backward compatibility
 router.put('/:id/approve', authorize('admin'), logAction('quotation'), approveQuotation);
-router.post('/:id/convert', authorize('admin', 'sales'), logAction('quotation'), convertToInvoice);
+router.post('/:id/convert', authorize('admin', 'sales'), logAction('quotation'), convertToSalesOrder);
 // Old convert route (kept for backward compatibility)
 router.post('/:id/convert-to-invoice', authorize('admin', 'sales'), logAction('quotation'), convertToInvoice);
+// NEW WORKFLOW: Convert to Sales Order
+router.post('/:id/convert-to-so', authorize('admin', 'sales'), logAction('quotation'), convertToSalesOrder);
 
 router.get('/client/:clientId', getClientQuotations);
 router.get('/product/:productId', getProductQuotations);

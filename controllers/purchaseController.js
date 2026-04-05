@@ -377,8 +377,9 @@ exports.receivePurchase = async (req, res, next) => {
 
     // Update supplier stats (supplier was fetched above)
     if (supplier) {
-      supplier.totalPurchases += purchase.roundedAmount;
-      supplier.outstandingBalance += purchase.roundedAmount;
+      const roundedAmount = parseFloat(purchase.roundedAmount) || 0;
+      supplier.totalPurchases += roundedAmount;
+      supplier.outstandingBalance += roundedAmount;
       supplier.lastPurchaseDate = new Date();
       await supplier.save();
     }
@@ -406,7 +407,17 @@ exports.receivePurchase = async (req, res, next) => {
 exports.recordPayment = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { amount, paymentMethod, reference, notes, bankAccountId } = req.body;
+    const { amount: amountRaw, paymentMethod, reference, notes, bankAccountId } = req.body;
+    
+    // Convert amount to number to prevent validation errors
+    const amount = parseFloat(amountRaw);
+    
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment amount'
+      });
+    }
 
     const purchase = await Purchase.findOne({ _id: req.params.id, company: companyId })
       .populate('items.product');
@@ -530,8 +541,7 @@ exports.recordPayment = async (req, res, next) => {
 
     // Update supplier stats (supplier was fetched earlier)
     if (supplier) {
-      supplier.outstandingBalance -= amount;
-      if (supplier.outstandingBalance < 0) supplier.outstandingBalance = 0;
+      supplier.outstandingBalance = Math.max(0, (parseFloat(supplier.outstandingBalance) || 0) - amount);
       // Update last purchase date if this is the first payment or auto-received
       if (purchase.stockAdded || (!purchase.stockAdded && purchase.status === 'draft' && (paymentMethod === 'cash' || paymentMethod === 'card'))) {
         supplier.lastPurchaseDate = new Date();

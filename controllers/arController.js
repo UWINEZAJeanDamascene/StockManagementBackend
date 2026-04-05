@@ -134,7 +134,7 @@ exports.listReceipts = async (req, res, next) => {
 
     const receipts = await ARReceipt.find(filter)
       .populate('client', 'name code')
-      .populate('bankAccount', 'accountName accountCode')
+      .populate('bankAccount', 'name accountNumber accountCode')
       .populate('postedBy', 'name')
       .populate('createdBy', 'name')
       .sort({ createdAt: -1 });
@@ -159,7 +159,7 @@ exports.getReceipt = async (req, res, next) => {
 
     const receipt = await ARReceipt.findOne({ _id: id, company: companyId })
       .populate('client', 'name code contact')
-      .populate('bankAccount', 'accountName accountCode')
+      .populate('bankAccount', 'name accountNumber accountCode')
       .populate('postedBy', 'name')
       .populate('createdBy', 'name')
       .populate('journalEntry');

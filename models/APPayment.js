@@ -131,6 +131,15 @@ const apPaymentSchema = new mongoose.Schema({
     default: null
   },
   
+  // Unallocated amount (for payments not fully allocated to GRNs)
+  unallocatedAmount: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: function(value) {
+      return value ? parseFloat(value.toString()) : 0;
+    }
+  },
+  
   // Company (tenant)
   company: {
     type: mongoose.Schema.Types.ObjectId,

@@ -1,0 +1,720 @@
+const ARTransactionLedger = require('../models/ARTransactionLedger');
+const Invoice = require('../models/Invoice');
+const Client = require('../models/Client');
+const ARReceipt = require('../models/ARReceipt');
+const ARReceiptAllocation = require('../models/ARReceiptAllocation');
+
+/**
+ * AR Tracking Service
+ * 
+ * Centralized service for tracking all Accounts Receivable movements.
+ * Ensures complete audit trail and data integrity for all AR transactions.
+ */
+class ARTrackingService {
+
+  /**
+   * Record an invoice creation (when invoice is confirmed)
+   * This INCREASES AR
+   */
+  static async recordInvoiceCreated(invoice, userId, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(invoice.client).session(session || null);
+      if (!client) {
+        throw new Error('Client not found for invoice');
+      }
+
+      const invoiceAmount = parseFloat(invoice.roundedAmount || invoice.totalAmount || invoice.total || 0);
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = currentClientBalance + invoiceAmount;
+
+      const transaction = new ARTransactionLedger({
+        company: invoice.company,
+        client: invoice.client,
+        invoice: invoice._id,
+        transactionType: 'invoice_created',
+        transactionDate: invoice.confirmedDate || invoice.invoiceDate || new Date(),
+        referenceNo: invoice.referenceNo || invoice.invoiceNumber,
+        description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} created - Amount: ${invoiceAmount.toFixed(2)}`,
+        amount: invoiceAmount,
+        direction: 'increase',
+        invoiceBalanceAfter: invoiceAmount,
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'invoice',
+        sourceId: invoice._id,
+        sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+        createdBy: userId,
+        fiscalYear: new Date().getFullYear(),
+        accountingPeriod: this._getAccountingPeriod(invoice.invoiceDate)
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordInvoiceCreated error:', error);
+      // Don't throw - we don't want to block the main operation
+      return null;
+    }
+  }
+
+  /**
+   * Record an invoice cancellation
+   * This DECREASES AR
+   */
+  static async recordInvoiceCancelled(invoice, userId, reason, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(invoice.client).session(session || null);
+      if (!client) return null;
+
+      const invoiceAmount = parseFloat(invoice.roundedAmount || invoice.totalAmount || invoice.total || 0);
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = Math.max(0, currentClientBalance - invoiceAmount);
+
+      const transaction = new ARTransactionLedger({
+        company: invoice.company,
+        client: invoice.client,
+        invoice: invoice._id,
+        transactionType: 'invoice_cancelled',
+        transactionDate: new Date(),
+        referenceNo: invoice.referenceNo || invoice.invoiceNumber,
+        description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled - Reason: ${reason || 'Not specified'}`,
+        amount: invoiceAmount,
+        direction: 'decrease',
+        invoiceBalanceAfter: 0,
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'invoice',
+        sourceId: invoice._id,
+        sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+        createdBy: userId,
+        metadata: {
+          adjustmentReason: reason
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordInvoiceCancelled error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a receipt posting
+   * This DECREASES AR
+   */
+  static async recordReceiptPosted(receipt, allocations, userId, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(receipt.client).session(session || null);
+      if (!client) return null;
+
+      const receiptAmount = parseFloat(receipt.amountReceived) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = Math.max(0, currentClientBalance - receiptAmount);
+
+      // Create main receipt transaction
+      const transaction = new ARTransactionLedger({
+        company: receipt.company,
+        client: receipt.client,
+        transactionType: 'receipt_posted',
+        transactionDate: receipt.receiptDate || new Date(),
+        referenceNo: receipt.referenceNo || receipt.reference,
+        description: `Receipt ${receipt.referenceNo || receipt.reference} posted - Payment: ${receiptAmount.toFixed(2)}`,
+        amount: receiptAmount,
+        direction: 'decrease',
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'ar_receipt',
+        sourceId: receipt._id,
+        sourceReference: receipt.referenceNo || receipt.reference,
+        createdBy: userId,
+        reconciliationStatus: 'verified', // Auto-verified since posted through normal workflow
+        metadata: {
+          paymentMethod: receipt.paymentMethod
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      // Create allocation transactions for each invoice
+      if (allocations && allocations.length > 0) {
+        for (const allocation of allocations) {
+          const invoice = await Invoice.findById(allocation.invoice).session(session || null);
+          if (invoice) {
+            const allocAmount = parseFloat(allocation.amountAllocated) || 0;
+            const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+            const newInvoiceBalance = Math.max(0, currentInvoiceBalance - allocAmount);
+
+            const allocTransaction = new ARTransactionLedger({
+              company: receipt.company,
+              client: receipt.client,
+              invoice: invoice._id,
+              transactionType: 'allocation_made',
+              transactionDate: receipt.receiptDate || new Date(),
+              referenceNo: receipt.referenceNo || receipt.reference,
+              description: `Allocation to Invoice ${invoice.referenceNo || invoice.invoiceNumber}: ${allocAmount.toFixed(2)}`,
+              amount: allocAmount,
+              direction: 'decrease',
+              invoiceBalanceAfter: newInvoiceBalance,
+              clientBalanceAfter: newClientBalance,
+              sourceType: 'ar_receipt',
+              sourceId: receipt._id,
+              sourceReference: receipt.referenceNo || receipt.reference,
+              createdBy: userId,
+              reconciliationStatus: 'verified' // Auto-verified since posted through normal workflow
+            });
+
+            if (session) {
+              await allocTransaction.save({ session });
+            } else {
+              await allocTransaction.save();
+            }
+          }
+        }
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordReceiptPosted error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a receipt reversal
+   * This INCREASES AR
+   */
+  static async recordReceiptReversed(receipt, allocations, userId, reason, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(receipt.client).session(session || null);
+      if (!client) return null;
+
+      const receiptAmount = parseFloat(receipt.amountReceived) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = currentClientBalance + receiptAmount;
+
+      const transaction = new ARTransactionLedger({
+        company: receipt.company,
+        client: receipt.client,
+        transactionType: 'receipt_reversed',
+        transactionDate: new Date(),
+        referenceNo: receipt.referenceNo || receipt.reference,
+        description: `Receipt ${receipt.referenceNo || receipt.reference} reversed - Reason: ${reason || 'Not specified'}`,
+        amount: receiptAmount,
+        direction: 'increase',
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'ar_receipt',
+        sourceId: receipt._id,
+        sourceReference: receipt.referenceNo || receipt.reference,
+        createdBy: userId,
+        metadata: {
+          adjustmentReason: reason
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      // Record allocation removals
+      if (allocations && allocations.length > 0) {
+        for (const allocation of allocations) {
+          const invoice = await Invoice.findById(allocation.invoice).session(session || null);
+          if (invoice) {
+            const allocAmount = parseFloat(allocation.amountAllocated) || 0;
+            const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+            const newInvoiceBalance = currentInvoiceBalance + allocAmount;
+
+            const allocTransaction = new ARTransactionLedger({
+              company: receipt.company,
+              client: receipt.client,
+              invoice: invoice._id,
+              transactionType: 'allocation_removed',
+              transactionDate: new Date(),
+              referenceNo: receipt.referenceNo || receipt.reference,
+              description: `Allocation reversed for Invoice ${invoice.referenceNo || invoice.invoiceNumber}: ${allocAmount.toFixed(2)}`,
+              amount: allocAmount,
+              direction: 'increase',
+              invoiceBalanceAfter: newInvoiceBalance,
+              clientBalanceAfter: newClientBalance,
+              sourceType: 'ar_receipt',
+              sourceId: receipt._id,
+              sourceReference: receipt.referenceNo || receipt.reference,
+              createdBy: userId
+            });
+
+            if (session) {
+              await allocTransaction.save({ session });
+            } else {
+              await allocTransaction.save();
+            }
+          }
+        }
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordReceiptReversed error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a credit note application
+   * This DECREASES AR
+   */
+  static async recordCreditNoteApplied(creditNote, invoice, amount, userId, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(creditNote.client).session(session || null);
+      if (!client) return null;
+
+      const creditAmount = parseFloat(amount) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = Math.max(0, currentClientBalance - creditAmount);
+
+      const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+      const newInvoiceBalance = Math.max(0, currentInvoiceBalance - creditAmount);
+
+      const transaction = new ARTransactionLedger({
+        company: creditNote.company,
+        client: creditNote.client,
+        invoice: invoice._id,
+        transactionType: 'credit_note_applied',
+        transactionDate: new Date(),
+        referenceNo: creditNote.creditNoteNumber || creditNote.referenceNo,
+        description: `Credit Note ${creditNote.creditNoteNumber || creditNote.referenceNo} applied to Invoice ${invoice.referenceNo || invoice.invoiceNumber}: ${creditAmount.toFixed(2)}`,
+        amount: creditAmount,
+        direction: 'decrease',
+        invoiceBalanceAfter: newInvoiceBalance,
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'credit_note',
+        sourceId: creditNote._id,
+        sourceReference: creditNote.creditNoteNumber || creditNote.referenceNo,
+        createdBy: userId,
+        metadata: {
+          creditNoteNumber: creditNote.creditNoteNumber || creditNote.referenceNo
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordCreditNoteApplied error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a bad debt write-off
+   * This DECREASES AR
+   */
+  static async recordBadDebtWriteoff(writeoff, invoice, userId, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(writeoff.client).session(session || null);
+      if (!client) return null;
+
+      const writeoffAmount = parseFloat(writeoff.amount) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = Math.max(0, currentClientBalance - writeoffAmount);
+
+      const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+      const newInvoiceBalance = Math.max(0, currentInvoiceBalance - writeoffAmount);
+
+      const transaction = new ARTransactionLedger({
+        company: writeoff.company,
+        client: writeoff.client,
+        invoice: invoice._id,
+        transactionType: 'bad_debt_writeoff',
+        transactionDate: writeoff.writeoffDate || new Date(),
+        referenceNo: writeoff.reference || writeoff.referenceNo,
+        description: `Bad Debt Write-off for Invoice ${invoice.referenceNo || invoice.invoiceNumber}: ${writeoffAmount.toFixed(2)}`,
+        amount: writeoffAmount,
+        direction: 'decrease',
+        invoiceBalanceAfter: newInvoiceBalance,
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'bad_debt_writeoff',
+        sourceId: writeoff._id,
+        sourceReference: writeoff.reference || writeoff.referenceNo,
+        createdBy: userId,
+        metadata: {
+          badDebtReason: writeoff.reason
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordBadDebtWriteoff error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a bad debt reversal
+   * This INCREASES AR
+   */
+  static async recordBadDebtReversed(writeoff, invoice, userId, reason, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(writeoff.client).session(session || null);
+      if (!client) return null;
+
+      const amount = parseFloat(writeoff.amount) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = currentClientBalance + amount;
+
+      const transaction = new ARTransactionLedger({
+        company: writeoff.company,
+        client: writeoff.client,
+        invoice: invoice._id,
+        transactionType: 'bad_debt_reversed',
+        transactionDate: new Date(),
+        referenceNo: writeoff.reference || writeoff.referenceNo,
+        description: `Bad Debt Reversal for Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Reason: ${reason || 'Not specified'}`,
+        amount: amount,
+        direction: 'increase',
+        invoiceBalanceAfter: amount, // Invoice is restored to this amount
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'bad_debt_writeoff',
+        sourceId: writeoff._id,
+        sourceReference: writeoff.reference || writeoff.referenceNo,
+        createdBy: userId,
+        metadata: {
+          adjustmentReason: reason
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordBadDebtReversed error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Record a legacy payment (from invoiceController.recordPayment)
+   * This DECREASES AR
+   */
+  static async recordPayment(invoice, amount, paymentMethod, userId, options = {}) {
+    try {
+      const { session } = options;
+      
+      const client = await Client.findById(invoice.client).session(session || null);
+      if (!client) return null;
+
+      const paymentAmount = parseFloat(amount) || 0;
+      const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
+      const newClientBalance = Math.max(0, currentClientBalance - paymentAmount);
+
+      const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+      const newInvoiceBalance = Math.max(0, currentInvoiceBalance - paymentAmount);
+
+      const transaction = new ARTransactionLedger({
+        company: invoice.company,
+        client: invoice.client,
+        invoice: invoice._id,
+        transactionType: 'payment_recorded',
+        transactionDate: new Date(),
+        referenceNo: invoice.referenceNo || invoice.invoiceNumber,
+        description: `Payment recorded for Invoice ${invoice.referenceNo || invoice.invoiceNumber}: ${paymentAmount.toFixed(2)}`,
+        amount: paymentAmount,
+        direction: 'decrease',
+        invoiceBalanceAfter: newInvoiceBalance,
+        clientBalanceAfter: newClientBalance,
+        sourceType: 'invoice',
+        sourceId: invoice._id,
+        sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+        createdBy: userId,
+        metadata: {
+          paymentMethod: paymentMethod
+        }
+      });
+
+      if (session) {
+        await transaction.save({ session });
+      } else {
+        await transaction.save();
+      }
+
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordPayment error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get AR summary for a client
+   */
+  static async getClientARSummary(companyId, clientId) {
+    try {
+      const summary = await ARTransactionLedger.aggregate([
+        {
+          $match: {
+            company: new mongoose.Types.ObjectId(companyId),
+            client: new mongoose.Types.ObjectId(clientId)
+          }
+        },
+        {
+          $group: {
+            _id: '$transactionType',
+            count: { $sum: 1 },
+            totalAmount: { $sum: '$amount' },
+            lastTransaction: { $max: '$transactionDate' }
+          }
+        }
+      ]);
+
+      const currentBalance = await this.getCurrentClientBalance(companyId, clientId);
+
+      return {
+        currentBalance,
+        transactionSummary: summary,
+        totalTransactions: summary.reduce((sum, s) => sum + s.count, 0)
+      };
+    } catch (error) {
+      console.error('ARTrackingService.getClientARSummary error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get current client balance from ledger
+   */
+  static async getCurrentClientBalance(companyId, clientId) {
+    try {
+      const lastTransaction = await ARTransactionLedger.findOne({
+        company: companyId,
+        client: clientId
+      }).sort({ transactionDate: -1, createdAt: -1 });
+
+      return lastTransaction ? parseFloat(lastTransaction.clientBalanceAfter) || 0 : 0;
+    } catch (error) {
+      console.error('ARTrackingService.getCurrentClientBalance error:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Get current invoice balance from ledger
+   */
+  static async getCurrentInvoiceBalance(companyId, invoiceId) {
+    try {
+      const lastTransaction = await ARTransactionLedger.findOne({
+        company: companyId,
+        invoice: invoiceId
+      }).sort({ transactionDate: -1, createdAt: -1 });
+
+      return lastTransaction ? parseFloat(lastTransaction.invoiceBalanceAfter) || 0 : 0;
+    } catch (error) {
+      console.error('ARTrackingService.getCurrentInvoiceBalance error:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Verify data integrity - compare ledger balances with actual document balances
+   */
+  static async verifyIntegrity(companyId, options = {}) {
+    const { clientId, invoiceId, startDate, endDate } = options;
+    
+    const discrepancies = [];
+
+    try {
+      // Build query for transactions to verify
+      const query = { company: new mongoose.Types.ObjectId(companyId) };
+      if (clientId) query.client = new mongoose.Types.ObjectId(clientId);
+      if (startDate || endDate) {
+        query.transactionDate = {};
+        if (startDate) query.transactionDate.$gte = new Date(startDate);
+        if (endDate) query.transactionDate.$lte = new Date(endDate);
+      }
+
+      // Get all unique invoices from transactions
+      const invoiceIds = await ARTransactionLedger.distinct('invoice', query);
+      
+      for (const invId of invoiceIds) {
+        if (!invId) continue;
+
+        const ledgerBalance = await this.getCurrentInvoiceBalance(companyId, invId);
+        const invoice = await Invoice.findById(invId);
+        
+        if (invoice) {
+          const actualBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+          
+          if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
+            discrepancies.push({
+              type: 'invoice',
+              id: invId,
+              reference: invoice.referenceNo || invoice.invoiceNumber,
+              ledgerBalance,
+              actualBalance,
+              difference: ledgerBalance - actualBalance
+            });
+          }
+        }
+      }
+
+      // Get all unique clients from transactions
+      const clientIds = await ARTransactionLedger.distinct('client', query);
+      
+      for (const clId of clientIds) {
+        const ledgerBalance = await this.getCurrentClientBalance(companyId, clId);
+        const client = await Client.findById(clId);
+        
+        if (client) {
+          const actualBalance = parseFloat(client.outstandingBalance) || 0;
+          
+          if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
+            discrepancies.push({
+              type: 'client',
+              id: clId,
+              name: client.name,
+              ledgerBalance,
+              actualBalance,
+              difference: ledgerBalance - actualBalance
+            });
+          }
+        }
+      }
+
+      return {
+        verified: discrepancies.length === 0,
+        discrepancies,
+        totalChecked: invoiceIds.length + clientIds.length
+      };
+    } catch (error) {
+      console.error('ARTrackingService.verifyIntegrity error:', error);
+      return {
+        verified: false,
+        error: error.message,
+        discrepancies: []
+      };
+    }
+  }
+
+  /**
+   * Reconcile and correct discrepancies
+   */
+  static async reconcileAndCorrect(companyId, userId, options = {}) {
+    const verification = await this.verifyIntegrity(companyId, options);
+    
+    if (verification.verified) {
+      // No discrepancies found - mark all pending transactions as verified
+      const updateResult = await ARTransactionLedger.updateMany(
+        { 
+          company: new mongoose.Types.ObjectId(companyId),
+          reconciliationStatus: 'pending'
+        },
+        {
+          reconciliationStatus: 'verified',
+          $set: { verifiedAt: new Date() }
+        }
+      );
+      return { 
+        corrected: 0, 
+        verified: updateResult.modifiedCount || 0,
+        message: `No discrepancies found. ${updateResult.modifiedCount || 0} transactions marked as verified.` 
+      };
+    }
+
+    let corrected = 0;
+
+    for (const disc of verification.discrepancies) {
+      try {
+        if (disc.type === 'client') {
+          // Update client balance to match ledger
+          await Client.findByIdAndUpdate(disc.id, {
+            outstandingBalance: disc.ledgerBalance
+          });
+          corrected++;
+        } else if (disc.type === 'invoice') {
+          // Create a correction transaction
+          const correction = new ARTransactionLedger({
+            company: companyId,
+            client: (await Invoice.findById(disc.id))?.client,
+            invoice: disc.id,
+            transactionType: 'system_correction',
+            transactionDate: new Date(),
+            referenceNo: disc.reference,
+            description: `System correction: Balance adjusted from ${disc.actualBalance.toFixed(2)} to ${disc.ledgerBalance.toFixed(2)}`,
+            amount: Math.abs(disc.difference),
+            direction: disc.difference > 0 ? 'increase' : 'decrease',
+            invoiceBalanceAfter: disc.ledgerBalance,
+            sourceType: 'system',
+            sourceId: disc.id,
+            createdBy: userId,
+            reconciliationStatus: 'corrected',
+            discrepancyDetails: {
+              expectedBalance: disc.ledgerBalance,
+              actualBalance: disc.actualBalance,
+              difference: disc.difference,
+              detectedAt: new Date(),
+              resolvedAt: new Date(),
+              resolutionNotes: 'Auto-corrected by system reconciliation'
+            }
+          });
+          await correction.save();
+          corrected++;
+        }
+      } catch (error) {
+        console.error('Error correcting discrepancy:', error);
+      }
+    }
+
+    return { corrected, message: `Corrected ${corrected} discrepancies` };
+  }
+
+  /**
+   * Helper: Get accounting period string (YYYY-MM)
+   */
+  static _getAccountingPeriod(date) {
+    const d = date ? new Date(date) : new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+}
+
+module.exports = ARTrackingService;

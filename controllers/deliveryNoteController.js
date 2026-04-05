@@ -1,34 +1,117 @@
 // Module 7 - Error Codes
-const mongoose = require('mongoose');
-const DeliveryNote = require('../models/DeliveryNote');
-const Quotation = require('../models/Quotation');
-const Invoice = require('../models/Invoice');
-const Product = require('../models/Product');
-const StockMovement = require('../models/StockMovement');
-const InventoryBatch = require('../models/InventoryBatch');
-const StockBatch = require('../models/StockBatch');
-const StockSerialNumber = require('../models/StockSerialNumber');
-const Company = require('../models/Company');
-const PDFDocument = require('pdfkit');
-const JournalService = require('../services/journalService');
-const { runInTransaction } = require('../services/transactionService');
+const mongoose = require("mongoose");
+const DeliveryNote = require("../models/DeliveryNote");
+const Quotation = require("../models/Quotation");
+const Invoice = require("../models/Invoice");
+const Product = require("../models/Product");
+const StockMovement = require("../models/StockMovement");
+const InventoryBatch = require("../models/InventoryBatch");
+const StockBatch = require("../models/StockBatch");
+const StockSerialNumber = require("../models/StockSerialNumber");
+const Company = require("../models/Company");
+const PDFDocument = require("pdfkit");
+const JournalService = require("../services/journalService");
+const { runInTransaction } = require("../services/transactionService");
+const StockLevel = require("../models/StockLevel");
 
-const ERR_DELIVERY_NOT_FOUND = 'ERR_DELIVERY_NOT_FOUND';
-const ERR_DELIVERY_CONFIRMED = 'ERR_DELIVERY_CONFIRMED';
-const ERR_DELIVERY_CANCELLED = 'ERR_DELIVERY_CANCELLED';
-const ERR_INVOICE_NOT_CONFIRMED = 'ERR_INVOICE_NOT_CONFIRMED';
-const ERR_INVOICE_CANCELLED = 'ERR_INVOICE_CANCELLED';
-const ERR_INSUFFICIENT_STOCK = 'ERR_INSUFFICIENT_STOCK';
-const ERR_BATCH_QUARANTINED = 'ERR_BATCH_QUARANTINED';
-const ERR_BATCH_NOT_FOUND = 'ERR_BATCH_NOT_FOUND';
-const ERR_SERIAL_NOT_IN_STOCK = 'ERR_SERIAL_NOT_IN_STOCK';
-const ERR_SERIAL_WRONG_WAREHOUSE = 'ERR_SERIAL_WRONG_WAREHOUSE';
-const ERR_EXCEEDS_INVOICE_QTY = 'ERR_EXCEEDS_INVOICE_QTY';
-const ERR_COST_LOOKUP_FAILED = 'ERR_COST_LOOKUP_FAILED';
-const ERR_COGS_ADJUSTMENT_FAILED = 'ERR_COGS_ADJUSTMENT_FAILED';
+const ERR_DELIVERY_NOT_FOUND = "ERR_DELIVERY_NOT_FOUND";
+const ERR_DELIVERY_CONFIRMED = "ERR_DELIVERY_CONFIRMED";
+const ERR_DELIVERY_CANCELLED = "ERR_DELIVERY_CANCELLED";
+const ERR_INVOICE_NOT_CONFIRMED = "ERR_INVOICE_NOT_CONFIRMED";
+const ERR_INVOICE_CANCELLED = "ERR_INVOICE_CANCELLED";
+const ERR_INSUFFICIENT_STOCK = "ERR_INSUFFICIENT_STOCK";
+const ERR_BATCH_QUARANTINED = "ERR_BATCH_QUARANTINED";
+const ERR_BATCH_NOT_FOUND = "ERR_BATCH_NOT_FOUND";
+const ERR_SERIAL_NOT_IN_STOCK = "ERR_SERIAL_NOT_IN_STOCK";
+const ERR_SERIAL_WRONG_WAREHOUSE = "ERR_SERIAL_WRONG_WAREHOUSE";
+const ERR_EXCEEDS_INVOICE_QTY = "ERR_EXCEEDS_INVOICE_QTY";
+const ERR_COST_LOOKUP_FAILED = "ERR_COST_LOOKUP_FAILED";
+const ERR_COGS_ADJUSTMENT_FAILED = "ERR_COGS_ADJUSTMENT_FAILED";
 
 // COGS adjustment tolerance (0.01 = 1 cent)
 const COGS_TOLERANCE = 0.01;
+
+/**
+ * Enhance delivery note objects with computed fields expected by frontend
+ * @param {Array|Object} deliveryNotes - Single delivery note or array
+ * @returns {Array|Object} Enhanced delivery note(s)
+ */
+function enhanceDeliveryNotes(deliveryNotes) {
+  if (!deliveryNotes) return deliveryNotes;
+
+  const isArray = Array.isArray(deliveryNotes);
+  const notes = isArray ? deliveryNotes : [deliveryNotes];
+
+  for (const note of notes) {
+    if (!note) continue;
+
+    // Get lines array (use lines, fallback to items for legacy)
+    const lines =
+      note.lines && note.lines.length > 0 ? note.lines : note.items || [];
+
+    // Compute grandTotal: sum of unitCost * qtyToDeliver (or deliveredQty if qtyToDeliver not set)
+    let grandTotal = 0;
+    if (Array.isArray(lines)) {
+      for (const line of lines) {
+        const qty =
+          line.qtyToDeliver !== undefined
+            ? line.qtyToDeliver
+            : line.deliveredQty || 0;
+        const unitCost = line.unitCost || 0;
+        const qtyNum = Number(qty) || 0;
+        const unitCostNum = Number(unitCost) || 0;
+        grandTotal += qtyNum * unitCostNum;
+      }
+    }
+    // Round to 2 decimal places
+    grandTotal = Math.round(grandTotal * 100) / 100;
+    note.grandTotal = grandTotal;
+
+    // Items count
+    note.itemsCount = Array.isArray(lines) ? lines.length : 0;
+
+    // Ensure legacy `items` shape is available for frontend (backwards compatibility)
+    if (
+      (!note.items || note.items.length === 0) &&
+      Array.isArray(lines) &&
+      lines.length > 0
+    ) {
+      try {
+        note.items = lines.map((l) => ({
+          _id: l._id,
+          product: l.product || null,
+          description: l.productName || l.description || "",
+          // Prefer qtyToDeliver, then orderedQty, then quantity, then deliveredQty
+          quantity:
+            l.qtyToDeliver !== undefined && l.qtyToDeliver !== null
+              ? Number(l.qtyToDeliver)
+              : l.orderedQty !== undefined && l.orderedQty !== null
+                ? Number(l.orderedQty)
+                : l.quantity !== undefined && l.quantity !== null
+                  ? Number(l.quantity)
+                  : l.deliveredQty !== undefined && l.deliveredQty !== null
+                    ? Number(l.deliveredQty)
+                    : 0,
+          unit: l.unit || (l.product && l.product.unit) || "pcs",
+        }));
+      } catch (e) {
+        // Non-fatal - leave items as-is if mapping fails
+      }
+    }
+
+    // Tracking number alias (trackingNo -> trackingNumber)
+    note.trackingNumber = note.trackingNo;
+
+    // Currency code: Prefer invoice.currencyCode, else default to 'USD'
+    if (note.invoice && note.invoice.currencyCode) {
+      note.currencyCode = note.invoice.currencyCode;
+    } else {
+      note.currencyCode = "USD";
+    }
+  }
+
+  return isArray ? notes : notes[0];
+}
 
 // @desc    Get all delivery notes (Module 7 filters)
 // @route   GET /api/delivery-notes
@@ -36,17 +119,17 @@ const COGS_TOLERANCE = 0.01;
 exports.getDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      page = 1, 
-      limit = 20, 
-      status, 
-      clientId, 
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      clientId,
       invoiceId,
       warehouseId,
-      dateFrom, 
-      dateTo 
+      dateFrom,
+      dateTo,
     } = req.query;
-    
+
     const query = { company: companyId };
 
     if (status) {
@@ -73,18 +156,21 @@ exports.getDeliveryNotes = async (req, res, next) => {
     }
 
     const total = await DeliveryNote.countDocuments(query);
-    const deliveryNotes = await DeliveryNote.find(query)
-      .populate('client', 'name code contact taxId')
-      .populate('quotation', 'quotationNumber')
-      .populate('invoice', 'invoiceNumber status')
-      .populate('warehouse', 'name code')
-      .populate('lines.product', 'name sku unit')
-      .populate('items.product', 'name sku unit') // Legacy
-      .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
+    let deliveryNotes = await DeliveryNote.find(query)
+      .populate("client", "name code contact taxId")
+      .populate("quotation", "referenceNo")
+      .populate("invoice", "referenceNo status grandTotal currencyCode") // include referenceNo
+      .populate("warehouse", "name code")
+      .populate("lines.product", "name sku unit")
+      .populate("items.product", "name sku unit") // Legacy
+      .populate("createdBy", "name email")
+      .populate("confirmedBy", "name email")
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
+
+    // Enhance with computed fields for frontend compatibility
+    deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
 
     res.json({
       success: true,
@@ -92,7 +178,7 @@ exports.getDeliveryNotes = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       currentPage: page,
-      data: deliveryNotes
+      data: deliveryNotes,
     });
   } catch (error) {
     next(error);
@@ -105,28 +191,33 @@ exports.getDeliveryNotes = async (req, res, next) => {
 exports.getDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
-      .populate('client', 'name code contact type taxId address')
-      .populate('quotation', 'quotationNumber status items')
-      .populate('invoice', 'invoiceNumber status grandTotal lines')
-      .populate('warehouse', 'name code')
-      .populate('lines.product', 'name sku unit trackingType')
-      .populate('lines.invoiceLineId')
-      .populate('items.product', 'name sku unit') // Legacy
-      .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
-      .populate('cancelledBy', 'name email');
+    let deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("client", "name code contact type taxId address")
+      .populate("quotation", "referenceNo status items")
+      .populate("invoice", "referenceNo status grandTotal currencyCode")
+      .populate("warehouse", "name code")
+      .populate("lines.product", "name sku unit trackingType")
+      .populate("items.product", "name sku unit") // Legacy
+      .populate("createdBy", "name email")
+      .populate("confirmedBy", "name email")
+      .populate("cancelledBy", "name email");
+
+    // Enhance with computed fields for frontend compatibility
+    deliveryNote = enhanceDeliveryNotes(deliveryNote);
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
     res.json({
       success: true,
-      data: deliveryNote
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
@@ -139,32 +230,35 @@ exports.getDeliveryNote = async (req, res, next) => {
 exports.createDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
+    const {
       invoice: invoiceId,
       lines,
       quotation: quotationId,
       carrier,
       trackingNo,
       deliveryDate,
-      notes
+      notes,
     } = req.body;
 
     // Module 7: Must have invoice_id
     if (!invoiceId) {
       return res.status(400).json({
         success: false,
-        code: 'ERR_INVOICE_REQUIRED',
-        message: 'invoice_id is required to create a delivery note'
+        code: "ERR_INVOICE_REQUIRED",
+        message: "invoice_id is required to create a delivery note",
       });
     }
 
     // Validate invoice exists and is confirmed
-    const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      company: companyId,
+    });
     if (!invoice) {
       return res.status(404).json({
         success: false,
         code: ERR_DELIVERY_NOT_FOUND,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
@@ -179,8 +273,8 @@ exports.createDeliveryNote = async (req, res, next) => {
     if (!warehouse) {
       return res.status(400).json({
         success: false,
-        code: 'ERR_WAREHOUSE_REQUIRED',
-        message: 'warehouse is required'
+        code: "ERR_WAREHOUSE_REQUIRED",
+        message: "warehouse is required",
       });
     }
 
@@ -193,8 +287,8 @@ exports.createDeliveryNote = async (req, res, next) => {
         if (!invoiceLine) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_INVALID_INVOICE_LINE',
-            message: `Invoice line ${line.invoiceLineId} not found`
+            code: "ERR_INVALID_INVOICE_LINE",
+            message: `Invoice line ${line.invoiceLineId} not found`,
           });
         }
 
@@ -207,7 +301,7 @@ exports.createDeliveryNote = async (req, res, next) => {
           return res.status(422).json({
             success: false,
             code: ERR_EXCEEDS_INVOICE_QTY,
-            message: `qty_to_deliver (${qtyToDeliver}) exceeds remaining invoice qty (${remainingQty})`
+            message: `qty_to_deliver (${qtyToDeliver}) exceeds remaining invoice qty (${remainingQty})`,
           });
         }
 
@@ -221,10 +315,16 @@ exports.createDeliveryNote = async (req, res, next) => {
           qtyToDeliver: qtyToDeliver,
           deliveredQty: 0,
           pendingQty: qtyToDeliver,
-            unitCost: invoiceLine.quantity > 0 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount || 0)) / Number(invoiceLine.quantity || 1) : 0,
+          unitCost:
+            invoiceLine.quantity > 0
+              ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
+                  ? Number(invoiceLine.cogsAmount.toString())
+                  : Number(invoiceLine.cogsAmount || 0)) /
+                Number(invoiceLine.quantity || 1)
+              : 0,
           batchId: line.batchId || null,
           serialNumbers: line.serialNumbers || [],
-          notes: line.notes || ''
+          notes: line.notes || "",
         });
       }
     } else {
@@ -243,10 +343,16 @@ exports.createDeliveryNote = async (req, res, next) => {
             qtyToDeliver: remainingQty,
             deliveredQty: 0,
             pendingQty: remainingQty,
-              unitCost: invoiceLine.quantity > 0 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount || 0)) / Number(invoiceLine.quantity || 1) : 0,
+            unitCost:
+              invoiceLine.quantity > 0
+                ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
+                    ? Number(invoiceLine.cogsAmount.toString())
+                    : Number(invoiceLine.cogsAmount || 0)) /
+                  Number(invoiceLine.quantity || 1)
+                : 0,
             batchId: null,
             serialNumbers: [],
-            notes: ''
+            notes: "",
           });
         }
       }
@@ -263,16 +369,18 @@ exports.createDeliveryNote = async (req, res, next) => {
       deliveryDate: deliveryDate || new Date(),
       lines: deliveryLines,
       items: deliveryLines, // Legacy support
-      notes: notes || '',
-      status: 'draft',
-      createdBy: req.user.id
+      notes: notes || "",
+      status: "draft",
+      createdBy: req.user.id,
     });
 
-    await deliveryNote.populate('client lines.product warehouse createdBy invoice');
+    await deliveryNote.populate(
+      "client lines.product warehouse createdBy invoice",
+    );
 
     res.status(201).json({
       success: true,
-      data: deliveryNote
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
@@ -285,28 +393,36 @@ exports.createDeliveryNote = async (req, res, next) => {
 exports.updateDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+    let deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
     // Only draft delivery notes can be updated
-    if (deliveryNote.status !== 'draft') {
+    if (deliveryNote.status !== "draft") {
       return res.status(409).json({
         success: false,
         code: ERR_DELIVERY_CONFIRMED,
-        message: `Cannot update delivery note with status: ${deliveryNote.status}`
+        message: `Cannot update delivery note with status: ${deliveryNote.status}`,
       });
     }
 
     // Update allowed fields
     const allowedFields = [
-      'carrier', 'trackingNo', 'deliveryDate', 'notes',
-      'deliveredBy', 'vehicle', 'deliveryAddress'
+      "carrier",
+      "trackingNo",
+      "deliveryDate",
+      "notes",
+      "deliveredBy",
+      "vehicle",
+      "deliveryAddress",
     ];
 
     // If lines are being updated, validate
@@ -315,7 +431,7 @@ exports.updateDeliveryNote = async (req, res, next) => {
       if (!invoice) {
         return res.status(404).json({
           success: false,
-          message: 'Invoice not found'
+          message: "Invoice not found",
         });
       }
 
@@ -324,8 +440,8 @@ exports.updateDeliveryNote = async (req, res, next) => {
         if (!invoiceLine) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_INVALID_INVOICE_LINE',
-            message: `Invoice line ${line.invoiceLineId} not found`
+            code: "ERR_INVALID_INVOICE_LINE",
+            message: `Invoice line ${line.invoiceLineId} not found`,
           });
         }
 
@@ -335,7 +451,7 @@ exports.updateDeliveryNote = async (req, res, next) => {
           return res.status(400).json({
             success: false,
             code: ERR_EXCEEDS_INVOICE_QTY,
-            message: `qty_to_deliver exceeds remaining invoice qty`
+            message: `qty_to_deliver exceeds remaining invoice qty`,
           });
         }
       }
@@ -350,12 +466,13 @@ exports.updateDeliveryNote = async (req, res, next) => {
       }
     }
 
-    deliveryNote = await deliveryNote.save()
-      .populate('client lines.product warehouse createdBy invoice');
+    deliveryNote = await deliveryNote
+      .save()
+      .populate("client lines.product warehouse createdBy invoice");
 
     res.json({
       success: true,
-      data: deliveryNote
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
@@ -368,20 +485,23 @@ exports.updateDeliveryNote = async (req, res, next) => {
 exports.deleteDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
     // Only draft delivery notes can be deleted
-    if (deliveryNote.status !== 'draft') {
+    if (deliveryNote.status !== "draft") {
       return res.status(400).json({
         success: false,
-        message: 'Only draft delivery notes can be deleted'
+        message: "Only draft delivery notes can be deleted",
       });
     }
 
@@ -389,12 +509,14 @@ exports.deleteDeliveryNote = async (req, res, next) => {
 
     // If linked to quotation, revert quotation status
     if (deliveryNote.quotation) {
-      await Quotation.findByIdAndUpdate(deliveryNote.quotation, { status: 'approved' });
+      await Quotation.findByIdAndUpdate(deliveryNote.quotation, {
+        status: "approved",
+      });
     }
 
     res.json({
       success: true,
-      message: 'Delivery note deleted successfully'
+      message: "Delivery note deleted successfully",
     });
   } catch (error) {
     next(error);
@@ -413,25 +535,28 @@ exports.confirmDelivery = async (req, res, next) => {
     const deliveryNoteId = req.params.id;
 
     // Find delivery note with populated data
-    let deliveryNote = await DeliveryNote.findOne({ _id: deliveryNoteId, company: companyId })
-      .populate('lines.product')
-      .populate('invoice')
-      .populate('warehouse');
+    let deliveryNote = await DeliveryNote.findOne({
+      _id: deliveryNoteId,
+      company: companyId,
+    })
+      .populate("lines.product")
+      .populate("invoice")
+      .populate("warehouse");
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
         code: ERR_DELIVERY_NOT_FOUND,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
     // Validate status is draft
-    if (deliveryNote.status !== 'draft') {
+    if (deliveryNote.status !== "draft") {
       return res.status(400).json({
         success: false,
         code: ERR_DELIVERY_CONFIRMED,
-        message: `Cannot confirm delivery note with status: ${deliveryNote.status}`
+        message: `Cannot confirm delivery note with status: ${deliveryNote.status}`,
       });
     }
 
@@ -441,16 +566,16 @@ exports.confirmDelivery = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         code: ERR_DELIVERY_NOT_FOUND,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Validate invoice is confirmed
-    if (invoice.status !== 'confirmed') {
+    if (invoice.status !== "confirmed") {
       return res.status(400).json({
         success: false,
         code: ERR_INVOICE_NOT_CONFIRMED,
-        message: 'Invoice must be confirmed before confirming delivery'
+        message: "Invoice must be confirmed before confirming delivery",
       });
     }
 
@@ -460,8 +585,8 @@ exports.confirmDelivery = async (req, res, next) => {
       if (!invoiceLine) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INVALID_INVOICE_LINE',
-          message: `Invoice line ${line.invoiceLineId} not found`
+          code: "ERR_INVALID_INVOICE_LINE",
+          message: `Invoice line ${line.invoiceLineId} not found`,
         });
       }
 
@@ -474,53 +599,63 @@ exports.confirmDelivery = async (req, res, next) => {
         return res.status(400).json({
           success: false,
           code: ERR_EXCEEDS_INVOICE_QTY,
-          message: `qty_to_deliver (${line.qtyToDeliver}) exceeds remaining invoice qty (${remainingQty}) for ${line.productName}`
+          message: `qty_to_deliver (${line.qtyToDeliver}) exceeds remaining invoice qty (${remainingQty}) for ${line.productName}`,
         });
       }
 
       const product = line.product;
       if (!product) continue;
 
-      const trackingType = product.trackingType || 'none';
+      const trackingType = product.trackingType || "none";
 
       // If product is stockable, ensure estimated unit cost from invoice exists and is > 0
       const isStockable = product.isStockable !== false;
       if (isStockable) {
         const invoiceLine = invoice.lines.id(line.invoiceLineId);
-        const estimatedUnitCost = (invoiceLine && invoiceLine.unitCost !== undefined && invoiceLine.unitCost !== null)
-          ? (invoiceLine.unitCost.toString ? Number(invoiceLine.unitCost.toString()) : Number(invoiceLine.unitCost))
-          : (invoiceLine && invoiceLine.cogsAmount ? ((invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount)) / Number(invoiceLine.quantity || 1)) : 0);
+        const estimatedUnitCost =
+          invoiceLine &&
+          invoiceLine.unitCost !== undefined &&
+          invoiceLine.unitCost !== null
+            ? invoiceLine.unitCost.toString
+              ? Number(invoiceLine.unitCost.toString())
+              : Number(invoiceLine.unitCost)
+            : invoiceLine && invoiceLine.cogsAmount
+              ? (invoiceLine.cogsAmount.toString
+                  ? Number(invoiceLine.cogsAmount.toString())
+                  : Number(invoiceLine.cogsAmount)) /
+                Number(invoiceLine.quantity || 1)
+              : 0;
 
         if (estimatedUnitCost === 0) {
           return res.status(500).json({
             success: false,
             code: ERR_COST_LOOKUP_FAILED,
-            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`
+            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`,
           });
         }
       }
 
       // Batch validation
-      if (trackingType === 'batch') {
+      if (trackingType === "batch") {
         if (!line.batchId) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_BATCH_REQUIRED',
-            message: `batch_id required for product ${product.name} (tracking_type=batch)`
+            code: "ERR_BATCH_REQUIRED",
+            message: `batch_id required for product ${product.name} (tracking_type=batch)`,
           });
         }
 
         const batch = await StockBatch.findOne({
           _id: line.batchId,
           company: companyId,
-          product: product._id
+          product: product._id,
         });
 
         if (!batch) {
           return res.status(404).json({
             success: false,
             code: ERR_BATCH_NOT_FOUND,
-            message: `Batch not found for product ${product.name}`
+            message: `Batch not found for product ${product.name}`,
           });
         }
 
@@ -528,7 +663,7 @@ exports.confirmDelivery = async (req, res, next) => {
           return res.status(409).json({
             success: false,
             code: ERR_BATCH_QUARANTINED,
-            message: `Batch ${batch.batchNo} is quarantined`
+            message: `Batch ${batch.batchNo} is quarantined`,
           });
         }
 
@@ -537,26 +672,26 @@ exports.confirmDelivery = async (req, res, next) => {
           return res.status(409).json({
             success: false,
             code: ERR_INSUFFICIENT_STOCK,
-            message: `Insufficient stock in batch ${batch.batchNo}. Available: ${availableQty}, Requested: ${line.qtyToDeliver}`
+            message: `Insufficient stock in batch ${batch.batchNo}. Available: ${availableQty}, Requested: ${line.qtyToDeliver}`,
           });
         }
       }
 
       // Serial validation
-      if (trackingType === 'serial') {
+      if (trackingType === "serial") {
         if (!line.serialNumbers || line.serialNumbers.length === 0) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_SERIAL_REQUIRED',
-            message: `serial_numbers required for product ${product.name} (tracking_type=serial)`
+            code: "ERR_SERIAL_REQUIRED",
+            message: `serial_numbers required for product ${product.name} (tracking_type=serial)`,
           });
         }
 
         if (line.serialNumbers.length !== line.qtyToDeliver) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_SERIAL_COUNT_MISMATCH',
-            message: `Serial count must equal qty_to_deliver`
+            code: "ERR_SERIAL_COUNT_MISMATCH",
+            message: `Serial count must equal qty_to_deliver`,
           });
         }
 
@@ -564,22 +699,22 @@ exports.confirmDelivery = async (req, res, next) => {
           const serial = await StockSerialNumber.findOne({
             _id: serialId,
             company: companyId,
-            product: product._id
+            product: product._id,
           });
 
           if (!serial) {
             return res.status(404).json({
               success: false,
-              code: 'ERR_SERIAL_NOT_FOUND',
-              message: `Serial number not found`
+              code: "ERR_SERIAL_NOT_FOUND",
+              message: `Serial number not found`,
             });
           }
 
-          if (serial.status !== 'in_stock') {
+          if (serial.status !== "in_stock") {
             return res.status(409).json({
               success: false,
               code: ERR_SERIAL_NOT_IN_STOCK,
-              message: `Serial ${serial.serialNo} is ${serial.status}, not in_stock`
+              message: `Serial ${serial.serialNo} is ${serial.status}, not in_stock`,
             });
           }
 
@@ -587,7 +722,7 @@ exports.confirmDelivery = async (req, res, next) => {
             return res.status(400).json({
               success: false,
               code: ERR_SERIAL_WRONG_WAREHOUSE,
-              message: `Serial ${serial.serialNo} is in different warehouse`
+              message: `Serial ${serial.serialNo} is in different warehouse`,
             });
           }
         }
@@ -595,7 +730,7 @@ exports.confirmDelivery = async (req, res, next) => {
     }
 
     // ========== STEPS 2-7: Execute in transaction ==========
-    const inventoryService = require('../services/inventoryService');
+    const inventoryService = require("../services/inventoryService");
     const cogsAdjustments = [];
 
     await runInTransaction(async (session) => {
@@ -603,34 +738,55 @@ exports.confirmDelivery = async (req, res, next) => {
       for (const line of deliveryNote.lines) {
         if (line.qtyToDeliver <= 0) continue;
 
-        const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(session);
+        const product = await Product.findOne({
+          _id: line.product._id,
+          company: companyId,
+        }).session(session);
         if (!product) continue;
 
-        const trackingType = product.trackingType || 'none';
+        const trackingType = product.trackingType || "none";
         let actualUnitCost = 0;
         let totalCost = 0;
 
         // ========== STEP 2: CONSUME STOCK (FIFO) ==========
-        if (trackingType === 'none' || trackingType === 'fifo') {
+        if (trackingType === "none" || trackingType === "fifo") {
           // FIFO consumption - consume lots in received_at ASC order
           const consumeResult = await inventoryService.consume(
             companyId,
             product._id,
             line.qtyToDeliver,
-            { method: 'fifo', warehouse: deliveryNote.warehouse._id, session }
+            { method: "fifo", warehouse: deliveryNote.warehouse._id, session },
           );
-          actualUnitCost = consumeResult.averageCost ? (consumeResult.averageCost.toString ? Number(consumeResult.averageCost.toString()) : Number(consumeResult.averageCost)) : 0;
-          totalCost = consumeResult.totalCost ? (consumeResult.totalCost.toString ? Number(consumeResult.totalCost.toString()) : Number(consumeResult.totalCost)) : 0;
-        } else if (trackingType === 'wac') {
+          actualUnitCost = consumeResult.averageCost
+            ? consumeResult.averageCost.toString
+              ? Number(consumeResult.averageCost.toString())
+              : Number(consumeResult.averageCost)
+            : 0;
+          totalCost = consumeResult.totalCost
+            ? consumeResult.totalCost.toString
+              ? Number(consumeResult.totalCost.toString())
+              : Number(consumeResult.totalCost)
+            : 0;
+        } else if (trackingType === "wac") {
           // WAC - use average cost from product
-          actualUnitCost = product.averageCost ? (product.averageCost.toString ? Number(product.averageCost.toString()) : Number(product.averageCost)) : 0;
+          actualUnitCost = product.averageCost
+            ? product.averageCost.toString
+              ? Number(product.averageCost.toString())
+              : Number(product.averageCost)
+            : 0;
           totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
-        } else if (trackingType === 'batch' && line.batchId) {
+        } else if (trackingType === "batch" && line.batchId) {
           // Batch-specific consumption
-          const batch = await StockBatch.findById(line.batchId).session(session);
-          actualUnitCost = batch?.unitCost ? (batch.unitCost.toString ? Number(batch.unitCost.toString()) : Number(batch.unitCost)) : 0;
+          const batch = await StockBatch.findById(line.batchId).session(
+            session,
+          );
+          actualUnitCost = batch?.unitCost
+            ? batch.unitCost.toString
+              ? Number(batch.unitCost.toString())
+              : Number(batch.unitCost)
+            : 0;
           totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
-          
+
           // Deduct from batch
           batch.qtyOnHand = (batch.qtyOnHand || 0) - line.qtyToDeliver;
           await batch.save({ session });
@@ -643,43 +799,89 @@ exports.confirmDelivery = async (req, res, next) => {
         // Update product quantity using direct update to avoid caching issues
         const previousStock = product.currentStock || 0;
         const newStock = Math.max(0, previousStock - line.qtyToDeliver);
+        // Also release the reservation for the delivered qty so that
+        // qty_available (currentStock - reservedQuantity) stays accurate.
+        // Clamp at 0 so a stale/partial reservation never produces a negative value.
+        const currentReserved = Number(product.reservedQuantity) || 0;
+        const reservationToRelease = Math.min(
+          Number(line.qtyToDeliver),
+          currentReserved,
+        );
         await Product.findByIdAndUpdate(
           product._id,
-          { currentStock: newStock },
-          { session }
+          {
+            $set: { currentStock: newStock },
+            $inc: { reservedQuantity: -reservationToRelease },
+          },
+          { session },
         );
 
+        // ── Decrement StockLevel for this product/warehouse (dispatch) ────────
+        try {
+          await StockLevel.updateOne(
+            {
+              company_id: companyId,
+              product_id: product._id,
+              warehouse_id: deliveryNote.warehouse._id,
+              qty_on_hand: { $gte: Number(line.qtyToDeliver) },
+            },
+            {
+              $inc: { qty_on_hand: -Number(line.qtyToDeliver) },
+              $set: {
+                last_movement_at: new Date(),
+                last_movement_type: "dispatch",
+              },
+            },
+            { session },
+          );
+        } catch (slErr) {
+          // StockLevel sync is best-effort — do not abort the delivery confirmation
+          console.error(
+            "StockLevel sync failed for delivery line:",
+            slErr.message,
+          );
+        }
+
         // ========== STEP 4: CREATE STOCK MOVEMENT (dispatch) ==========
-        await StockMovement.create([{
-          company: companyId,
-          product: product._id,
-          warehouse: deliveryNote.warehouse._id,
-          type: 'out',
-          reason: 'dispatch',
-          quantity: line.qtyToDeliver,
-          previousStock,
-          newStock,
-          unitCost: actualUnitCost,
-          totalCost,
-          sourceType: 'delivery_note',
-          sourceId: deliveryNote._id,
-          referenceNumber: deliveryNote.referenceNo,
-          notes: `DN#${deliveryNote.referenceNo} - ${line.productName}`,
-          performedBy: req.user.id,
-          movementDate: new Date()
-        }], { session });
+        await StockMovement.create(
+          [
+            {
+              company: companyId,
+              product: product._id,
+              warehouse: deliveryNote.warehouse._id,
+              type: "out",
+              reason: "dispatch",
+              quantity: line.qtyToDeliver,
+              previousStock,
+              newStock,
+              unitCost: actualUnitCost,
+              totalCost,
+              sourceType: "delivery_note",
+              sourceId: deliveryNote._id,
+              referenceNumber: deliveryNote.referenceNo,
+              notes: `DN#${deliveryNote.referenceNo} - ${line.productName}`,
+              performedBy: req.user.id,
+              movementDate: new Date(),
+            },
+          ],
+          { session },
+        );
 
         // ========== STEP 5: UPDATE SERIAL STATUS ==========
-        if (trackingType === 'serial' && line.serialNumbers && line.serialNumbers.length > 0) {
+        if (
+          trackingType === "serial" &&
+          line.serialNumbers &&
+          line.serialNumbers.length > 0
+        ) {
           await StockSerialNumber.updateMany(
             { _id: { $in: line.serialNumbers } },
             {
-              status: 'dispatched',
+              status: "dispatched",
               dispatchedVia: line._id,
               dispatchedAt: new Date(),
-              warehouse: deliveryNote.warehouse._id
+              warehouse: deliveryNote.warehouse._id,
             },
-            { session }
+            { session },
           );
         }
 
@@ -694,11 +896,21 @@ exports.confirmDelivery = async (req, res, next) => {
         if (invoiceLine && invoiceLine.quantity > 0) {
           // Prefer unitCost recorded on the invoice line (set at invoice confirmation),
           // fall back to cogsAmount/quantity when unitCost is not present.
-          const estimatedUnitCost = (invoiceLine.unitCost !== undefined && invoiceLine.unitCost !== null)
-            ? (invoiceLine.unitCost.toString ? Number(invoiceLine.unitCost.toString()) : Number(invoiceLine.unitCost))
-            : (invoiceLine.cogsAmount ? (invoiceLine.cogsAmount.toString ? Number(invoiceLine.cogsAmount.toString()) : Number(invoiceLine.cogsAmount)) / Number(invoiceLine.quantity || 1) : 0);
+          const estimatedUnitCost =
+            invoiceLine.unitCost !== undefined && invoiceLine.unitCost !== null
+              ? invoiceLine.unitCost.toString
+                ? Number(invoiceLine.unitCost.toString())
+                : Number(invoiceLine.unitCost)
+              : invoiceLine.cogsAmount
+                ? (invoiceLine.cogsAmount.toString
+                    ? Number(invoiceLine.cogsAmount.toString())
+                    : Number(invoiceLine.cogsAmount)) /
+                  Number(invoiceLine.quantity || 1)
+                : 0;
 
-          const rawDiff = Number(totalCost || 0) - (Number(estimatedUnitCost || 0) * Number(line.qtyToDeliver || 0));
+          const rawDiff =
+            Number(totalCost || 0) -
+            Number(estimatedUnitCost || 0) * Number(line.qtyToDeliver || 0);
           // Round to cents to avoid tiny floating point mismatches
           const costDifference = Math.round(rawDiff * 100) / 100;
 
@@ -707,16 +919,22 @@ exports.confirmDelivery = async (req, res, next) => {
             cogsAdjustments.push({
               product: product,
               line: line,
-              estimatedCost: Math.round((Number(estimatedUnitCost || 0) * Number(line.qtyToDeliver || 0)) * 100) / 100,
+              estimatedCost:
+                Math.round(
+                  Number(estimatedUnitCost || 0) *
+                    Number(line.qtyToDeliver || 0) *
+                    100,
+                ) / 100,
               actualCost: Math.round(Number(totalCost || 0) * 100) / 100,
-              difference: costDifference
+              difference: costDifference,
             });
           }
         }
 
         // ========== STEP 7: UPDATE INVOICE LINE ==========
         if (invoiceLine) {
-          invoiceLine.qtyDelivered = (invoiceLine.qtyDelivered || 0) + line.qtyToDeliver;
+          invoiceLine.qtyDelivered =
+            (invoiceLine.qtyDelivered || 0) + line.qtyToDeliver;
         }
       }
 
@@ -724,12 +942,12 @@ exports.confirmDelivery = async (req, res, next) => {
       await invoice.save({ session });
 
       // Save delivery note lines
-      deliveryNote.lines.forEach(line => line.markModified('unitCost'));
+      deliveryNote.lines.forEach((line) => line.markModified("unitCost"));
       await deliveryNote.save({ session });
 
       // ========== POST COGS ADJUSTMENTS ==========
       if (cogsAdjustments.length > 0) {
-        const { getAccount } = require('../constants/chartOfAccounts');
+        const { getAccount } = require("../constants/chartOfAccounts");
         const entries = [];
 
         for (const adj of cogsAdjustments) {
@@ -739,40 +957,50 @@ exports.confirmDelivery = async (req, res, next) => {
           const isIncrease = difference > 0;
 
           const cogsAccount = product.cogsAccount || product.cogs_account_id;
-          const inventoryAccount = product.inventoryAccount || product.inventory_account_id;
+          const inventoryAccount =
+            product.inventoryAccount || product.inventory_account_id;
 
           if (!cogsAccount || !inventoryAccount) {
-            console.warn('Missing COGS or Inventory account for product:', product._id);
+            console.warn(
+              "Missing COGS or Inventory account for product:",
+              product._id,
+            );
             continue;
           }
 
-          const cogsAccountName = getAccount(cogsAccount)?.name || 'Cost of Goods Sold';
-          const inventoryAccountName = getAccount(inventoryAccount)?.name || 'Inventory';
+          const cogsAccountName =
+            getAccount(cogsAccount)?.name || "Cost of Goods Sold";
+          const inventoryAccountName =
+            getAccount(inventoryAccount)?.name || "Inventory";
 
           const narration = `COGS Adjustment - ${line.productName} - DN#${deliveryNote.referenceNo} - cost variance`;
 
           const journalEntry = {
             date: new Date(),
             description: narration,
-            sourceType: 'cogs_adjustment',
+            sourceType: "cogs_adjustment",
             sourceId: deliveryNote._id,
             sourceReference: `DN-ADJ-${deliveryNote.referenceNo}`,
             lines: [
               {
                 accountCode: isIncrease ? cogsAccount : inventoryAccount,
-                accountName: isIncrease ? cogsAccountName : inventoryAccountName,
+                accountName: isIncrease
+                  ? cogsAccountName
+                  : inventoryAccountName,
                 debit: isIncrease ? Math.abs(difference) : 0,
                 credit: isIncrease ? 0 : Math.abs(difference),
-                description: narration
+                description: narration,
               },
               {
                 accountCode: isIncrease ? inventoryAccount : cogsAccount,
-                accountName: isIncrease ? inventoryAccountName : cogsAccountName,
+                accountName: isIncrease
+                  ? inventoryAccountName
+                  : cogsAccountName,
                 debit: isIncrease ? 0 : Math.abs(difference),
                 credit: isIncrease ? Math.abs(difference) : 0,
-                description: narration
-              }
-            ]
+                description: narration,
+              },
+            ],
           };
 
           entries.push(journalEntry);
@@ -780,41 +1008,51 @@ exports.confirmDelivery = async (req, res, next) => {
 
         if (entries.length > 0) {
           try {
-            if (typeof JournalService.createEntriesAtomic === 'function') {
-              await JournalService.createEntriesAtomic(companyId, req.user.id, entries, { session });
+            if (typeof JournalService.createEntriesAtomic === "function") {
+              await JournalService.createEntriesAtomic(
+                companyId,
+                req.user.id,
+                entries,
+                { session },
+              );
             } else {
               // Fallback: create entries one by one but keep session
               for (const e of entries) {
-                await JournalService.createEntry(companyId, req.user.id, { ...e, session });
+                await JournalService.createEntry(companyId, req.user.id, {
+                  ...e,
+                  session,
+                });
               }
             }
           } catch (err) {
-            console.error('COGS adjustment failed (atomic post):', err);
+            console.error("COGS adjustment failed (atomic post):", err);
           }
         }
       }
 
       // Update delivery note status
-      deliveryNote.status = 'confirmed';
+      deliveryNote.status = "confirmed";
       deliveryNote.confirmedBy = req.user.id;
       deliveryNote.confirmedDate = new Date();
       deliveryNote.stockDeducted = true;
       await deliveryNote.save({ session });
     });
 
-    await deliveryNote.populate('lines.product warehouse createdBy confirmedBy invoice');
+    await deliveryNote.populate(
+      "lines.product warehouse createdBy confirmedBy invoice",
+    );
 
     try {
-      const cacheService = require('../services/cacheService');
+      const cacheService = require("../services/cacheService");
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
-      console.error('Cache bump after delivery confirm failed:', e);
+      console.error("Cache bump after delivery confirm failed:", e);
     }
 
     res.json({
       success: true,
-      message: 'Delivery note confirmed successfully',
-      data: deliveryNote
+      message: "Delivery note confirmed successfully",
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
@@ -822,30 +1060,40 @@ exports.confirmDelivery = async (req, res, next) => {
 };
 
 // Helper: Create COGS adjustment journal entry
-async function createCOGSAdjustmentEntry(companyId, userId, data, options = {}) {
+async function createCOGSAdjustmentEntry(
+  companyId,
+  userId,
+  data,
+  options = {},
+) {
   const { product, deliveryNote, line, difference } = data;
   const isIncrease = difference > 0;
 
   // Get accounts from product
   const cogsAccount = product.cogsAccount || product.cogs_account_id;
-  const inventoryAccount = product.inventoryAccount || product.inventory_account_id;
+  const inventoryAccount =
+    product.inventoryAccount || product.inventory_account_id;
 
   if (!cogsAccount || !inventoryAccount) {
-    console.warn('Missing COGS or Inventory account for product:', product._id);
+    console.warn("Missing COGS or Inventory account for product:", product._id);
     return;
   }
 
   // Get account names
-  const { getAccount, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-  const cogsAccountName = getAccount(cogsAccount)?.name || 'Cost of Goods Sold';
-  const inventoryAccountName = getAccount(inventoryAccount)?.name || 'Inventory';
+  const {
+    getAccount,
+    DEFAULT_ACCOUNTS,
+  } = require("../constants/chartOfAccounts");
+  const cogsAccountName = getAccount(cogsAccount)?.name || "Cost of Goods Sold";
+  const inventoryAccountName =
+    getAccount(inventoryAccount)?.name || "Inventory";
 
   const narration = `COGS Adjustment - ${line.productName} - DN#${deliveryNote.referenceNo} - cost variance`;
 
   const journalEntry = {
     date: new Date(),
     description: narration,
-    sourceType: 'cogs_adjustment',
+    sourceType: "cogs_adjustment",
     sourceId: deliveryNote._id,
     sourceReference: `DN-ADJ-${deliveryNote.referenceNo}`,
     lines: [
@@ -854,19 +1102,22 @@ async function createCOGSAdjustmentEntry(companyId, userId, data, options = {}) 
         accountName: isIncrease ? cogsAccountName : inventoryAccountName,
         debit: isIncrease ? Math.abs(difference) : 0,
         credit: isIncrease ? 0 : Math.abs(difference),
-        description: narration
+        description: narration,
       },
       {
         accountCode: isIncrease ? inventoryAccount : cogsAccount,
         accountName: isIncrease ? inventoryAccountName : cogsAccountName,
         debit: isIncrease ? 0 : Math.abs(difference),
         credit: isIncrease ? Math.abs(difference) : 0,
-        description: narration
-      }
-    ]
+        description: narration,
+      },
+    ],
   };
 
-  await JournalService.createEntry(companyId, userId, { ...journalEntry, session: options.session });
+  await JournalService.createEntry(companyId, userId, {
+    ...journalEntry,
+    session: options.session,
+  });
 }
 
 // @desc    Cancel confirmed delivery note (Module 7 - reverse stock)
@@ -877,24 +1128,27 @@ exports.cancelDeliveryNote = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { cancellationReason } = req.body;
 
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product')
-      .populate('warehouse');
+    let deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("lines.product")
+      .populate("warehouse");
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
         code: ERR_DELIVERY_NOT_FOUND,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
     // Only confirmed delivery notes can be cancelled
-    if (deliveryNote.status !== 'confirmed') {
+    if (deliveryNote.status !== "confirmed") {
       return res.status(400).json({
         success: false,
         code: ERR_DELIVERY_CONFIRMED,
-        message: `Cannot cancel delivery note with status: ${deliveryNote.status}`
+        message: `Cannot cancel delivery note with status: ${deliveryNote.status}`,
       });
     }
 
@@ -902,11 +1156,11 @@ exports.cancelDeliveryNote = async (req, res, next) => {
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
-    const inventoryService = require('../services/inventoryService');
+    const inventoryService = require("../services/inventoryService");
 
     // Execute reversal in transaction
     await runInTransaction(async (session) => {
@@ -914,25 +1168,30 @@ exports.cancelDeliveryNote = async (req, res, next) => {
       for (const line of deliveryNote.lines) {
         if (line.deliveredQty <= 0) continue;
 
-        const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(session);
+        const product = await Product.findOne({
+          _id: line.product._id,
+          company: companyId,
+        }).session(session);
         if (!product) continue;
 
-        const trackingType = product.trackingType || 'none';
+        const trackingType = product.trackingType || "none";
 
         // ========== Reverse stock consumption ==========
-        if (trackingType === 'none' || trackingType === 'fifo') {
+        if (trackingType === "none" || trackingType === "fifo") {
           // Reverse FIFO - add back to lots
           await inventoryService.reverseConsume(
             companyId,
             product._id,
             line.deliveredQty,
-            { warehouse: deliveryNote.warehouse._id, session }
+            { warehouse: deliveryNote.warehouse._id, session },
           );
-        } else if (trackingType === 'wac') {
+        } else if (trackingType === "wac") {
           // WAC - stock level will be updated below
-        } else if (trackingType === 'batch' && line.batchId) {
+        } else if (trackingType === "batch" && line.batchId) {
           // Restore batch quantity
-          const batch = await StockBatch.findById(line.batchId).session(session);
+          const batch = await StockBatch.findById(line.batchId).session(
+            session,
+          );
           if (batch) {
             batch.qtyOnHand = (batch.qtyOnHand || 0) + line.deliveredQty;
             await batch.save({ session });
@@ -947,46 +1206,58 @@ exports.cancelDeliveryNote = async (req, res, next) => {
         await Product.findByIdAndUpdate(
           product._id,
           { currentStock: newStock },
-          { session }
+          { session },
         );
 
         // ========== Reverse stock movement ==========
-        await StockMovement.create([{
-          company: companyId,
-          product: product._id,
-          warehouse: deliveryNote.warehouse._id,
-          type: 'in',
-          reason: 'dispatch_reversal',
-          quantity: line.deliveredQty,
-          previousStock: newStock - line.deliveredQty,
-          newStock: newStock,
-          unitCost: line.unitCost || 0,
-          totalCost: (line.unitCost || 0) * line.deliveredQty,
-          sourceType: 'delivery_note_cancellation',
-          sourceId: deliveryNote._id,
-          referenceNumber: deliveryNote.referenceNo,
-          notes: `DN#${deliveryNote.referenceNo} Cancellation - ${line.productName}`,
-          performedBy: req.user.id,
-          movementDate: new Date()
-        }], { session });
+        await StockMovement.create(
+          [
+            {
+              company: companyId,
+              product: product._id,
+              warehouse: deliveryNote.warehouse._id,
+              type: "in",
+              reason: "dispatch_reversal",
+              quantity: line.deliveredQty,
+              previousStock: newStock - line.deliveredQty,
+              newStock: newStock,
+              unitCost: line.unitCost || 0,
+              totalCost: (line.unitCost || 0) * line.deliveredQty,
+              sourceType: "delivery_note_cancellation",
+              sourceId: deliveryNote._id,
+              referenceNumber: deliveryNote.referenceNo,
+              notes: `DN#${deliveryNote.referenceNo} Cancellation - ${line.productName}`,
+              performedBy: req.user.id,
+              movementDate: new Date(),
+            },
+          ],
+          { session },
+        );
 
         // ========== Restore serial status ==========
-        if (trackingType === 'serial' && line.serialNumbers && line.serialNumbers.length > 0) {
+        if (
+          trackingType === "serial" &&
+          line.serialNumbers &&
+          line.serialNumbers.length > 0
+        ) {
           await StockSerialNumber.updateMany(
             { _id: { $in: line.serialNumbers } },
             {
-              status: 'in_stock',
+              status: "in_stock",
               dispatchedVia: null,
-              dispatchedAt: null
+              dispatchedAt: null,
             },
-            { session }
+            { session },
           );
         }
 
         // ========== Reverse invoice qty_delivered ==========
         const invoiceLine = invoice.lines.id(line.invoiceLineId);
         if (invoiceLine) {
-          invoiceLine.qtyDelivered = Math.max(0, (invoiceLine.qtyDelivered || 0) - line.deliveredQty);
+          invoiceLine.qtyDelivered = Math.max(
+            0,
+            (invoiceLine.qtyDelivered || 0) - line.deliveredQty,
+          );
         }
       }
 
@@ -995,47 +1266,55 @@ exports.cancelDeliveryNote = async (req, res, next) => {
 
       // ========== Reverse COGS adjustment if exists ==========
       // Find COGS adjustment journal entries for this delivery note
-      const cogsAdjustments = await mongoose.model('JournalEntry').find({
-        company: companyId,
-        sourceType: 'cogs_adjustment',
-        sourceId: deliveryNote._id
-      }).session(session);
+      const cogsAdjustments = await mongoose
+        .model("JournalEntry")
+        .find({
+          company: companyId,
+          sourceType: "cogs_adjustment",
+          sourceId: deliveryNote._id,
+        })
+        .session(session);
 
       // Aggregate reversal entries and mark originals as reversed, then post atomically
       const reversalEntries = [];
       for (const adjEntry of cogsAdjustments) {
         // Mark original entry as reversed
-        adjEntry.status = 'reversed';
+        adjEntry.status = "reversed";
         adjEntry.reversalDate = new Date();
         adjEntry.reversedBy = req.user.id;
         await adjEntry.save({ session });
 
         // Build reverse journal entry options
-        const reverseLines = adjEntry.lines.map(e => ({
+        const reverseLines = adjEntry.lines.map((e) => ({
           accountCode: e.accountCode,
           accountName: e.accountName,
           debit: e.credit,
           credit: e.debit,
-          description: `Reversed: ${e.description}`
+          description: `Reversed: ${e.description}`,
         }));
 
         reversalEntries.push({
           date: new Date(),
           description: `Reversal of COGS Adjustment - DN#${deliveryNote.referenceNo}`,
-          sourceType: 'cogs_adjustment_reversal',
+          sourceType: "cogs_adjustment_reversal",
           sourceId: deliveryNote._id,
           sourceReference: `DN-ADJ-REV-${deliveryNote.referenceNo}`,
           lines: reverseLines,
-          isAutoGenerated: true
+          isAutoGenerated: true,
         });
       }
 
       if (reversalEntries.length > 0) {
-        await JournalService.createEntriesAtomic(companyId, req.user.id, reversalEntries, { session });
+        await JournalService.createEntriesAtomic(
+          companyId,
+          req.user.id,
+          reversalEntries,
+          { session },
+        );
       }
 
       // Update delivery note status
-      deliveryNote.status = 'cancelled';
+      deliveryNote.status = "cancelled";
       deliveryNote.cancellationReason = cancellationReason;
       deliveryNote.cancelledBy = req.user.id;
       deliveryNote.cancelledDate = new Date();
@@ -1043,110 +1322,179 @@ exports.cancelDeliveryNote = async (req, res, next) => {
       await deliveryNote.save({ session });
     });
 
-    await deliveryNote.populate('lines.product warehouse createdBy cancelledBy invoice');
+    await deliveryNote.populate(
+      "lines.product warehouse createdBy cancelledBy invoice",
+    );
 
     res.json({
       success: true,
-      message: 'Delivery note cancelled successfully',
-      data: deliveryNote
+      message: "Delivery note cancelled successfully",
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Create invoice from delivery note
+// @desc    Create invoice from delivery note (NEW WORKFLOW)
 // @route   POST /api/delivery-notes/:id/create-invoice
 // @access  Private
 exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { dueDate, paymentTerms, notes, terms } = req.body;
+    const { dueDate, paymentTerms, notes, terms, confirmDelivery } = req.body;
 
-    let deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
-      .populate('items.product')
-      .populate('client');
+    let deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("lines.product")
+      .populate("items.product")
+      .populate("client")
+      .populate("salesOrder");
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
-    if (!['delivered', 'partial'].includes(deliveryNote.status)) {
+    // NEW WORKFLOW: Allow invoice creation from draft delivery notes created via Pick Pack
+    // OLD WORKFLOW: Only from delivered/partial status
+    const isNewWorkflow =
+      deliveryNote.sourceType === "pick_pack" || !deliveryNote.invoice;
+    const isOldWorkflow = ["delivered", "partial"].includes(
+      deliveryNote.status,
+    );
+
+    if (!isNewWorkflow && !isOldWorkflow) {
       return res.status(400).json({
         success: false,
-        message: 'Only confirmed delivery notes can be converted to invoice'
+        message:
+          "Delivery note must be confirmed (delivered/partial) or created via Pick Pack to generate invoice",
       });
     }
 
     if (deliveryNote.invoice) {
       return res.status(400).json({
         success: false,
-        message: 'Invoice has already been created from this delivery note'
+        message: "Invoice has already been created from this delivery note",
       });
     }
 
-    // Process items for invoice - use DELIVERED quantities, not ordered
-    const processedItems = deliveryNote.items.map((item, idx) => {
-      const quantity = item.deliveredQty || 0;
-      const product = item.product;
-      const unitPrice = product?.sellingPrice || 0;
-      const subtotal = quantity * unitPrice;
-      const discount = 0;
-      const netAmount = subtotal - discount;
-      const taxRate = product?.taxRate || 0;
-      const taxCode = product?.taxCode || 'A';
-      const taxAmount = netAmount * (taxRate / 100);
-      const totalWithTax = netAmount + taxAmount;
+    // Use lines (new) or items (legacy)
+    const lineArray =
+      deliveryNote.lines && deliveryNote.lines.length > 0
+        ? deliveryNote.lines
+        : deliveryNote.items || [];
 
-      return {
-        product: product._id,
-        itemCode: item.itemCode || product?.sku || `ITEM-${idx + 1}`,
-        description: item.productName || product?.name || '',
-        quantity,
-        unit: item.unit || product?.unit || '',
-        unitPrice,
-        discount,
-        taxCode,
-        taxRate,
-        taxAmount,
-        subtotal,
-        totalWithTax
-      };
-    }).filter(item => item.quantity > 0); // Only include items with delivered quantity
+    // Process lines for invoice - use qtyToDeliver (or deliveredQty for legacy)
+    const processedLines = lineArray
+      .map((line, idx) => {
+        const quantity = line.qtyToDeliver || line.deliveredQty || 0;
+        const product = line.product;
+        if (!product) return null;
 
-    if (processedItems.length === 0) {
+        const unitPrice = product.sellingPrice || 0;
+        const subtotal = quantity * unitPrice;
+        const discountPct = 0;
+        const netAmount = subtotal;
+        const taxRate = product.taxRate || 0;
+        const taxCode = product.taxCode || "A";
+        const taxAmount = netAmount * (taxRate / 100);
+        const totalWithTax = netAmount + taxAmount;
+
+        return {
+          product: product._id,
+          productCode: product.sku || `ITEM-${idx + 1}`,
+          productName: line.productName || product.name || "",
+          description: line.productName || product.name || "",
+          qty: quantity,
+          unit: line.unit || product.unit || "",
+          unitPrice,
+          discountPct,
+          taxCode,
+          taxRate,
+          taxAmount,
+          lineSubtotal: subtotal,
+          lineTotal: totalWithTax,
+          warehouse: deliveryNote.warehouse,
+        };
+      })
+      .filter((line) => line && line.qty > 0);
+
+    if (processedLines.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No items with delivery quantity to create invoice'
+        message: "No items with delivery quantity to create invoice",
       });
     }
 
-    // Create invoice
+    // Create invoice with links to Sales Order and Delivery Note
     const invoice = await Invoice.create({
       company: companyId,
       client: deliveryNote.client._id,
+      salesOrder: deliveryNote.salesOrder?._id,
+      deliveryNote: deliveryNote._id,
       quotation: deliveryNote.quotation,
-      items: processedItems,
-      terms: terms || '',
+      lines: processedLines,
+      terms: terms || "",
       notes: notes || deliveryNote.notes,
       createdBy: req.user.id,
       dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-      paymentTerms: paymentTerms || 'credit_30'
+      paymentTerms: paymentTerms || "credit_30",
+      autoConfirm: false, // Stay as draft until explicitly confirmed
     });
 
     // Update delivery note with invoice reference
     deliveryNote.invoice = invoice._id;
+
+    // Map created invoice lines back to delivery note lines (set invoiceLineId)
+    // This ensures later delivery confirmation can lookup corresponding invoice lines.
+    try {
+      if (invoice.lines && invoice.lines.length > 0) {
+        const invoiceLines = invoice.lines;
+        let invIdx = 0;
+        for (const ln of lineArray) {
+          const qty = ln.qtyToDeliver || ln.deliveredQty || 0;
+          if (!qty || qty <= 0) continue;
+          const invLine = invoiceLines[invIdx];
+          if (invLine) {
+            ln.invoiceLineId = invLine._id;
+          }
+          invIdx++;
+        }
+      }
+    } catch (e) {
+      // Non-fatal - continue without back-mapping if something goes wrong
+      console.warn("Failed to map invoice lines to delivery note lines:", e);
+    }
+
+    // If requested, also confirm the delivery note
+    if (confirmDelivery && deliveryNote.status === "draft") {
+      deliveryNote.status = "confirmed";
+      deliveryNote.confirmedBy = req.user.id;
+      deliveryNote.confirmedDate = new Date();
+    }
+
     await deliveryNote.save();
 
-    await invoice.populate('client items.product createdBy');
+    // Update Sales Order with invoice reference
+    if (deliveryNote.salesOrder) {
+      const SalesOrder = require("../models/SalesOrder");
+      await SalesOrder.findByIdAndUpdate(deliveryNote.salesOrder._id, {
+        $addToSet: { invoices: invoice._id },
+        status: "invoiced",
+      });
+    }
+
+    await invoice.populate("client createdBy");
 
     res.status(201).json({
       success: true,
-      message: 'Invoice created successfully from delivery note',
-      data: invoice
+      message: "Invoice created successfully from delivery note",
+      data: invoice,
     });
   } catch (error) {
     next(error);
@@ -1159,21 +1507,25 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
 exports.getInvoiceDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNotes = await DeliveryNote.find({ 
-      invoice: req.params.invoiceId, 
-      company: companyId 
+    const deliveryNotes = await DeliveryNote.find({
+      invoice: req.params.invoiceId,
+      company: companyId,
     })
-      .populate('client', 'name code')
-      .populate('warehouse', 'name code')
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
+      .populate("client", "name code")
+      .populate("warehouse", "name code")
+      .populate("lines.product", "name sku")
+      .populate("createdBy", "name email")
+      .populate("confirmedBy", "name email")
+      .populate("invoice", "currencyCode")
       .sort({ createdAt: -1 });
+
+    // Enhance with computed fields for frontend compatibility
+    deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
 
     res.json({
       success: true,
       count: deliveryNotes.length,
-      data: deliveryNotes
+      data: deliveryNotes,
     });
   } catch (error) {
     next(error);
@@ -1185,19 +1537,23 @@ exports.getInvoiceDeliveryNotes = async (req, res, next) => {
 exports.getQuotationDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNotes = await DeliveryNote.find({ 
-      quotation: req.params.quotationId, 
-      company: companyId 
+    const deliveryNotes = await DeliveryNote.find({
+      quotation: req.params.quotationId,
+      company: companyId,
     })
-      .populate('client', 'name code')
-      .populate('items.product', 'name sku')
-      .populate('createdBy', 'name email')
+      .populate("client", "name code")
+      .populate("items.product", "name sku")
+      .populate("createdBy", "name email")
+      .populate("invoice", "currencyCode")
       .sort({ createdAt: -1 });
+
+    // Enhance with computed fields for frontend compatibility
+    deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
 
     res.json({
       success: true,
       count: deliveryNotes.length,
-      data: deliveryNotes
+      data: deliveryNotes,
     });
   } catch (error) {
     next(error);
@@ -1210,16 +1566,19 @@ exports.getQuotationDeliveryNotes = async (req, res, next) => {
 exports.generateDeliveryNotePDF = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId })
-      .populate('client')
-      .populate('quotation')
-      .populate('items.product')
-      .populate('company');
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("client")
+      .populate("quotation")
+      .populate("items.product")
+      .populate("company");
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
@@ -1227,8 +1586,11 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
     const doc = new PDFDocument({ margin: 50 });
 
     // Set response headers
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=delivery-note-${deliveryNote.deliveryNumber}.pdf`);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=delivery-note-${deliveryNote.deliveryNumber}.pdf`,
+    );
 
     // Pipe PDF to response
     doc.pipe(res);
@@ -1242,74 +1604,113 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
     let pageNum = 1;
     const drawFooter = (p) => {
       const bottom = doc.page.height - 40;
-      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
-      doc.text(`Generated: ${new Date().toLocaleString()}`, left, bottom, { align: 'left' });
-      doc.text(`Page ${p}`, 0, bottom, { align: 'right' });
+      doc.fontSize(8).fillColor("#9ca3af").font("Helvetica");
+      doc.text(`Generated: ${new Date().toLocaleString()}`, left, bottom, {
+        align: "left",
+      });
+      doc.text(`Page ${p}`, 0, bottom, { align: "right" });
     };
 
     const renderHeader = () => {
       // Header with logo area and title
-      doc.fontSize(24).fillColor('#111827').text('NOTE DE LIVRAISON', { align: 'center' });
+      doc
+        .fontSize(24)
+        .fillColor("#111827")
+        .text("NOTE DE LIVRAISON", { align: "center" });
       doc.moveDown(0.3);
-      
-      doc.fontSize(14).fillColor('#6b7280').text(`N°: ${deliveryNote.deliveryNumber}`, { align: 'center' });
+
+      doc
+        .fontSize(14)
+        .fillColor("#6b7280")
+        .text(`N°: ${deliveryNote.deliveryNumber}`, { align: "center" });
       doc.moveDown(0.8);
 
       // Company and Client info
       const startY = doc.y;
       const lineHeight = 14;
-      
+
       // Left column - Supplier (You)
-      doc.fontSize(10).fillColor('#111827').font('Helvetica-Bold');
-      doc.text('FOURNISSEUR (You):', left, startY);
-      doc.font('Helvetica').fontSize(10).fillColor('#374151');
-      doc.text(deliveryNote.company?.name || 'Company Name', left, startY + lineHeight);
-      doc.text(deliveryNote.company?.taxId ? `TIN: ${deliveryNote.company.taxId}` : '', left, startY + lineHeight * 2);
-      doc.text(deliveryNote.company?.address || '', left, startY + lineHeight * 3);
+      doc.fontSize(10).fillColor("#111827").font("Helvetica-Bold");
+      doc.text("FOURNISSEUR (You):", left, startY);
+      doc.font("Helvetica").fontSize(10).fillColor("#374151");
+      doc.text(
+        deliveryNote.company?.name || "Company Name",
+        left,
+        startY + lineHeight,
+      );
+      doc.text(
+        deliveryNote.company?.taxId ? `TIN: ${deliveryNote.company.taxId}` : "",
+        left,
+        startY + lineHeight * 2,
+      );
+      doc.text(
+        deliveryNote.company?.address || "",
+        left,
+        startY + lineHeight * 3,
+      );
 
       // Right column - Client
       const clientX = left + Math.floor(availWidth * 0.55);
-      doc.font('Helvetica-Bold').fontSize(10).fillColor('#111827');
-      doc.text('CLIENT:', clientX, startY);
-      doc.font('Helvetica').fontSize(10).fillColor('#374151');
-      doc.text(deliveryNote.client?.name || '', clientX, startY + lineHeight);
-      doc.text(deliveryNote.client?.taxId ? `TIN: ${deliveryNote.client.taxId}` : '', clientX, startY + lineHeight * 2);
-      doc.text(deliveryNote.client?.contact?.address || deliveryNote.customerAddress || '', clientX, startY + lineHeight * 3);
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#111827");
+      doc.text("CLIENT:", clientX, startY);
+      doc.font("Helvetica").fontSize(10).fillColor("#374151");
+      doc.text(deliveryNote.client?.name || "", clientX, startY + lineHeight);
+      doc.text(
+        deliveryNote.client?.taxId ? `TIN: ${deliveryNote.client.taxId}` : "",
+        clientX,
+        startY + lineHeight * 2,
+      );
+      doc.text(
+        deliveryNote.client?.contact?.address ||
+          deliveryNote.customerAddress ||
+          "",
+        clientX,
+        startY + lineHeight * 3,
+      );
 
       doc.moveDown(3);
 
       // Date and Reference row
-      doc.fontSize(10).fillColor('#111827');
-      doc.text(`Date: ${new Date(deliveryNote.deliveryDate).toLocaleDateString()}`, left);
+      doc.fontSize(10).fillColor("#111827");
+      doc.text(
+        `Date: ${new Date(deliveryNote.deliveryDate).toLocaleDateString()}`,
+        left,
+      );
       if (deliveryNote.quotation) {
-        doc.text(`Référence: ${deliveryNote.quotation.quotationNumber || 'N/A'}`, left + 200);
+        doc.text(
+          `Référence: ${deliveryNote.quotation.quotationNumber || "N/A"}`,
+          left + 200,
+        );
       }
       doc.moveDown(0.5);
 
       // Driver info
       if (deliveryNote.deliveredBy || deliveryNote.vehicle) {
-        doc.text(`Chauffeur: ${deliveryNote.deliveredBy || '___'}    Véhicule: ${deliveryNote.vehicle || '___'}`);
+        doc.text(
+          `Chauffeur: ${deliveryNote.deliveredBy || "___"}    Véhicule: ${deliveryNote.vehicle || "___"}`,
+        );
         doc.moveDown(0.5);
       }
     };
 
     // Table columns: No, Product, Unit, Ordered, Delivered
-    const colPercents = [0.08, 0.42, 0.12, 0.18, 0.20];
-    const colWidths = colPercents.map(p => Math.floor(availWidth * p));
+    const colPercents = [0.08, 0.42, 0.12, 0.18, 0.2];
+    const colWidths = colPercents.map((p) => Math.floor(availWidth * p));
     const sumCols = colWidths.reduce((s, v) => s + v, 0);
-    if (sumCols < availWidth) colWidths[colWidths.length - 1] += (availWidth - sumCols);
+    if (sumCols < availWidth)
+      colWidths[colWidths.length - 1] += availWidth - sumCols;
 
     const renderTableHeader = (y) => {
-      doc.rect(left - 8, y, availWidth + 16, 28).fill('#111827');
-      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
+      doc.rect(left - 8, y, availWidth + 16, 28).fill("#111827");
+      doc.fillColor("#ffffff").fontSize(10).font("Helvetica-Bold");
       let x = left;
-      const headers = ['No.', 'Produit', 'Unité', 'Commandé', 'Livré'];
+      const headers = ["No.", "Produit", "Unité", "Commandé", "Livré"];
       headers.forEach((h, i) => {
-        const align = (i >= 3) ? 'right' : 'left';
+        const align = i >= 3 ? "right" : "left";
         doc.text(h, x, y + 8, { width: colWidths[i], align });
         x += colWidths[i];
       });
-      doc.fillColor('#111827').font('Helvetica');
+      doc.fillColor("#111827").font("Helvetica");
     };
 
     // Print header and table header
@@ -1319,11 +1720,11 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
     y += 34;
 
     // Items
-    doc.fontSize(9).font('Helvetica');
+    doc.fontSize(9).font("Helvetica");
     for (let idx = 0; idx < deliveryNote.items.length; idx++) {
       const item = deliveryNote.items[idx];
-      const productName = item.productName || item.product?.name || '';
-      const unit = item.unit || item.product?.unit || '';
+      const productName = item.productName || item.product?.name || "";
+      const unit = item.unit || item.product?.unit || "";
       const orderedQty = item.orderedQty || 0;
       const deliveredQty = item.deliveredQty || 0;
 
@@ -1331,9 +1732,20 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
       const hNo = doc.heightOfString(String(idx + 1), { width: colWidths[0] });
       const hProduct = doc.heightOfString(productName, { width: colWidths[1] });
       const hUnit = doc.heightOfString(unit, { width: colWidths[2] });
-      const hOrdered = doc.heightOfString(String(orderedQty), { width: colWidths[3] });
-      const hDelivered = doc.heightOfString(String(deliveredQty), { width: colWidths[4] });
-      const rowHeight = Math.max(hNo, hProduct, hUnit, hOrdered, hDelivered, 14);
+      const hOrdered = doc.heightOfString(String(orderedQty), {
+        width: colWidths[3],
+      });
+      const hDelivered = doc.heightOfString(String(deliveredQty), {
+        width: colWidths[4],
+      });
+      const rowHeight = Math.max(
+        hNo,
+        hProduct,
+        hUnit,
+        hOrdered,
+        hDelivered,
+        14,
+      );
 
       // Page break if needed
       if (y + rowHeight > bottomLimit) {
@@ -1348,24 +1760,38 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
 
       // Alternating shading
       if (idx % 2 === 0) {
-        doc.rect(left - 8, y - 6, availWidth + 16, rowHeight + 8).fill('#f9fafb');
-        doc.fillColor('#111827');
+        doc
+          .rect(left - 8, y - 6, availWidth + 16, rowHeight + 8)
+          .fill("#f9fafb");
+        doc.fillColor("#111827");
       }
 
       // Render cells
       let x = left;
-      doc.text(String(idx + 1), x, y, { width: colWidths[0] }); x += colWidths[0];
-      doc.text(productName, x, y, { width: colWidths[1] }); x += colWidths[1];
-      doc.text(unit, x, y, { width: colWidths[2] }); x += colWidths[2];
-      doc.text(String(orderedQty), x, y, { width: colWidths[3], align: 'right' }); x += colWidths[3];
-      doc.text(String(deliveredQty), x, y, { width: colWidths[4], align: 'right' });
+      doc.text(String(idx + 1), x, y, { width: colWidths[0] });
+      x += colWidths[0];
+      doc.text(productName, x, y, { width: colWidths[1] });
+      x += colWidths[1];
+      doc.text(unit, x, y, { width: colWidths[2] });
+      x += colWidths[2];
+      doc.text(String(orderedQty), x, y, {
+        width: colWidths[3],
+        align: "right",
+      });
+      x += colWidths[3];
+      doc.text(String(deliveredQty), x, y, {
+        width: colWidths[4],
+        align: "right",
+      });
 
       y += rowHeight + 8;
     }
 
     // Notes section
     y += 10;
-    const hasNotes = deliveryNote.notes || (deliveryNote.items && deliveryNote.items.some(i => i.notes));
+    const hasNotes =
+      deliveryNote.notes ||
+      (deliveryNote.items && deliveryNote.items.some((i) => i.notes));
     if (hasNotes) {
       if (y + 60 > bottomLimit) {
         drawFooter(pageNum);
@@ -1373,15 +1799,15 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
         pageNum += 1;
         y = 50;
       }
-      
-      doc.fontSize(10).font('Helvetica-Bold').fillColor('#111827');
-      doc.text('Notes:', left, y);
-      doc.font('Helvetica').fontSize(9).fillColor('#374151');
-      
-      let notesText = deliveryNote.notes || '';
-      
+
+      doc.fontSize(10).font("Helvetica-Bold").fillColor("#111827");
+      doc.text("Notes:", left, y);
+      doc.font("Helvetica").fontSize(9).fillColor("#374151");
+
+      let notesText = deliveryNote.notes || "";
+
       // Add item-specific notes (backorders, etc.)
-      deliveryNote.items.forEach(item => {
+      deliveryNote.items.forEach((item) => {
         if (item.notes) {
           notesText += `\n- ${item.productName}: ${item.notes}`;
         }
@@ -1389,7 +1815,7 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
           notesText += `\n- ${item.productName}: ${item.pendingQty} en attente`;
         }
       });
-      
+
       doc.text(notesText, left, y + 14, { width: availWidth });
       y += 40;
     }
@@ -1405,24 +1831,48 @@ exports.generateDeliveryNotePDF = async (req, res, next) => {
     // Signature boxes
     const boxWidth = Math.floor(availWidth / 2) - 10;
     const boxHeight = 80;
-    
+
     // Delivered by box
-    doc.rect(left, y, boxWidth, boxHeight).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#111827');
-    doc.text('LIVRÉ PAR:', left + 8, y + 8);
-    doc.font('Helvetica').fontSize(9).fillColor('#374151');
-    doc.text(`Nom: ${deliveryNote.deliveredBy || '_______________'}`, left + 8, y + 28);
+    doc
+      .rect(left, y, boxWidth, boxHeight)
+      .strokeColor("#e5e7eb")
+      .lineWidth(0.5)
+      .stroke();
+    doc.fontSize(10).font("Helvetica-Bold").fillColor("#111827");
+    doc.text("LIVRÉ PAR:", left + 8, y + 8);
+    doc.font("Helvetica").fontSize(9).fillColor("#374151");
+    doc.text(
+      `Nom: ${deliveryNote.deliveredBy || "_______________"}`,
+      left + 8,
+      y + 28,
+    );
     doc.text(`Signature: _______________`, left + 8, y + 42);
-    doc.text(`Date: ${deliveryNote.deliveryDate ? new Date(deliveryNote.deliveryDate).toLocaleDateString() : '_______________'}`, left + 8, y + 56);
+    doc.text(
+      `Date: ${deliveryNote.deliveryDate ? new Date(deliveryNote.deliveryDate).toLocaleDateString() : "_______________"}`,
+      left + 8,
+      y + 56,
+    );
 
     // Received by client box
-    doc.rect(left + boxWidth + 20, y, boxWidth, boxHeight).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#111827');
-    doc.text('REÇU PAR LE CLIENT:', left + boxWidth + 28, y + 8);
-    doc.font('Helvetica').fontSize(9).fillColor('#374151');
-    doc.text(`Nom: ${deliveryNote.receivedBy || '_______________'}`, left + boxWidth + 28, y + 28);
+    doc
+      .rect(left + boxWidth + 20, y, boxWidth, boxHeight)
+      .strokeColor("#e5e7eb")
+      .lineWidth(0.5)
+      .stroke();
+    doc.fontSize(10).font("Helvetica-Bold").fillColor("#111827");
+    doc.text("REÇU PAR LE CLIENT:", left + boxWidth + 28, y + 8);
+    doc.font("Helvetica").fontSize(9).fillColor("#374151");
+    doc.text(
+      `Nom: ${deliveryNote.receivedBy || "_______________"}`,
+      left + boxWidth + 28,
+      y + 28,
+    );
     doc.text(`Signature: _______________`, left + boxWidth + 28, y + 42);
-    doc.text(`Date: ${deliveryNote.receivedDate ? new Date(deliveryNote.receivedDate).toLocaleDateString() : '_______________'}`, left + boxWidth + 28, y + 56);
+    doc.text(
+      `Date: ${deliveryNote.receivedDate ? new Date(deliveryNote.receivedDate).toLocaleDateString() : "_______________"}`,
+      left + boxWidth + 28,
+      y + 56,
+    );
     if (deliveryNote.clientStamp) {
       doc.text(`Cachet: ✓`, left + boxWidth + 28, y + 70);
     }
@@ -1442,38 +1892,43 @@ exports.updateLineDeliveryQty = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { qtyToDeliver, batchId, serialNumbers, notes } = req.body;
 
-    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
-    if (deliveryNote.status !== 'draft') {
+    if (deliveryNote.status !== "draft") {
       return res.status(409).json({
         success: false,
         code: ERR_DELIVERY_CONFIRMED,
-        message: 'Cannot update lines on confirmed delivery note'
+        message: "Cannot update lines on confirmed delivery note",
       });
     }
 
     const lineIndex = deliveryNote.lines.findIndex(
-      line => line._id.toString() === req.params.lineId
+      (line) => line._id.toString() === req.params.lineId,
     );
 
     if (lineIndex === -1) {
       return res.status(404).json({
         success: false,
-        message: 'Line not found'
+        message: "Line not found",
       });
     }
 
     // Validate against invoice remaining qty
     const invoice = await Invoice.findById(deliveryNote.invoice);
     if (invoice) {
-      const invoiceLine = invoice.lines.id(deliveryNote.lines[lineIndex].invoiceLineId);
+      const invoiceLine = invoice.lines.id(
+        deliveryNote.lines[lineIndex].invoiceLineId,
+      );
       if (invoiceLine) {
         const alreadyDelivered = invoiceLine.qtyDelivered || 0;
         const remainingQty = invoiceLine.quantity - alreadyDelivered;
@@ -1481,7 +1936,7 @@ exports.updateLineDeliveryQty = async (req, res, next) => {
           return res.status(422).json({
             success: false,
             code: ERR_EXCEEDS_INVOICE_QTY,
-            message: 'qty_to_deliver exceeds remaining invoice qty'
+            message: "qty_to_deliver exceeds remaining invoice qty",
           });
         }
       }
@@ -1503,11 +1958,11 @@ exports.updateLineDeliveryQty = async (req, res, next) => {
 
     await deliveryNote.save();
 
-    await deliveryNote.populate('lines.product warehouse createdBy invoice');
+    await deliveryNote.populate("lines.product warehouse createdBy invoice");
 
     res.json({
       success: true,
-      data: deliveryNote
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);
@@ -1521,30 +1976,33 @@ exports.updateItemDeliveryQty = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { deliveredQty, notes } = req.body;
 
-    const deliveryNote = await DeliveryNote.findOne({ _id: req.params.id, company: companyId });
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!deliveryNote) {
       return res.status(404).json({
         success: false,
-        message: 'Delivery note not found'
+        message: "Delivery note not found",
       });
     }
 
-    if (!['draft', 'dispatched'].includes(deliveryNote.status)) {
+    if (!["draft", "dispatched"].includes(deliveryNote.status)) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot update items on confirmed delivery note'
+        message: "Cannot update items on confirmed delivery note",
       });
     }
 
     const itemIndex = deliveryNote.items.findIndex(
-      item => item._id.toString() === req.params.itemId
+      (item) => item._id.toString() === req.params.itemId,
     );
 
     if (itemIndex === -1) {
       return res.status(404).json({
         success: false,
-        message: 'Item not found'
+        message: "Item not found",
       });
     }
 
@@ -1552,23 +2010,24 @@ exports.updateItemDeliveryQty = async (req, res, next) => {
     if (deliveredQty > deliveryNote.items[itemIndex].orderedQty) {
       return res.status(400).json({
         success: false,
-        message: 'Delivered quantity cannot exceed ordered quantity'
+        message: "Delivered quantity cannot exceed ordered quantity",
       });
     }
 
     deliveryNote.items[itemIndex].deliveredQty = deliveredQty;
-    deliveryNote.items[itemIndex].pendingQty = deliveryNote.items[itemIndex].orderedQty - deliveredQty;
+    deliveryNote.items[itemIndex].pendingQty =
+      deliveryNote.items[itemIndex].orderedQty - deliveredQty;
     if (notes) {
       deliveryNote.items[itemIndex].notes = notes;
     }
 
     await deliveryNote.save();
 
-    await deliveryNote.populate('client items.product createdBy');
+    await deliveryNote.populate("client items.product createdBy");
 
     res.json({
       success: true,
-      data: deliveryNote
+      data: deliveryNote,
     });
   } catch (error) {
     next(error);

@@ -36,14 +36,26 @@ exports.getInvoices = async (req, res, next) => {
     } = req.query;
     const query = { company: companyId };
 
-    // Status filter - support both old and new status names
+    // Status filter - support both old and new status names, and comma-separated list
     if (status) {
-      // Map old status to new
-      const statusMap = {
-        'partial': 'partially_paid',
-        'paid': 'fully_paid'
-      };
-      query.status = statusMap[status] || status;
+      // Check if status contains comma (multiple statuses)
+      if (status.includes(',')) {
+        const statuses = status.split(',').map(s => s.trim());
+        // Map old statuses to new
+        const statusMap = {
+          'partial': 'partially_paid',
+          'paid': 'fully_paid'
+        };
+        const mappedStatuses = statuses.map(s => statusMap[s] || s);
+        query.status = { $in: mappedStatuses };
+      } else {
+        // Single status - Map old status to new
+        const statusMap = {
+          'partial': 'partially_paid',
+          'paid': 'fully_paid'
+        };
+        query.status = statusMap[status] || status;
+      }
     }
 
     if (clientId) {
@@ -1199,6 +1211,14 @@ exports.recordPayment = async (req, res, next) => {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
+    }
+
+    // Record AR tracking transaction for payment
+    try {
+      const ARTrackingService = require('../services/arTrackingService');
+      await ARTrackingService.recordPayment(invoice, amount, paymentMethod, req.user.id);
+    } catch (trackingError) {
+      console.error('AR tracking error for payment:', trackingError);
     }
 
     res.json({

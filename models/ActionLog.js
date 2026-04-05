@@ -21,7 +21,7 @@ const actionLogSchema = new mongoose.Schema({
     enum: [
       'product', 'stock', 'supplier', 'client', 
       'quotation', 'invoice', 'user', 'category', 'report', 'purchase', 'company', 'department', 'receivable',
-      'delivery_note', 'warehouse', 'ar_receipt', 'ar_bad_debt', 'pos_sale', 'pos_payment', 
+      'delivery_note', 'warehouse', 'ar_receipt', 'ar_bad_debt', 'ar_reconciliation', 'pos_sale', 'pos_payment', 
       'drawer_open', 'drawer_close', 'bulk_import', 'payable'
     ],
     required: true

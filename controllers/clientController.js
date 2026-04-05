@@ -597,11 +597,24 @@ exports.getClientCreditNotes = async (req, res, next) => {
     const total = await CreditNote.countDocuments(query);
     const creditNotes = await CreditNote.find(query)
       .populate('createdBy', 'name email')
-      .sort({ creditNoteDate: -1 })
+      // Model uses `creditDate`; sort by that to get expected ordering
+      .sort({ creditDate: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
 
-    const totalAmount = creditNotes.reduce((sum, cn) => sum + cn.grandTotal, 0);
+    // Normalize returned docs to ensure a numeric `grandTotal` is present (fall back to totalAmount)
+    // and provide `creditNoteDate` for frontend consumers (fallback to `creditDate` or createdAt)
+    const normalizedNotes = creditNotes.map(cnDoc => {
+      const cn = (typeof cnDoc.toObject === 'function') ? cnDoc.toObject() : { ...cnDoc };
+      const fallback = (cn.totalAmount !== undefined && cn.totalAmount !== null) ? Number(cn.totalAmount) : 0;
+      // Support legacy or differing field names for total
+      cn.grandTotal = (cn.grandTotal !== undefined && cn.grandTotal !== null) ? Number(cn.grandTotal) : fallback;
+      // Normalize date field expected by frontend: `creditNoteDate`
+      cn.creditNoteDate = cn.creditNoteDate || cn.creditDate || cn.createdAt || null;
+      return cn;
+    });
+
+    const totalAmount = normalizedNotes.reduce((sum, cn) => sum + (Number(cn.grandTotal) || 0), 0);
 
     res.json({
       success: true,
@@ -612,7 +625,7 @@ exports.getClientCreditNotes = async (req, res, next) => {
       summary: {
         totalAmount
       },
-      data: creditNotes
+      data: normalizedNotes
     });
   } catch (error) {
     next(error);

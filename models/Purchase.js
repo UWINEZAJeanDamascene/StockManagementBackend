@@ -314,6 +314,14 @@ purchaseSchema.set('toJSON', {
     if (ret.totalTaxA !== undefined) ret.totalTaxA = toMoney(ret.totalTaxA);
     if (ret.totalTaxB !== undefined) ret.totalTaxB = toMoney(ret.totalTaxB);
 
+    // Handle payments array - convert Decimal128 amounts to strings
+    if (Array.isArray(ret.payments)) {
+      ret.payments = ret.payments.map(payment => ({
+        ...payment,
+        amount: toMoney(payment.amount)
+      }));
+    }
+
     return ret;
   }
 });

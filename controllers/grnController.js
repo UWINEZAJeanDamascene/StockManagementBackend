@@ -1,44 +1,66 @@
-const mongoose = require('mongoose');
-const GoodsReceivedNote = require('../models/GoodsReceivedNote');
-const PurchaseOrder = require('../models/PurchaseOrder');
-const InventoryBatch = require('../models/InventoryBatch');
-const StockBatch = require('../models/StockBatch');
-const StockSerialNumber = require('../models/StockSerialNumber');
-const StockMovement = require('../models/StockMovement');
-const Product = require('../models/Product');
-const Supplier = require('../models/Supplier');
-const JournalService = require('../services/journalService');
-const TaxAutomationService = require('../services/taxAutomationService');
-const transactionService = require('../services/transactionService');
-const cacheService = require('../services/cacheService');
-const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
+const mongoose = require("mongoose");
+const GoodsReceivedNote = require("../models/GoodsReceivedNote");
+const PurchaseOrder = require("../models/PurchaseOrder");
+const InventoryBatch = require("../models/InventoryBatch");
+const StockBatch = require("../models/StockBatch");
+const StockSerialNumber = require("../models/StockSerialNumber");
+const StockMovement = require("../models/StockMovement");
+const Product = require("../models/Product");
+const Supplier = require("../models/Supplier");
+const JournalService = require("../services/journalService");
+const TaxAutomationService = require("../services/taxAutomationService");
+const transactionService = require("../services/transactionService");
+const cacheService = require("../services/cacheService");
+const DEFAULT_ACCOUNTS =
+  require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
+const StockLevel = require("../models/StockLevel");
 
 // Create GRN (simple create against approved PO)
 exports.createGRN = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { purchaseOrderId, warehouse, lines, referenceNo, supplierInvoiceNo, receivedDate } = req.body;
+    const {
+      purchaseOrderId,
+      warehouse,
+      lines,
+      referenceNo,
+      supplierInvoiceNo,
+      receivedDate,
+    } = req.body;
 
-    const po = await PurchaseOrder.findOne({ _id: purchaseOrderId, company: companyId });
-    if (!po) return res.status(404).json({ success: false, message: 'Purchase order not found' });
-    if (po.status !== 'approved' && po.status !== 'partially_received') return res.status(409).json({ success: false, message: 'PO must be approved before creating GRN' });
+    const po = await PurchaseOrder.findOne({
+      _id: purchaseOrderId,
+      company: companyId,
+    });
+    if (!po)
+      return res
+        .status(404)
+        .json({ success: false, message: "Purchase order not found" });
+    if (po.status !== "approved" && po.status !== "partially_received")
+      return res
+        .status(409)
+        .json({
+          success: false,
+          message: "PO must be approved before creating GRN",
+        });
 
     // Validate qtyReceived against remaining qty for each line and enrich with taxRate from PO
     const enrichedLines = [];
     for (const line of lines) {
       const poLine = po.lines.id(line.purchaseOrderLine);
       if (poLine) {
-        const remainingQty = (poLine.qtyOrdered || 0) - (poLine.qtyReceived || 0);
+        const remainingQty =
+          (poLine.qtyOrdered || 0) - (poLine.qtyReceived || 0);
         if (line.qtyReceived > remainingQty) {
-          return res.status(400).json({ 
-            success: false, 
-            message: `Qty received (${line.qtyReceived}) exceeds remaining qty (${remainingQty}) for product` 
+          return res.status(400).json({
+            success: false,
+            message: `Qty received (${line.qtyReceived}) exceeds remaining qty (${remainingQty}) for product`,
           });
         }
         // Enrich line with taxRate from PO line for frontend display
         enrichedLines.push({
           ...line,
-          taxRate: line.taxRate != null ? line.taxRate : (poLine.taxRate || 0)
+          taxRate: line.taxRate != null ? line.taxRate : poLine.taxRate || 0,
         });
       } else {
         enrichedLines.push(line);
@@ -54,7 +76,7 @@ exports.createGRN = async (req, res, next) => {
       supplierInvoiceNo: supplierInvoiceNo || null,
       receivedDate: receivedDate ? new Date(receivedDate) : undefined,
       lines: enrichedLines,
-      createdBy: req.user.id
+      createdBy: req.user.id,
     });
 
     res.status(201).json({ success: true, data: grn });
@@ -72,13 +94,28 @@ exports.confirmGRN = async (req, res, next) => {
     const useSession = !!sess;
     const findOpts = useSession ? { session: sess } : {};
 
-    const grn = await GoodsReceivedNote.findOne({ _id: req.params.id, company: companyId }, null, findOpts);
-    if (!grn) throw Object.assign(new Error('GRN not found'), { status: 404 });
-    if (grn.status === 'confirmed') throw Object.assign(new Error('GRN already confirmed'), { status: 400 });
+    const grn = await GoodsReceivedNote.findOne(
+      { _id: req.params.id, company: companyId },
+      null,
+      findOpts,
+    );
+    if (!grn) throw Object.assign(new Error("GRN not found"), { status: 404 });
+    if (grn.status === "confirmed")
+      throw Object.assign(new Error("GRN already confirmed"), { status: 400 });
 
-    const po = await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }, null, findOpts);
-    if (!po) throw Object.assign(new Error('Purchase order not found'), { status: 404 });
-    if (po.status !== 'approved' && po.status !== 'partially_received') throw Object.assign(new Error('PO must be approved to confirm GRN'), { status: 409 });
+    const po = await PurchaseOrder.findOne(
+      { _id: grn.purchaseOrder, company: companyId },
+      null,
+      findOpts,
+    );
+    if (!po)
+      throw Object.assign(new Error("Purchase order not found"), {
+        status: 404,
+      });
+    if (po.status !== "approved" && po.status !== "partially_received")
+      throw Object.assign(new Error("PO must be approved to confirm GRN"), {
+        status: 409,
+      });
 
     let journalLines = [];
     let vatTotal = 0;
@@ -96,56 +133,94 @@ exports.confirmGRN = async (req, res, next) => {
 
     // First pass: Validate tracking types and prepare batch/serial data
     for (const line of grn.lines) {
-      const product = await Product.findOne({ _id: line.product, company: companyId }, null, useSession ? { session: sess } : {});
-      
+      const product = await Product.findOne(
+        { _id: line.product, company: companyId },
+        null,
+        useSession ? { session: sess } : {},
+      );
+
       if (!product) {
-        throw Object.assign(new Error(`Product not found: ${line.product}`), { status: 404 });
+        throw Object.assign(new Error(`Product not found: ${line.product}`), {
+          status: 404,
+        });
       }
 
       // Ensure stockable products have a valid unit cost
-      const isStockable = product.isStockable !== false && product.isStockable !== undefined ? product.isStockable : true;
+      const isStockable =
+        product.isStockable !== false && product.isStockable !== undefined
+          ? product.isStockable
+          : true;
       if (isStockable && (!line.unitCost || Number(line.unitCost) <= 0)) {
-        throw Object.assign(new Error(`Unit cost must be greater than zero for stockable product ${product.name}`), { status: 400 });
+        throw Object.assign(
+          new Error(
+            `Unit cost must be greater than zero for stockable product ${product.name}`,
+          ),
+          { status: 400 },
+        );
       }
 
-      const trackingType = product.trackingType || 'none';
+      const trackingType = product.trackingType || "none";
 
       // Batch tracking: require batchNo
-      if (trackingType === 'batch') {
+      if (trackingType === "batch") {
         if (!line.batchNo) {
-          throw Object.assign(new Error(`Batch number required for product ${product.name} (tracking_type=batch)`), { status: 400 });
+          throw Object.assign(
+            new Error(
+              `Batch number required for product ${product.name} (tracking_type=batch)`,
+            ),
+            { status: 400 },
+          );
         }
       }
 
       // Serial tracking: require serialNumbers array with count matching qtyReceived
-      if (trackingType === 'serial') {
+      if (trackingType === "serial") {
         if (!line.serialNumbers || !Array.isArray(line.serialNumbers)) {
-          throw Object.assign(new Error(`Serial numbers array required for product ${product.name} (tracking_type=serial)`), { status: 400 });
+          throw Object.assign(
+            new Error(
+              `Serial numbers array required for product ${product.name} (tracking_type=serial)`,
+            ),
+            { status: 400 },
+          );
         }
         if (line.serialNumbers.length !== line.qtyReceived) {
-          throw Object.assign(new Error(`Serial numbers count (${line.serialNumbers.length}) must equal qty_received (${line.qtyReceived}) for product ${product.name}`), { status: 400 });
+          throw Object.assign(
+            new Error(
+              `Serial numbers count (${line.serialNumbers.length}) must equal qty_received (${line.qtyReceived}) for product ${product.name}`,
+            ),
+            { status: 400 },
+          );
         }
       }
     }
 
     // Second pass: Process stock
     for (const line of grn.lines) {
-      const product = await Product.findOne({ _id: line.product, company: companyId }, null, useSession ? { session: sess } : {});
-      const trackingType = product.trackingType || 'none';
+      const product = await Product.findOne(
+        { _id: line.product, company: companyId },
+        null,
+        useSession ? { session: sess } : {},
+      );
+      const trackingType = product.trackingType || "none";
 
       // Handle batch tracking
-      if (trackingType === 'batch' && line.batchNo) {
+      if (trackingType === "batch" && line.batchNo) {
         // Check if batch already exists
-        let stockBatch = await StockBatch.findOne({
-          company: companyId,
-          product: line.product,
-          warehouse: grn.warehouse,
-          batchNo: line.batchNo.toUpperCase()
-        }, null, useSession ? { session: sess } : {});
+        let stockBatch = await StockBatch.findOne(
+          {
+            company: companyId,
+            product: line.product,
+            warehouse: grn.warehouse,
+            batchNo: line.batchNo.toUpperCase(),
+          },
+          null,
+          useSession ? { session: sess } : {},
+        );
 
         if (stockBatch) {
           // Update existing batch
-          stockBatch.qtyOnHand = (Number(stockBatch.qtyOnHand) || 0) + Number(line.qtyReceived);
+          stockBatch.qtyOnHand =
+            (Number(stockBatch.qtyOnHand) || 0) + Number(line.qtyReceived);
           await stockBatch.save(useSession ? { session: sess } : {});
         } else {
           // Create new batch
@@ -160,7 +235,7 @@ exports.confirmGRN = async (req, res, next) => {
             unitCost: line.unitCost,
             manufactureDate: line.manufactureDate || null,
             expiryDate: line.expiryDate || null,
-            isQuarantined: false
+            isQuarantined: false,
           });
           await stockBatch.save(useSession ? { session: sess } : {});
           createdStockBatches.push(stockBatch._id);
@@ -168,17 +243,30 @@ exports.confirmGRN = async (req, res, next) => {
       }
 
       // Handle serial number tracking
-      if (trackingType === 'serial' && line.serialNumbers && line.serialNumbers.length > 0) {
+      if (
+        trackingType === "serial" &&
+        line.serialNumbers &&
+        line.serialNumbers.length > 0
+      ) {
         for (const serialNo of line.serialNumbers) {
           // Check if serial already exists for this product
-          const existingSerial = await StockSerialNumber.findOne({
-            company: companyId,
-            product: line.product,
-            serialNo: serialNo.toUpperCase()
-          }, null, useSession ? { session: sess } : {});
+          const existingSerial = await StockSerialNumber.findOne(
+            {
+              company: companyId,
+              product: line.product,
+              serialNo: serialNo.toUpperCase(),
+            },
+            null,
+            useSession ? { session: sess } : {},
+          );
 
           if (existingSerial) {
-            throw Object.assign(new Error(`Serial number ${serialNo} already exists for product ${product.name}`), { status: 400 });
+            throw Object.assign(
+              new Error(
+                `Serial number ${serialNo} already exists for product ${product.name}`,
+              ),
+              { status: 400 },
+            );
           }
 
           const stockSerial = new StockSerialNumber({
@@ -188,7 +276,7 @@ exports.confirmGRN = async (req, res, next) => {
             grn: grn._id,
             serialNo: serialNo.toUpperCase(),
             unitCost: line.unitCost,
-            status: 'in_stock'
+            status: "in_stock",
           });
           await stockSerial.save(useSession ? { session: sess } : {});
           createdSerialNumbers.push(stockSerial._id);
@@ -204,7 +292,7 @@ exports.confirmGRN = async (req, res, next) => {
         availableQuantity: line.qtyReceived,
         unitCost: line.unitCost,
         receivedDate: grn.receivedDate,
-        createdBy: req.user.id
+        createdBy: req.user.id,
       });
       await batch.save(useSession ? { session: sess } : {});
       createdBatches.push(batch._id);
@@ -213,47 +301,112 @@ exports.confirmGRN = async (req, res, next) => {
       const previousStock = Number(product.currentStock || 0);
       const previousAvg = Number(product.averageCost || 0);
       if (!updatedProducts.has(String(product._id))) {
-        updatedProducts.set(String(product._id), { previousStock, previousAvg });
+        updatedProducts.set(String(product._id), {
+          previousStock,
+          previousAvg,
+        });
       }
-      product.currentStock = (Number(product.currentStock || 0) + Number(line.qtyReceived));
+      product.currentStock =
+        Number(product.currentStock || 0) + Number(line.qtyReceived);
 
       // Always update averageCost using weighted average formula for display purposes
       const existingValue = (Number(product.averageCost) || 0) * previousStock;
       const receivedValue = Number(line.unitCost) * Number(line.qtyReceived);
       const newQty = previousStock + Number(line.qtyReceived);
-      product.averageCost = newQty > 0 ? ((existingValue + receivedValue) / newQty) : product.averageCost;
+      product.averageCost =
+        newQty > 0
+          ? (existingValue + receivedValue) / newQty
+          : product.averageCost;
 
       await product.save(useSession ? { session: sess } : {});
+
+      // ── Upsert StockLevel (qty + WAC) for this product/warehouse ──────────
+      try {
+        const existingLevel = await StockLevel.findOne(
+          {
+            company_id: companyId,
+            product_id: line.product,
+            warehouse_id: grn.warehouse,
+          },
+          null,
+          useSession ? { session: sess } : {},
+        );
+        const prevQtyOnHand = existingLevel
+          ? existingLevel.qty_on_hand || 0
+          : 0;
+        const prevAvgCost = existingLevel ? existingLevel.avg_cost || 0 : 0;
+        const recvQty = Number(line.qtyReceived);
+        const recvCost = Number(line.unitCost);
+        const newQtyOnHand =
+          Math.round((prevQtyOnHand + recvQty) * 10000) / 10000;
+        const newAvgCost =
+          newQtyOnHand > 0
+            ? Math.round(
+                ((prevQtyOnHand * prevAvgCost + recvQty * recvCost) /
+                  newQtyOnHand) *
+                  1000000,
+              ) / 1000000
+            : recvCost;
+        const newTotalValue = Math.round(newQtyOnHand * newAvgCost * 100) / 100;
+
+        await StockLevel.findOneAndUpdate(
+          {
+            company_id: companyId,
+            product_id: line.product,
+            warehouse_id: grn.warehouse,
+          },
+          {
+            $set: {
+              qty_on_hand: newQtyOnHand,
+              avg_cost: newAvgCost,
+              total_value: newTotalValue,
+              last_movement_at: new Date(),
+              last_movement_type: "receipt",
+            },
+            $setOnInsert: {
+              qty_reserved: 0,
+              qty_on_order: 0,
+            },
+          },
+          { upsert: true, ...(useSession ? { session: sess } : {}) },
+        );
+      } catch (slErr) {
+        // StockLevel sync is best-effort — do not abort the GRN confirmation
+        console.error("StockLevel sync failed for GRN line:", slErr.message);
+      }
 
       const movement = new StockMovement({
         company: companyId,
         product: line.product,
-        type: 'in',
-        reason: 'purchase',
+        type: "in",
+        reason: "purchase",
         quantity: line.qtyReceived,
         previousStock,
         newStock: product.currentStock,
         unitCost: line.unitCost,
         totalCost: line.unitCost * line.qtyReceived,
         warehouse: grn.warehouse,
-        referenceType: 'purchase_order',
+        referenceType: "purchase_order",
         referenceNumber: po.referenceNo,
         referenceDocument: po._id,
-        referenceModel: 'PurchaseOrder',
+        referenceModel: "PurchaseOrder",
         performedBy: req.user.id,
-        movementDate: new Date()
+        movementDate: new Date(),
       });
       await movement.save(useSession ? { session: sess } : {});
       createdMovements.push(movement._id);
 
       const poLine = po.lines.id(line.purchaseOrderLine);
       if (poLine) {
-        updatedPOLines.push({ id: String(poLine._id), previousQty: poLine.qtyReceived || 0 });
+        updatedPOLines.push({
+          id: String(poLine._id),
+          previousQty: poLine.qtyReceived || 0,
+        });
         poLine.qtyReceived = (poLine.qtyReceived || 0) + line.qtyReceived;
       }
 
       const lineNet = Number(line.unitCost) * line.qtyReceived;
-      const lineTaxRate = (poLine && poLine.taxRate) ? poLine.taxRate : 0;
+      const lineTaxRate = poLine && poLine.taxRate ? poLine.taxRate : 0;
       purchaseTaxLines.push({ netAmount: lineNet, taxRatePct: lineTaxRate });
 
       const prev = productTotals.get(String(line.product)) || 0;
@@ -261,12 +414,19 @@ exports.confirmGRN = async (req, res, next) => {
     }
 
     const totalOrdered = po.lines.reduce((s, l) => s + (l.qtyOrdered || 0), 0);
-    const totalReceived = po.lines.reduce((s, l) => s + (l.qtyReceived || 0), 0);
-    po.status = totalReceived >= totalOrdered ? 'fully_received' : 'partially_received';
+    const totalReceived = po.lines.reduce(
+      (s, l) => s + (l.qtyReceived || 0),
+      0,
+    );
+    po.status =
+      totalReceived >= totalOrdered ? "fully_received" : "partially_received";
     await po.save(useSession ? { session: sess } : {});
 
     // Use TaxAutomationService for centralized tax computation
-    const purchaseTax = await TaxAutomationService.computePurchaseTax(companyId, purchaseTaxLines);
+    const purchaseTax = await TaxAutomationService.computePurchaseTax(
+      companyId,
+      purchaseTaxLines,
+    );
 
     // Build journal lines from TaxAutomationService output
     // Inventory lines (per product)
@@ -274,48 +434,86 @@ exports.confirmGRN = async (req, res, next) => {
       const product = await Product.findById(prodId).lean();
       let invAcct = DEFAULT_ACCOUNTS.inventory;
       if (product.inventoryAccount) {
-        if (typeof product.inventoryAccount === 'string' && product.inventoryAccount.length === 24 && /^[0-9a-fA-F]{24}$/.test(product.inventoryAccount)) {
+        if (
+          typeof product.inventoryAccount === "string" &&
+          product.inventoryAccount.length === 24 &&
+          /^[0-9a-fA-F]{24}$/.test(product.inventoryAccount)
+        ) {
           // It's an ObjectId - resolve to account code
-          const ChartOfAccounts = require('../models/ChartOfAccount');
-          const acctDoc = await ChartOfAccounts.findById(product.inventoryAccount).lean();
+          const ChartOfAccounts = require("../models/ChartOfAccount");
+          const acctDoc = await ChartOfAccounts.findById(
+            product.inventoryAccount,
+          ).lean();
           invAcct = acctDoc ? acctDoc.code : DEFAULT_ACCOUNTS.inventory;
         } else {
           invAcct = product.inventoryAccount;
         }
       } else {
-        invAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: grn.warehouse });
+        invAcct = await JournalService.getMappedAccountCode(
+          companyId,
+          "purchases",
+          "inventory",
+          DEFAULT_ACCOUNTS.inventory,
+          { productId: prodId, warehouseId: grn.warehouse },
+        );
       }
-      journalLines.push(JournalService.createDebitLine(invAcct || DEFAULT_ACCOUNTS.inventory, amt, `Purchase ${po.referenceNo} - ${grn.referenceNo}`));
+      journalLines.push(
+        JournalService.createDebitLine(
+          invAcct || DEFAULT_ACCOUNTS.inventory,
+          amt,
+          `Purchase ${po.referenceNo} - ${grn.referenceNo}`,
+        ),
+      );
     }
 
     // VAT Input line from TaxAutomationService
     if (purchaseTax.totals.tax > 0) {
-      journalLines.push(JournalService.createDebitLine(
-        DEFAULT_ACCOUNTS.vatInput || '2210',
-        purchaseTax.totals.tax,
-        `VAT Input for ${grn.referenceNo}`
-      ));
+      journalLines.push(
+        JournalService.createDebitLine(
+          DEFAULT_ACCOUNTS.vatInput || "2210",
+          purchaseTax.totals.tax,
+          `VAT Input for ${grn.referenceNo}`,
+        ),
+      );
     }
 
-    const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
-    journalLines.push(JournalService.createCreditLine(apAcct, purchaseTax.totals.gross, `AP for ${po.referenceNo} / ${grn.referenceNo}`));
+    const apAcct = await JournalService.getMappedAccountCode(
+      companyId,
+      "purchases",
+      "accountsPayable",
+      DEFAULT_ACCOUNTS.accountsPayable,
+    );
+    journalLines.push(
+      JournalService.createCreditLine(
+        apAcct,
+        purchaseTax.totals.gross,
+        `AP for ${po.referenceNo} / ${grn.referenceNo}`,
+      ),
+    );
 
     const supplier = await Supplier.findById(po.supplier).lean();
-    const narration = `Purchase - ${supplier ? supplier.name : ''} - PO#${po.referenceNo} - GRN#${grn.referenceNo}`;
+    const narration = `Purchase - ${supplier ? supplier.name : ""} - PO#${po.referenceNo} - GRN#${grn.referenceNo}`;
 
     let je;
     try {
-      const created = await JournalService.createEntriesAtomic(companyId, req.user.id, [{
-        date: new Date(),
-        description: narration,
-        sourceType: 'purchase_order',
-        sourceId: grn._id,
-        sourceReference: `${po.referenceNo} / ${grn.referenceNo}`,
-        lines: journalLines,
-        isAutoGenerated: true,
-        session: useSession ? sess : null
-      }], { session: useSession ? sess : null });
-      je = (created && created.length) ? created[0] : null;
+      const created = await JournalService.createEntriesAtomic(
+        companyId,
+        req.user.id,
+        [
+          {
+            date: new Date(),
+            description: narration,
+            sourceType: "purchase_order",
+            sourceId: grn._id,
+            sourceReference: `${po.referenceNo} / ${grn.referenceNo}`,
+            lines: journalLines,
+            isAutoGenerated: true,
+            session: useSession ? sess : null,
+          },
+        ],
+        { session: useSession ? sess : null },
+      );
+      je = created && created.length ? created[0] : null;
     } catch (jeErr) {
       // If we're not in a DB transaction, perform manual rollback of created resources
       if (!useSession) {
@@ -334,11 +532,19 @@ exports.confirmGRN = async (req, res, next) => {
           }
           // delete created serial numbers (Module 4)
           if (createdSerialNumbers.length) {
-            await StockSerialNumber.deleteMany({ _id: { $in: createdSerialNumbers } });
+            await StockSerialNumber.deleteMany({
+              _id: { $in: createdSerialNumbers },
+            });
           }
           // restore product stocks and avg
           for (const [prodId, prev] of updatedProducts.entries()) {
-            await Product.updateOne({ _id: prodId }, { currentStock: prev.previousStock, averageCost: prev.previousAvg });
+            await Product.updateOne(
+              { _id: prodId },
+              {
+                currentStock: prev.previousStock,
+                averageCost: prev.previousAvg,
+              },
+            );
           }
           // restore PO lines
           for (const pl of updatedPOLines) {
@@ -346,12 +552,12 @@ exports.confirmGRN = async (req, res, next) => {
             if (lineDoc) lineDoc.qtyReceived = pl.previousQty;
           }
           // restore PO status
-          po.status = 'approved';
+          po.status = "approved";
           await po.save();
 
           // leave GRN as draft (do not set journalEntry)
         } catch (rbErr) {
-          console.error('Failed during manual rollback after JE error:', rbErr);
+          console.error("Failed during manual rollback after JE error:", rbErr);
         }
       }
       // rethrow to caller
@@ -359,31 +565,44 @@ exports.confirmGRN = async (req, res, next) => {
     }
 
     grn.journalEntry = je._id;
-    grn.status = 'confirmed';
+    grn.status = "confirmed";
     grn.confirmedBy = req.user.id;
     grn.confirmedAt = new Date();
-    
+
     // Calculate and set totalAmount from lines
-    const grnTotal = grn.lines.reduce((sum, line) => sum + (Number(line.qtyReceived) * Number(line.unitCost || 0)), 0);
+    const grnTotal = grn.lines.reduce(
+      (sum, line) =>
+        sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
+      0,
+    );
     grn.totalAmount = grnTotal;
     grn.balance = grnTotal;
-    grn.paymentStatus = 'pending';
-    
+    grn.paymentStatus = "pending";
+
     await grn.save(useSession ? { session: sess } : {});
 
     return grn;
   };
 
   try {
-    const result = await transactionService.runInTransaction(async (trx) => await runConfirm(trx));
+    const result = await transactionService.runInTransaction(
+      async (trx) => await runConfirm(trx),
+    );
     try {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
-      console.error('Cache bump after GRN confirm failed:', e);
+      console.error("Cache bump after GRN confirm failed:", e);
     }
-    res.json({ success: true, message: 'GRN confirmed', data: await GoodsReceivedNote.findById(result._id) });
+    res.json({
+      success: true,
+      message: "GRN confirmed",
+      data: await GoodsReceivedNote.findById(result._id),
+    });
   } catch (err) {
-    if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });
+    if (err && err.status)
+      return res
+        .status(err.status)
+        .json({ success: false, message: err.message });
     next(err);
   }
 };
@@ -392,10 +611,17 @@ exports.confirmGRN = async (req, res, next) => {
 exports.listGRNs = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { supplier_id, status, date_from, date_to, page = 1, limit = 20 } = req.query;
-    
+    const {
+      supplier_id,
+      status,
+      date_from,
+      date_to,
+      page = 1,
+      limit = 20,
+    } = req.query;
+
     const query = { company: companyId };
-    
+
     if (supplier_id) query.supplier = supplier_id;
     if (status) query.status = status;
     if (date_from || date_to) {
@@ -403,27 +629,31 @@ exports.listGRNs = async (req, res, next) => {
       if (date_from) query.receivedDate.$gte = new Date(date_from);
       if (date_to) query.receivedDate.$lte = new Date(date_to);
     }
-    
+
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    
+
     const grns = await GoodsReceivedNote.find(query)
-      .populate('purchaseOrder', 'referenceNo')
-      .populate('supplier', 'name code')
-      .populate('warehouse', 'name code')
-      .populate('createdBy', 'name email')
+      .populate("purchaseOrder", "referenceNo")
+      .populate("supplier", "name code")
+      .populate("warehouse", "name code")
+      .populate("createdBy", "name email")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit))
       .lean();
-    
+
     const total = await GoodsReceivedNote.countDocuments(query);
-    
+
     // Calculate totalAmount for each GRN from lines
-    const grnsWithTotal = grns.map(grn => {
-      const totalAmount = grn.lines.reduce((sum, line) => sum + (Number(line.qtyReceived) * Number(line.unitCost || 0)), 0);
+    const grnsWithTotal = grns.map((grn) => {
+      const totalAmount = grn.lines.reduce(
+        (sum, line) =>
+          sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
+        0,
+      );
       return { ...grn, totalAmount };
     });
-    
+
     res.json({
       success: true,
       data: grnsWithTotal,
@@ -431,8 +661,8 @@ exports.listGRNs = async (req, res, next) => {
         currentPage: parseInt(page),
         totalPages: Math.ceil(total / parseInt(limit)),
         total,
-        limit: parseInt(limit)
-      }
+        limit: parseInt(limit),
+      },
     });
   } catch (err) {
     next(err);
@@ -443,31 +673,38 @@ exports.listGRNs = async (req, res, next) => {
 exports.getGRN = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
-    const grn = await GoodsReceivedNote.findOne({ _id: req.params.id, company: companyId })
+
+    const grn = await GoodsReceivedNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
       .populate({
-        path: 'purchaseOrder',
+        path: "purchaseOrder",
         populate: {
-          path: 'lines.product',
-          select: 'name sku'
-        }
+          path: "lines.product",
+          select: "name sku",
+        },
       })
-      .populate('lines.product', 'name sku')
-      .populate('supplier', 'name code contact')
-      .populate('warehouse', 'name code')
-      .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
-      .populate('journalEntry')
+      .populate("lines.product", "name sku")
+      .populate("supplier", "name code contact")
+      .populate("warehouse", "name code")
+      .populate("createdBy", "name email")
+      .populate("confirmedBy", "name email")
+      .populate("journalEntry")
       .lean();
-    
+
     if (!grn) {
-      return res.status(404).json({ success: false, message: 'GRN not found' });
+      return res.status(404).json({ success: false, message: "GRN not found" });
     }
-    
+
     // Calculate totals from lines
-    const totalAmount = grn.lines.reduce((sum, line) => sum + (Number(line.qtyReceived) * Number(line.unitCost || 0)), 0);
+    const totalAmount = grn.lines.reduce(
+      (sum, line) =>
+        sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
+      0,
+    );
     grn.totalAmount = totalAmount;
-    
+
     res.json({ success: true, data: grn });
   } catch (err) {
     next(err);

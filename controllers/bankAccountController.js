@@ -30,16 +30,59 @@ exports.getBankAccounts = async (req, res, next) => {
       query.isActive = isActive === 'true';
     }
     
-    const accounts = await BankAccount.find(query)
+    let accounts = await BankAccount.find(query)
       .populate('createdBy', 'name email')
       .sort({ isPrimary: -1, name: 1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
     
+    // Compute actual balance from journal entries for each account
+    const JournalEntry = require('../models/JournalEntry');
+    accounts = await Promise.all(accounts.map(async (account) => {
+      const accObj = account.toObject();
+      
+      // Get computed balance from journal entries
+      const ledgerAccountId = account.ledgerAccountId || '1100';
+      const openingBalance = parseFloat(account.openingBalance?.toString() || '0');
+      const openingBalanceDate = account.openingBalanceDate || new Date(0);
+      
+      // Aggregate journal entries for this bank account's ledger account
+      const agg = await JournalEntry.aggregate([
+        { $match: { company: companyId, status: 'posted', date: { $gte: openingBalanceDate } } },
+        { $unwind: '$lines' },
+        { $match: { 'lines.accountCode': ledgerAccountId } },
+        { $group: {
+          _id: null,
+          totalDebits: { $sum: { $toDouble: { $ifNull: [ '$lines.debit', 0 ] } } },
+          totalCredits: { $sum: { $toDouble: { $ifNull: [ '$lines.credit', 0 ] } } }
+        }}
+      ]).allowDiskUse(true);
+      
+      const totalDebits = agg[0]?.totalDebits || 0;
+      const totalCredits = agg[0]?.totalCredits || 0;
+      const computedBalance = openingBalance + totalDebits - totalCredits;
+      
+      // Return account with computed balance
+      return {
+        ...accObj,
+        cachedBalance: computedBalance,
+        computedFromJournal: true
+      };
+    }));
+    
     const total = await BankAccount.countDocuments(query);
     
-    // Get totals by type
-    const totals = await BankAccount.getTotalCashPosition(companyId);
+    // Get totals by type using computed balances
+    const totals = {
+      total: accounts.reduce((sum, acc) => sum + (acc.cachedBalance || 0), 0),
+      byType: {}
+    };
+    
+    accounts.forEach(acc => {
+      const type = acc.accountType || 'unknown';
+      if (!totals.byType[type]) totals.byType[type] = 0;
+      totals.byType[type] += acc.cachedBalance || 0;
+    });
     
     res.json({
       success: true,
@@ -70,9 +113,51 @@ exports.getBankAccount = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Bank account not found' });
     }
     
+    // Compute actual balance from journal entries
+    const JournalEntry = require('../models/JournalEntry');
+    const ledgerAccountId = account.ledgerAccountId || '1100';
+    const openingBalance = parseFloat(account.openingBalance?.toString() || '0');
+    const openingBalanceDate = account.openingBalanceDate || new Date(0);
+    
+    console.log('[BankAccount Debug]', {
+      accountId: account._id,
+      name: account.name,
+      ledgerAccountId: account.ledgerAccountId,
+      openingBalance: openingBalance,
+      openingBalanceDate: openingBalanceDate
+    });
+    
+    // Aggregate journal entries for this bank account's ledger account
+    const agg = await JournalEntry.aggregate([
+      { $match: { company: companyId, status: 'posted', date: { $gte: openingBalanceDate } } },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': ledgerAccountId } },
+      { $group: {
+        _id: null,
+        totalDebits: { $sum: { $toDouble: { $ifNull: [ '$lines.debit', 0 ] } } },
+        totalCredits: { $sum: { $toDouble: { $ifNull: [ '$lines.credit', 0 ] } } }
+      }}
+    ]).allowDiskUse(true);
+    
+    const totalDebits = agg[0]?.totalDebits || 0;
+    const totalCredits = agg[0]?.totalCredits || 0;
+    const computedBalance = openingBalance + totalDebits - totalCredits;
+    
+    console.log('[BankAccount Debug Balance]', {
+      totalDebits,
+      totalCredits,
+      computedBalance,
+      aggResult: agg[0]
+    });
+    
+    // Convert to plain object and update balance
+    const accountData = account.toObject();
+    accountData.cachedBalance = computedBalance;
+    accountData.computedFromJournal = true;
+    
     res.json({
       success: true,
-      data: account
+      data: accountData
     });
   } catch (error) {
     next(error);
@@ -219,6 +304,7 @@ exports.getAccountTransactions = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Bank account not found' });
     }
     
+    // First try to get transactions from BankTransaction collection
     const query = { account: req.params.id };
     
     if (type) {
@@ -231,11 +317,98 @@ exports.getAccountTransactions = async (req, res, next) => {
       if (endDate) query.date.$lte = new Date(endDate);
     }
     
-    const transactions = await BankTransaction.find(query)
+    let transactions = await BankTransaction.find(query)
       .populate('createdBy', 'name email')
       .sort({ date: -1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
+    
+    // If no BankTransaction records found, fetch from journal entries
+    if (transactions.length === 0) {
+      const ledgerAccountId = account.ledgerAccountId || '1100';
+      
+      // Build journal entry query
+      const journalQuery = { 
+        company: companyId,
+        status: 'posted'
+      };
+      
+      if (startDate || endDate) {
+        journalQuery.date = {};
+        if (startDate) journalQuery.date.$gte = new Date(startDate);
+        if (endDate) journalQuery.date.$lte = new Date(endDate);
+      }
+      
+      // Get journal entries that have lines matching this bank account's ledger account
+      const journalEntries = await JournalEntry.find(journalQuery)
+        .populate('createdBy', 'name email')
+        .sort({ date: -1 });
+      
+      // Filter and transform journal entries into transaction format
+      transactions = [];
+      let runningBalance = parseFloat(account.openingBalance?.toString() || '0');
+      
+      for (const entry of journalEntries) {
+        // Find lines that involve this bank account's ledger account
+        const bankLines = entry.lines.filter(line => 
+          line.accountCode === ledgerAccountId ||
+          line.accountCode === account.accountCode
+        );
+        
+        for (const line of bankLines) {
+          const amount = parseFloat(line.debit || 0) || parseFloat(line.credit || 0);
+          if (amount === 0) continue;
+          
+          // Determine transaction type based on debit/credit
+          // Debit to bank account = deposit (inflow)
+          // Credit from bank account = withdrawal (outflow)
+          const txType = parseFloat(line.debit || 0) > 0 ? 'deposit' : 'withdrawal';
+          
+          // Update running balance
+          if (txType === 'deposit') {
+            runningBalance += amount;
+          } else {
+            runningBalance -= amount;
+          }
+          
+          transactions.push({
+            _id: `${entry._id}_${line.accountCode}`,
+            date: entry.date,
+            description: line.description || entry.description,
+            reference: entry.reference || entry.entryNumber,
+            type: txType,
+            amount: amount,
+            balanceAfter: runningBalance,
+            createdBy: entry.createdBy,
+            journalEntryId: entry._id,
+            entryNumber: entry.entryNumber
+          });
+        }
+      }
+      
+      // Sort by date descending
+      transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+      
+      // Apply pagination
+      const total = transactions.length;
+      transactions = transactions.slice((page - 1) * limit, page * limit);
+      
+      // Calculate totals for the response
+      const totals = [
+        { _id: 'deposit', total: transactions.filter(t => t.type === 'deposit').reduce((sum, t) => sum + t.amount, 0) },
+        { _id: 'withdrawal', total: transactions.filter(t => t.type === 'withdrawal').reduce((sum, t) => sum + t.amount, 0) }
+      ];
+      
+      return res.json({
+        success: true,
+        count: transactions.length,
+        total,
+        pages: Math.ceil(total / limit),
+        totals,
+        data: transactions,
+        source: 'journal_entries'
+      });
+    }
     
     const total = await BankTransaction.countDocuments(query);
     
@@ -256,7 +429,8 @@ exports.getAccountTransactions = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       totals,
-      data: transactions
+      data: transactions,
+      source: 'bank_transactions'
     });
   } catch (error) {
     next(error);

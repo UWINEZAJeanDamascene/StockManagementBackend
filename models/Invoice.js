@@ -160,6 +160,20 @@ const invoiceSchema = new mongoose.Schema({
     alias: 'quotation_id'
   },
   
+  // Sales Order reference (new workflow)
+  salesOrder: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SalesOrder',
+    default: null
+  },
+  
+  // Delivery Note reference (new workflow)
+  deliveryNote: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'DeliveryNote',
+    default: null
+  },
+  
   // Invoice status - Module 6 enum values
   status: {
     type: String,
@@ -562,11 +576,11 @@ invoiceSchema.virtual('invoiceNumber').get(function() {
   return this.referenceNo;
 });
 invoiceSchema.virtual('items').get(function() {
-  return this.lines || this.items;
+  return this.lines;
 });
 invoiceSchema.virtual('grandTotal').get(function() {
   const val = this.totalAmount || this._doc && this._doc.total;
-  return parseFloat(val) || this.grandTotal || 0;
+  return parseFloat(val) || (this._doc && this._doc.grandTotal) || 0;
 });
 
 invoiceSchema.virtual('balance').get(function() {
@@ -581,6 +595,44 @@ invoiceSchema.virtual('balance').get(function() {
 });
 invoiceSchema.virtual('currency').get(function() {
   return this.currencyCode || 'USD';
+});
+
+// Post-save hook for AR tracking
+invoiceSchema.post('save', async function(doc) {
+  try {
+    // Track invoice creation (when status changes to confirmed from draft)
+    if (this._previousStatus === 'draft' && doc.status === 'confirmed') {
+      const ARTrackingService = require('../services/arTrackingService');
+      await ARTrackingService.recordInvoiceCreated(doc, doc.confirmedBy || doc.createdBy);
+    }
+    
+    // Track invoice cancellation
+    if (this._previousStatus !== 'cancelled' && doc.status === 'cancelled') {
+      const ARTrackingService = require('../services/arTrackingService');
+      await ARTrackingService.recordInvoiceCancelled(doc, doc.cancelledBy || doc.createdBy, doc.cancellationReason);
+    }
+  } catch (error) {
+    // Don't fail the save if tracking fails
+    console.error('AR tracking error in invoice post-save:', error);
+  }
+});
+
+// Pre-save hook to capture previous status
+invoiceSchema.pre('save', function(next) {
+  if (this.isModified('status') && !this.isNew) {
+    // Store previous status for post-save hook
+    this.constructor.findById(this._id).select('status').then(prev => {
+      if (prev) {
+        this._previousStatus = prev.status;
+      }
+      next();
+    }).catch(err => {
+      console.error('Error getting previous invoice status:', err);
+      next();
+    });
+  } else {
+    next();
+  }
 });
 
 module.exports = mongoose.model('Invoice', invoiceSchema);

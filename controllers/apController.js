@@ -158,6 +158,26 @@ const apController = {
   },
 
   /**
+   * POST /api/ap/payments/:id/save-and-post - Save and post without journal entry
+   */
+  async saveAndPostPayment(req, res, next) {
+    try {
+      const companyId = req.user.company._id;
+      const userId = req.user._id;
+      const { id } = req.params;
+
+      const payment = await APService.saveAndPostPayment(companyId, userId, id);
+
+      res.status(200).json({ success: true, data: payment });
+    } catch (error) {
+      if (error && error.message && error.message.indexOf('Only draft payments can be posted') !== -1) {
+        return res.status(400).json({ success: false, error: 'ONLY_DRAFT_CAN_BE_POSTED' });
+      }
+      next(error);
+    }
+  },
+
+  /**
    * POST /api/ap/payments/:id/reverse - Reverse payment
    */
   async reversePayment(req, res, next) {

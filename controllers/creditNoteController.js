@@ -11,8 +11,61 @@ const TaxAutomationService = require('../services/taxAutomationService');
 exports.getCreditNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const notes = await CreditNote.find({ company: companyId }).populate('invoice client createdBy');
-    res.json({ success: true, count: notes.length, data: notes });
+    const { status, client, type, dateFrom, dateTo, search, page = 1, limit = 50 } = req.query;
+    
+    // Build query filter
+    let query = { company: companyId };
+    
+    // Status filter
+    if (status && status !== 'all') {
+      query.status = status;
+    }
+    
+    // Client filter
+    if (client && client !== 'all') {
+      query.client = client;
+    }
+    
+    // Type filter
+    if (type && type !== 'all') {
+      query.type = type;
+    }
+    
+    // Date range filter
+    if (dateFrom || dateTo) {
+      query.creditDate = {};
+      if (dateFrom) query.creditDate.$gte = new Date(dateFrom);
+      if (dateTo) query.creditDate.$lte = new Date(dateTo);
+    }
+    
+    // Search filter (reference number or reason)
+    if (search) {
+      query.$or = [
+        { referenceNo: { $regex: search, $options: 'i' } },
+        { creditNoteNumber: { $regex: search, $options: 'i' } },
+        { reason: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    const skip = (Number(page) - 1) * Number(limit);
+    
+    const [notes, total] = await Promise.all([
+      CreditNote.find(query)
+        .populate('invoice client createdBy')
+        .sort({ creditDate: -1 })
+        .skip(skip)
+        .limit(Number(limit)),
+      CreditNote.countDocuments(query)
+    ]);
+    
+    res.json({ 
+      success: true, 
+      count: notes.length,
+      total,
+      page: Number(page),
+      pages: Math.ceil(total / Number(limit)),
+      data: notes 
+    });
   } catch (err) { next(err); }
 };
 
@@ -31,11 +84,102 @@ exports.createCreditNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { invoice: invoiceId } = req.body;
+    
+    console.log('DEBUG createCreditNote: req.body.lines =', JSON.stringify(req.body.lines, null, 2));
+    console.log('DEBUG createCreditNote: req.body.items =', JSON.stringify(req.body.items, null, 2));
+    
     const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
     if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found' });
 
     const payload = { ...req.body, company: companyId, client: invoice.client, createdBy: req.user.id };
+    // Normalize and calculate line totals before creating so tax amounts persist
+    const lineArray = payload.lines && Array.isArray(payload.lines) && payload.lines.length > 0
+      ? payload.lines
+      : (payload.items && Array.isArray(payload.items) ? payload.items : []);
+
+    console.log('DEBUG createCreditNote: lineArray length =', lineArray.length);
+
+    if (lineArray.length > 0) {
+      let subtotal = 0;
+      let totalTax = 0;
+
+      for (let i = 0; i < lineArray.length; i++) {
+        const line = lineArray[i] || {};
+        const quantity = Number(line.quantity) || 0;
+        const unitPrice = Number(line.unitPrice) || 0;
+        // Use provided taxRate or fall back to the original invoice line's taxRate
+        let taxRate = Number(line.taxRate);
+        console.log('DEBUG: line', i, 'input taxRate:', line.taxRate, 'parsed:', taxRate);
+        if ((!taxRate || isNaN(taxRate)) && line.invoiceLineId) {
+          try {
+            const invLine = invoice.lines.id(line.invoiceLineId);
+            console.log('DEBUG: found invoice line:', invLine ? 'yes' : 'no', 'invLine.taxRate:', invLine?.taxRate);
+            if (invLine && (invLine.taxRate || invLine.tax_rate)) {
+              taxRate = Number(invLine.taxRate || invLine.tax_rate) || 0;
+            }
+          } catch (e) {
+            taxRate = 0;
+          }
+        }
+
+        const lineSubtotal = quantity * unitPrice;
+        const lineTax = lineSubtotal * ((Number(taxRate) || 0) / 100);
+        const lineTotal = lineSubtotal + lineTax;
+        console.log('DEBUG: line', i, 'qty:', quantity, 'price:', unitPrice, 'taxRate:', taxRate, 'subtotal:', lineSubtotal, 'tax:', lineTax);
+        const unitCost = Number(line.unitCost) || 0;
+        const cogsAmount = quantity * unitCost;
+
+        // assign back into payload lines so model pre-save will also see values
+        lineArray[i] = {
+          ...line,
+          quantity,
+          unitPrice,
+          unitCost,
+          taxRate: Number(taxRate) || 0,
+          lineSubtotal,
+          lineTax,
+          lineTotal,
+          cogsAmount
+        };
+
+        subtotal += lineSubtotal;
+        totalTax += lineTax;
+      }
+
+      // attach computed lines back to payload (prefer new `lines` name)
+      payload.lines = lineArray;
+      payload.subtotal = subtotal;
+      payload.taxAmount = totalTax;
+      payload.totalAmount = subtotal + totalTax;
+      
+      console.log('DEBUG createCreditNote: processed payload.lines =', JSON.stringify(payload.lines, null, 2));
+    }
+
     const note = await CreditNote.create(payload);
+    
+    console.log('DEBUG createCreditNote: created note.lines =', JSON.stringify(note.lines, null, 2));
+
+    // If model pre-save didn't compute totals for some reason, ensure totals persist
+    try {
+      const hasRootTax = (note.taxAmount !== undefined && note.taxAmount !== null && Number(note.taxAmount) > 0);
+      if (!hasRootTax && payload.lines && Array.isArray(payload.lines) && payload.lines.length > 0) {
+        const computed = payload.lines.reduce((acc, l) => {
+          const ls = Number(l.lineSubtotal || l.lineSubtotal === 0 ? l.lineSubtotal : (Number(l.quantity || 0) * Number(l.unitPrice || 0)));
+          const lt = Number(l.lineTax || l.lineTax === 0 ? l.lineTax : (ls * (Number(l.taxRate || 0) / 100)));
+          return { subtotal: acc.subtotal + (isNaN(ls) ? 0 : ls), totalTax: acc.totalTax + (isNaN(lt) ? 0 : lt) };
+        }, { subtotal: 0, totalTax: 0 });
+
+        if (computed.totalTax > 0 || computed.subtotal > 0) {
+          note.subtotal = computed.subtotal;
+          note.taxAmount = computed.totalTax;
+          note.totalAmount = computed.subtotal + computed.totalTax;
+          await note.save();
+        }
+      }
+    } catch (e) {
+      console.error('Error ensuring credit note totals persisted:', e);
+    }
+
     res.status(201).json({ success: true, data: note });
   } catch (err) { next(err); }
 };
@@ -410,9 +554,30 @@ exports.updateCreditNote = async (req, res, next) => {
     if (creditDate) note.creditDate = creditDate;
     if (notes !== undefined) note.notes = notes;
     
-    // Update lines if provided
+    // Update lines if provided - calculate line totals before saving
     if (lines && Array.isArray(lines)) {
-      note.lines = lines;
+      // Calculate line totals
+      const processedLines = lines.map(line => {
+        const quantity = Number(line.quantity) || 0;
+        const unitPrice = Number(line.unitPrice) || 0;
+        const taxRate = Number(line.taxRate) || 0;
+        const unitCost = Number(line.unitCost) || 0;
+        
+        const lineSubtotal = quantity * unitPrice;
+        const lineTax = lineSubtotal * (taxRate / 100);
+        const lineTotal = lineSubtotal + lineTax;
+        const cogsAmount = quantity * unitCost;
+        
+        return {
+          ...line,
+          lineSubtotal,
+          lineTax,
+          lineTotal,
+          cogsAmount
+        };
+      });
+      
+      note.lines = processedLines;
     }
     
     await note.save();
@@ -505,8 +670,10 @@ exports.confirmCreditNote = async (req, res, next) => {
     const StockMovement = require('../models/StockMovement');
     const StockBatch = require('../models/StockBatch');
     const StockSerialNumber = require('../models/StockSerialNumber');
+    const ChartOfAccount = require('../models/ChartOfAccount');
     const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
     
+    console.log('DEBUG: About to run transaction');
     await runInTransaction(async (session) => {
       // Calculate totals for journal entries
       let totalSubtotal = 0;
@@ -514,6 +681,8 @@ exports.confirmCreditNote = async (req, res, next) => {
       let totalCogs = 0;
       
       const isGoodsReturn = creditNote.type === 'goods_return';
+      
+      console.log('DEBUG: Inside transaction, processing', lineArray.length, 'lines');
       
       // Process each line
       console.log('DEBUG: Processing lineArray =', JSON.stringify(lineArray, null, 2));
@@ -628,7 +797,18 @@ exports.confirmCreditNote = async (req, res, next) => {
       if (lineArray[0] && lineArray[0].product) {
         const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
         if (firstProduct && firstProduct.revenueAccount) {
-          revenueAccount = firstProduct.revenueAccount;
+          // revenueAccount might be an ObjectId, look up the actual account code
+          const revenueAccountId = firstProduct.revenueAccount;
+          const revenueAcct = await ChartOfAccount.findOne({
+            $or: [
+              { _id: revenueAccountId },
+              { accountCode: revenueAccountId }
+            ],
+            company: companyId
+          }).session(session);
+          if (revenueAcct && revenueAcct.accountCode) {
+            revenueAccount = revenueAcct.accountCode;
+          }
         }
       }
 
@@ -648,8 +828,30 @@ exports.confirmCreditNote = async (req, res, next) => {
         if (lineArray[0] && lineArray[0].product) {
           const firstProduct = await Product.findById(lineArray[0].product._id).session(session);
           if (firstProduct) {
-            if (firstProduct.inventoryAccount) inventoryAccount = firstProduct.inventoryAccount;
-            if (firstProduct.cogsAccount) cogsAccount = firstProduct.cogsAccount;
+            if (firstProduct.inventoryAccount) {
+              const inventoryAcct = await ChartOfAccount.findOne({
+                $or: [
+                  { _id: firstProduct.inventoryAccount },
+                  { accountCode: firstProduct.inventoryAccount }
+                ],
+                company: companyId
+              }).session(session);
+              if (inventoryAcct && inventoryAcct.accountCode) {
+                inventoryAccount = inventoryAcct.accountCode;
+              }
+            }
+            if (firstProduct.cogsAccount) {
+              const cogsAcct = await ChartOfAccount.findOne({
+                $or: [
+                  { _id: firstProduct.cogsAccount },
+                  { accountCode: firstProduct.cogsAccount }
+                ],
+                company: companyId
+              }).session(session);
+              if (cogsAcct && cogsAcct.accountCode) {
+                cogsAccount = cogsAcct.accountCode;
+              }
+            }
           }
         }
         const cogsNarration = 'COGS Reversal - ' + (creditNote.client?.name || 'Client') + ' - CN#' + (creditNote.referenceNo || creditNote.creditNoteNumber);
@@ -701,16 +903,31 @@ exports.confirmCreditNote = async (req, res, next) => {
       await invoice.save({ session });
       
       // Update credit note status
+      console.log('DEBUG: About to update status - current status:', creditNote.status);
       creditNote.status = 'confirmed';
       creditNote.confirmedBy = req.user.id;
       creditNote.confirmedAt = new Date();
       creditNote.stockReversed = isGoodsReturn;
       
+      console.log('DEBUG: Saving credit note with new status:', creditNote.status);
       await creditNote.save({ session });
+      console.log('DEBUG: Credit note saved successfully');
     });
+    
+    console.log('DEBUG: Transaction completed, creditNote.status =', creditNote.status);
+    
+    // Record AR tracking transaction for credit note application
+    try {
+      const ARTrackingService = require('../services/arTrackingService');
+      const totalAmount = (creditNote.totalAmount || creditNote.grandTotal || creditNote.total || 0);
+      await ARTrackingService.recordCreditNoteApplied(creditNote, invoice, totalAmount, req.user.id);
+    } catch (trackingError) {
+      console.error('AR tracking error for credit note:', trackingError);
+    }
     
     await creditNote.populate('lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry');
     
+    console.log('DEBUG: Sending response with status:', creditNote.status);
     res.json({ success: true, message: 'Credit note confirmed successfully', data: creditNote });
   } catch (err) {
     console.error('Error confirming credit note:', err);

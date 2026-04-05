@@ -7,6 +7,7 @@ const Client = require('../models/Client');
 const JournalService = require('./journalService');
 const periodService = require('./periodService');
 const cacheService = require('./cacheService');
+const ARTrackingService = require('./arTrackingService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
@@ -27,6 +28,7 @@ class ARService {
   static async createReceipt(companyId, userId, data) {
     const {
       clientId,
+      client,
       receiptDate,
       paymentMethod,
       bankAccountId,
@@ -38,9 +40,12 @@ class ARService {
       allocations = []
     } = data;
 
+    // Support both clientId and client parameters
+    const actualClientId = clientId || client;
+
     // Validate client
-    const client = await Client.findOne({ _id: clientId, company: companyId });
-    if (!client) {
+    const clientDoc = await Client.findOne({ _id: actualClientId, company: companyId });
+    if (!clientDoc) {
       throw new Error('Client not found');
     }
 
@@ -64,7 +69,7 @@ class ARService {
     // Create receipt
     const receipt = new ARReceipt({
       company: companyId,
-      client: clientId,
+      client: actualClientId,
       receiptDate: receiptDate || new Date(),
       paymentMethod,
       bankAccount: bankAccountId || null,
@@ -215,11 +220,9 @@ class ARService {
 
     // Calculate unallocated amount
     const unallocatedAmount = amountNum - totalAllocated;
-    
-    // Step 3: Update invoice balances for each allocation
-    for (const alloc of allocations) {
-      await this.updateInvoiceBalanceOnPost(alloc.invoice, parseFloat(alloc.amountAllocated));
-    }
+
+    // Note: Invoice balances are already updated when allocations are created via allocateToInvoice
+    // Do NOT update them again here to avoid double-counting
 
     // Update receipt status
     receipt.status = 'posted';
@@ -234,6 +237,13 @@ class ARService {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
+    }
+
+    // Record AR tracking transaction for receipt posting
+    try {
+      await ARTrackingService.recordReceiptPosted(receipt, allocations, userId);
+    } catch (trackingError) {
+      console.error('AR tracking error for receipt posting:', trackingError);
     }
 
     return receipt;
@@ -316,6 +326,13 @@ class ARService {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error('Cache invalidation failed:', e);
+    }
+
+    // Record AR tracking transaction for receipt reversal
+    try {
+      await ARTrackingService.recordReceiptReversed(receipt, allocations, userId, reason);
+    } catch (trackingError) {
+      console.error('AR tracking error for receipt reversal:', trackingError);
     }
 
     return receipt;
@@ -635,6 +652,13 @@ class ARService {
       console.error('Cache invalidation failed:', e);
     }
 
+    // Record AR tracking transaction for bad debt write-off
+    try {
+      await ARTrackingService.recordBadDebtWriteoff(writeoff, invoice, userId);
+    } catch (trackingError) {
+      console.error('AR tracking error for bad debt write-off:', trackingError);
+    }
+
     return writeoff;
   }
 
@@ -712,6 +736,13 @@ class ARService {
       console.error('Cache invalidation failed:', e);
     }
 
+    // Record AR tracking transaction for bad debt reversal
+    try {
+      await ARTrackingService.recordBadDebtReversed(writeoff, invoice, userId, reason);
+    } catch (trackingError) {
+      console.error('AR tracking error for bad debt reversal:', trackingError);
+    }
+
     return writeoff;
   }
 
@@ -730,12 +761,9 @@ class ARService {
     const now = asOfDate ? new Date(asOfDate) : new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     
-    // Calculate date boundaries
+    // Calculate date boundaries for standard aging buckets
     const todayMinus1 = new Date(today);
     todayMinus1.setDate(todayMinus1.getDate() - 1);
-
-    const todayMinus15 = new Date(today);
-    todayMinus15.setDate(todayMinus15.getDate() - 15);
 
     const todayMinus30 = new Date(today);
     todayMinus30.setDate(todayMinus30.getDate() - 30);
@@ -743,14 +771,14 @@ class ARService {
     const todayMinus31 = new Date(today);
     todayMinus31.setDate(todayMinus31.getDate() - 31);
 
-    const todayMinus16 = new Date(today);
-    todayMinus16.setDate(todayMinus16.getDate() - 16);
-
-    const todayMinus45 = new Date(today);
-    todayMinus45.setDate(todayMinus45.getDate() - 45);
-
     const todayMinus60 = new Date(today);
     todayMinus60.setDate(todayMinus60.getDate() - 60);
+
+    const todayMinus61 = new Date(today);
+    todayMinus61.setDate(todayMinus61.getDate() - 61);
+
+    const todayMinus90 = new Date(today);
+    todayMinus90.setDate(todayMinus90.getDate() - 90);
 
     // Build match conditions
     const matchConditions = {
@@ -765,8 +793,9 @@ class ARService {
     }
 
     // Get invoices with their allocations
-    // Retrieve invoices without populating client to preserve raw client id
+    // Populate client to get client names
     const invoices = await Invoice.find(matchConditions)
+      .populate('client', 'name code')
       .sort({ invoiceDate: 1 });
 
     // Debug: log invoices found for aging report
@@ -794,7 +823,10 @@ class ARService {
     invoices.forEach(inv => {
       // Subtract allocated amounts from outstanding balance
       const allocated = allocMap[inv._id.toString()] || 0;
-      const outstanding = parseFloat(inv.amountOutstanding) || parseFloat(inv.balance) || 0;
+      // FIX: Convert Decimal128 to string before parseFloat
+      const outstanding = inv.amountOutstanding 
+        ? parseFloat(inv.amountOutstanding.toString()) 
+        : (inv.balance ? parseFloat(inv.balance.toString()) : 0);
       const effectiveBalance = outstanding - allocated;
       
       if (effectiveBalance <= 0) return;
@@ -805,63 +837,53 @@ class ARService {
 
       let bucket;
       
-      // Bucket definitions for acceptance tests: current, 1-15, 16-30, 31-45, 46+
+      // Standard aging buckets: current, 1-30, 31-60, 61-90, 90+
       if (dueDateOnly >= today) {
         bucket = 'current';
-      } else if (dueDateOnly >= todayMinus15 && dueDateOnly <= todayMinus1) {
-        bucket = '1-15';
-      } else if (dueDateOnly >= todayMinus30 && dueDateOnly <= todayMinus16) {
-        bucket = '16-30';
-      } else if (dueDateOnly >= todayMinus45 && dueDateOnly <= todayMinus31) {
-        bucket = '31-45';
+      } else if (dueDateOnly >= todayMinus30 && dueDateOnly <= todayMinus1) {
+        bucket = '1-30';
+      } else if (dueDateOnly >= todayMinus60 && dueDateOnly <= todayMinus31) {
+        bucket = '31-60';
+      } else if (dueDateOnly >= todayMinus90 && dueDateOnly <= todayMinus61) {
+        bucket = '61-90';
       } else {
-        bucket = '46+';
+        bucket = '90+';
       }
 
-      // Robust client extraction: support populated client object or raw ObjectId
-      const rawClient = inv.client && (inv.client._id ? inv.client._id : inv.client);
-      const clientKey = rawClient ? rawClient.toString() : null;
-      // Debugging: log computed balances to help tests
-      try {
-        console.log('ARService.getAgingReport - invoice:', inv.referenceNo, 'outstanding:', outstanding, 'allocated:', allocated, 'effective:', effectiveBalance, 'clientKey:', clientKey, 'clientObj:', JSON.stringify(inv.client), 'rawClientField:', inv._doc && inv._doc.client ? inv._doc.client : null);
-      } catch (e) {}
-      if (!clientKey) return;
+      // Get client info - client is now populated
+      const clientId = inv.client?._id?.toString();
+      const clientName = inv.client?.name || 'Unknown';
+      const clientCode = inv.client?.code || '';
+      
+      if (!clientId) return;
 
-      if (!clientData[clientKey]) {
-        clientData[clientKey] = {
-          client_id: rawClient,
-          client_name: inv.client && inv.client.name ? inv.client.name : 'Unknown',
+      if (!clientData[clientId]) {
+        clientData[clientId] = {
+          client_id: inv.client._id,
+          client_name: clientName,
+          client_code: clientCode,
           current: 0,
-          days15: 0,
-          days30: 0,
-          days45: 0,
-          days60Plus: 0,
+          '1-30': 0,
+          '31-60': 0,
+          '61-90': 0,
+          '90+': 0,
           total_outstanding: 0
         };
       }
-      // Map bucket to response field names expected by acceptance tests
-      const fieldMap = {
-        'current': 'current',
-        '1-15': 'days15',
-        '16-30': 'days30',
-        '31-45': 'days45',
-        '46+': 'days60Plus'
-      };
-
-      const field = fieldMap[bucket] || 'current';
-      clientData[clientKey][field] += effectiveBalance;
-      clientData[clientKey].total_outstanding += effectiveBalance;
+      // Add to appropriate bucket
+      clientData[clientId][bucket] += effectiveBalance;
+      clientData[clientId].total_outstanding += effectiveBalance;
     });
 
     // Format amounts as strings with 2 decimal places
     const result = Object.values(clientData).map(c => ({
-      client: { _id: c.client_id, name: c.client_name },
+      client: { _id: c.client_id, name: c.client_name, code: c.client_code },
       current: c.current.toFixed(2),
-      days15: c.days15.toFixed(2),
-      days30: c.days30.toFixed(2),
-      days45: c.days45.toFixed(2),
-      days60Plus: c.days60Plus.toFixed(2),
-      total_outstanding: c.total_outstanding.toFixed(2)
+      '1-30': c['1-30'].toFixed(2),
+      '31-60': c['31-60'].toFixed(2),
+      '61-90': c['61-90'].toFixed(2),
+      '90+': c['90+'].toFixed(2),
+      totalBalance: c.total_outstanding.toFixed(2)
     }));
 
     try { console.log('ARService.getAgingReport - result:', JSON.stringify(result)); } catch (e) {}

@@ -74,6 +74,10 @@ const productSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Decimal128,
     default: mongoose.Types.Decimal128.fromString('0.0000')
   },
+  reservedQuantity: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: mongoose.Types.Decimal128.fromString('0.0000')
+  },
   // Active flag: soft-delete control
   isActive: {
     type: Boolean,
@@ -220,6 +224,17 @@ productSchema.virtual('isLowStock').get(function() {
   }
 });
 
+// Virtual for available stock (current - reserved)
+productSchema.virtual('availableStock').get(function() {
+  try {
+    const cs = this.currentStock && this.currentStock.toString ? parseFloat(this.currentStock.toString()) : Number(this.currentStock || 0);
+    const rs = this.reservedQuantity && this.reservedQuantity.toString ? parseFloat(this.reservedQuantity.toString()) : Number(this.reservedQuantity || 0);
+    return Math.max(0, cs - rs);
+  } catch (e) {
+    return Number(this.currentStock || 0);
+  }
+});
+
 // Add history entry before save
 productSchema.pre('save', async function(next) {
   if (this.isNew) {
@@ -264,6 +279,7 @@ productSchema.set('toJSON', {
     if (ret.sellingPrice !== undefined) ret.sellingPrice = toMoney(ret.sellingPrice);
     if (ret.costPrice !== undefined) ret.costPrice = toMoney(ret.costPrice);
     if (ret.currentStock !== undefined) ret.currentStock = toQty(ret.currentStock);
+    if (ret.reservedQuantity !== undefined) ret.reservedQuantity = toQty(ret.reservedQuantity);
     if (ret.lowStockThreshold !== undefined) ret.lowStockThreshold = toQty(ret.lowStockThreshold);
     if (ret.reorderPoint !== undefined) ret.reorderPoint = toQty(ret.reorderPoint);
     if (ret.reorderQuantity !== undefined) ret.reorderQuantity = toQty(ret.reorderQuantity);
