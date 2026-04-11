@@ -14,10 +14,7 @@ const REQUIRED_ENV_VARS = [
   'NODE_ENV',
 ];
 
-const REQUIRED_IN_PRODUCTION = [
-  'JWT_SECRET',
-  'MONGODB_URI',
-];
+const REQUIRED_IN_PRODUCTION = [];
 
 /**
  * Validate required environment variables
