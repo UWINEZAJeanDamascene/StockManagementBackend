@@ -181,8 +181,8 @@ class PeriodService {
       companyId,
       userId,
       action: 'periods.generate',
-      entity_type: 'accounting_period',
-      entity_id: null,
+      entityType: 'accounting_period',
+      entityId: null,
       changes: { fiscal_year: fiscalYear, periods_created: results.length }
     });
 
@@ -221,8 +221,8 @@ class PeriodService {
       companyId,
       userId,
       action: 'period.close',
-      entity_type: 'accounting_period',
-      entity_id: periodId,
+      entityType: 'accounting_period',
+      entityId: periodId,
       changes: { status: 'closed' }
     });
 
@@ -253,8 +253,8 @@ class PeriodService {
       companyId,
       userId,
       action: 'period.reopen',
-      entity_type: 'accounting_period',
-      entity_id: periodId,
+      entityType: 'accounting_period',
+      entityId: periodId,
       changes: { status: 'open' }
     });
 
@@ -281,8 +281,8 @@ class PeriodService {
       companyId,
       userId,
       action: 'period.lock',
-      entity_type: 'accounting_period',
-      entity_id: periodId,
+      entityType: 'accounting_period',
+      entityId: periodId,
       changes: { status: 'locked' }
     });
 
@@ -465,8 +465,8 @@ class PeriodService {
       companyId,
       userId,
       action: 'period.year_end_close',
-      entity_type: 'accounting_period',
-      entity_id: yearEndPeriod._id,
+      entityType: 'accounting_period',
+      entityId: yearEndPeriod._id,
       changes: { fiscal_year: fiscalYear, net_profit: netProfit }
     });
 

@@ -1,17 +1,22 @@
 /**
  * Module 5 - Fixed Assets Controller
- * 
+ *
  * Handles asset registration, depreciation schedules, and disposal
  * Following exact specifications from Module 5 docs
  */
 
-const mongoose = require('mongoose');
-const { parsePagination, paginationMeta } = require('../utils/pagination');
-const { FixedAsset, DepreciationEntry } = require('../models/FixedAsset');
-const JournalEntry = require('../models/JournalEntry');
-const ChartOfAccount = require('../models/ChartOfAccount');
-const { canPostToAccount, DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
-const PeriodService = require('../services/periodService');
+const mongoose = require("mongoose");
+const { parsePagination, paginationMeta } = require("../utils/pagination");
+const { FixedAsset, DepreciationEntry } = require("../models/FixedAsset");
+const JournalEntry = require("../models/JournalEntry");
+const ChartOfAccount = require("../models/ChartOfAccount");
+const {
+  canPostToAccount,
+  DEFAULT_ACCOUNTS,
+  CHART_OF_ACCOUNTS,
+} = require("../constants/chartOfAccounts");
+const PeriodService = require("../services/periodService");
+const { BankAccount } = require("../models/BankAccount");
 
 // Get all fixed assets for a company
 exports.getAssets = async (req, res) => {
@@ -23,19 +28,26 @@ exports.getAssets = async (req, res) => {
     if (status) query.status = status;
     if (purchase_date_from || purchase_date_to) {
       query.purchaseDate = {};
-      if (purchase_date_from) query.purchaseDate.$gte = new Date(purchase_date_from);
-      if (purchase_date_to) query.purchaseDate.$lte = new Date(purchase_date_to);
+      if (purchase_date_from)
+        query.purchaseDate.$gte = new Date(purchase_date_from);
+      if (purchase_date_to)
+        query.purchaseDate.$lte = new Date(purchase_date_to);
     }
 
-    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50 });
+    const { page, limit, skip } = parsePagination(req.query, {
+      defaultLimit: 50,
+    });
     const total = await FixedAsset.countDocuments(query);
     const assets = await FixedAsset.find(query)
-      .populate('assetAccountId', 'code name')
-      .populate('accumDepreciationAccountId', 'code name')
-      .populate('depreciationExpenseAccountId', 'code name')
-      .populate('supplierId', 'name')
-      .populate('createdBy', 'name')
-      .populate('categoryId', 'name description defaultUsefulLifeMonths defaultDepreciationMethod')
+      .populate("assetAccountId", "code name")
+      .populate("accumDepreciationAccountId", "code name")
+      .populate("depreciationExpenseAccountId", "code name")
+      .populate("supplierId", "name")
+      .populate("createdBy", "name")
+      .populate(
+        "categoryId",
+        "name description defaultUsefulLifeMonths defaultDepreciationMethod",
+      )
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -46,7 +58,7 @@ exports.getAssets = async (req, res) => {
       pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
-    console.error('Error getting fixed assets:', error);
+    console.error("Error getting fixed assets:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -58,25 +70,28 @@ exports.getAssetById = async (req, res) => {
     const companyId = req.user.company._id;
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId })
-      .populate('assetAccountId', 'code name')
-      .populate('accumDepreciationAccountId', 'code name')
-      .populate('depreciationExpenseAccountId', 'code name')
-      .populate('supplierId', 'name')
-      .populate('createdBy', 'name')
-      .populate('categoryId', 'name description defaultUsefulLifeMonths defaultDepreciationMethod')
-      .populate('purchaseJournalEntryId')
-      .populate('disposalJournalEntryId');
+      .populate("assetAccountId", "code name")
+      .populate("accumDepreciationAccountId", "code name")
+      .populate("depreciationExpenseAccountId", "code name")
+      .populate("supplierId", "name")
+      .populate("createdBy", "name")
+      .populate(
+        "categoryId",
+        "name description defaultUsefulLifeMonths defaultDepreciationMethod",
+      )
+      .populate("departmentId", "name")
+      .populate("disposalJournalEntryId");
 
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
     res.json({
       success: true,
-      data: asset
+      data: asset,
     });
   } catch (error) {
-    console.error('Error getting fixed asset:', error);
+    console.error("Error getting fixed asset:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -89,7 +104,7 @@ exports.getDepreciationSchedule = async (req, res) => {
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
     // Generate schedule from today to end of useful life
@@ -98,12 +113,14 @@ exports.getDepreciationSchedule = async (req, res) => {
     const purchaseCost = parseFloat(asset.purchaseCost?.toString() || 0);
     const salvageValue = parseFloat(asset.salvageValue?.toString() || 0);
     const depreciableAmount = purchaseCost - salvageValue;
-    
+
     const startMonth = today.getMonth();
     const startYear = today.getFullYear();
     const totalMonths = asset.usefulLifeMonths;
 
-    let accumulatedDepreciation = parseFloat(asset.accumulatedDepreciation?.toString() || 0);
+    let accumulatedDepreciation = parseFloat(
+      asset.accumulatedDepreciation?.toString() || 0,
+    );
 
     for (let i = 0; i < totalMonths; i++) {
       const month = (startMonth + i) % 12;
@@ -115,11 +132,16 @@ exports.getDepreciationSchedule = async (req, res) => {
         break;
       }
 
+      // Calculate opening NBV for this period
+      const openingNBV = purchaseCost - accumulatedDepreciation;
+
       let depreciation = 0;
-      if (asset.depreciationMethod === 'straight_line') {
+      if (asset.depreciationMethod === "straight_line") {
         depreciation = depreciableAmount / totalMonths;
-      } else if (asset.depreciationMethod === 'declining_balance') {
-        const rate = asset.decliningRate ? parseFloat(asset.decliningRate.toString()) : 0.2;
+      } else if (asset.depreciationMethod === "declining_balance") {
+        const rate = asset.decliningRate
+          ? parseFloat(asset.decliningRate.toString())
+          : 0.2;
         const nbv = purchaseCost - accumulatedDepreciation;
         depreciation = (nbv * rate) / 12;
       }
@@ -132,15 +154,22 @@ exports.getDepreciationSchedule = async (req, res) => {
 
       if (depreciation > 0) {
         // NBV = max(salvage_value, purchase_cost - accumulated_depreciation)
-        const netBookValue = Math.max(salvageValue, purchaseCost - accumulatedDepreciation);
+        const closingNBV = Math.max(
+          salvageValue,
+          purchaseCost - accumulatedDepreciation,
+        );
+
+        // Format month label (e.g., "Jan 2026")
+        const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        const label = `${monthNames[month]} ${year}`;
+
         schedule.push({
           period: i + 1,
-          periodDate,
-          year,
-          month: month + 1,
-          depreciationAmount: Math.round(depreciation * 100) / 100,
-          accumulatedDepreciation: Math.round(accumulatedDepreciation * 100) / 100,
-          netBookValue: Math.round(netBookValue * 100) / 100
+          date: periodDate.toISOString(),
+          label,
+          openingNBV: Math.round(openingNBV * 100) / 100,
+          depreciation: Math.round(depreciation * 100) / 100,
+          closingNBV: Math.round(closingNBV * 100) / 100,
         });
       }
     }
@@ -156,13 +185,13 @@ exports.getDepreciationSchedule = async (req, res) => {
           salvageValue,
           usefulLifeMonths: asset.usefulLifeMonths,
           depreciationMethod: asset.depreciationMethod,
-          status: asset.status
+          status: asset.status,
         },
-        schedule
-      }
+        schedule,
+      },
     });
   } catch (error) {
-    console.error('Error getting depreciation schedule:', error);
+    console.error("Error getting depreciation schedule:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -171,8 +200,11 @@ exports.getDepreciationSchedule = async (req, res) => {
 exports.createAsset = async (req, res) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      name, 
+    // createdBy always comes from the authenticated session — never trust the request body
+    const createdBy = req.user._id;
+
+    const {
+      name,
       description,
       categoryId,
       assetAccountCode,
@@ -185,91 +217,139 @@ exports.createAsset = async (req, res) => {
       depreciationMethod,
       decliningRate,
       supplierId,
-      paymentAccountCode, // 2100 for AP or 1100 for Bank
-      createdBy
+      paymentAccountCode,
+      bankAccountId,
+      // New fields
+      serialNumber,
+      location,
+      departmentId,
+      warrantyStartDate,
+      warrantyEndDate,
+      insuredValue,
+      status,
     } = req.body;
 
     // Validate required fields
-    if (!name || !assetAccountCode || !accumDepreciationAccountCode || 
-        !depreciationExpenseAccountCode || !purchaseDate || !purchaseCost || 
-        !usefulLifeMonths || !createdBy) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Missing required fields' 
+    if (
+      !name ||
+      !assetAccountCode ||
+      !accumDepreciationAccountCode ||
+      !depreciationExpenseAccountCode ||
+      !purchaseDate ||
+      !purchaseCost ||
+      !usefulLifeMonths
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields",
       });
     }
-    // Determine payment account (default to 1100 Bank if not provided)
-    const payAccountCode = paymentAccountCode || '1100';
+
+    // Resolve payment account code: prefer the bank account's ledgerAccountId if provided
+    let bankAccountDoc = null;
+    let payAccountCode = paymentAccountCode || "2000"; // default to Accounts Payable
+    if (bankAccountId) {
+      bankAccountDoc = await BankAccount.findOne({
+        _id: bankAccountId,
+        company: companyId,
+        isActive: true,
+      });
+      if (!bankAccountDoc) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: "Bank account not found or inactive",
+          });
+      }
+      payAccountCode = bankAccountDoc.ledgerAccountId || "1100";
+    }
     const payAccountVal = canPostToAccount(payAccountCode);
     if (!payAccountVal.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Invalid payment account: ${payAccountVal.reason}` 
+      return res.status(400).json({
+        success: false,
+        error: `Invalid payment account: ${payAccountVal.reason}`,
       });
     }
 
     // Get category defaults if categoryId provided
     let categoryDefaults = null;
     if (categoryId) {
-      const AssetCategory = require('../models/AssetCategory');
-      categoryDefaults = await AssetCategory.findOne({ 
-        _id: categoryId, 
+      const AssetCategory = require("../models/AssetCategory");
+      categoryDefaults = await AssetCategory.findOne({
+        _id: categoryId,
         company: companyId,
-        isDeleted: false
+        isDeleted: false,
       });
       if (!categoryDefaults) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Invalid category' 
+        return res.status(400).json({
+          success: false,
+          error: "Invalid category",
         });
       }
     }
 
     // Use category defaults if not explicitly provided
-    const finalAssetAccountCode = assetAccountCode || categoryDefaults?.defaultAssetAccountCode || '1500';
-    const finalAccumDepAccountCode = accumDepreciationAccountCode || categoryDefaults?.defaultAccumDepreciationAccountCode || '1510';
-    const finalDepExpenseAccountCode = depreciationExpenseAccountCode || categoryDefaults?.defaultDepreciationExpenseAccountCode || '6050';
-    const finalUsefulLifeMonths = usefulLifeMonths || categoryDefaults?.defaultUsefulLifeMonths || 60;
-    const finalDepreciationMethod = depreciationMethod || categoryDefaults?.defaultDepreciationMethod || 'straight_line';
-    const finalDecliningRate = decliningRate || (categoryDefaults?.defaultDecliningRate ? parseFloat(categoryDefaults.defaultDecliningRate.toString()) : null);
+    // Default asset codes match the Chart of Accounts (1700-series for PP&E, 1810-series for accum dep)
+    const finalAssetAccountCode =
+      assetAccountCode || categoryDefaults?.defaultAssetAccountCode || "1700";
+    const finalAccumDepAccountCode =
+      accumDepreciationAccountCode ||
+      categoryDefaults?.defaultAccumDepreciationAccountCode ||
+      "1810";
+    const finalDepExpenseAccountCode =
+      depreciationExpenseAccountCode ||
+      categoryDefaults?.defaultDepreciationExpenseAccountCode ||
+      "5800";
+    const finalUsefulLifeMonths =
+      usefulLifeMonths || categoryDefaults?.defaultUsefulLifeMonths || 60;
+    const finalDepreciationMethod =
+      depreciationMethod ||
+      categoryDefaults?.defaultDepreciationMethod ||
+      "straight_line";
+    const finalDecliningRate =
+      decliningRate ||
+      (categoryDefaults?.defaultDecliningRate
+        ? parseFloat(categoryDefaults.defaultDecliningRate.toString())
+        : null);
 
     // Validate account codes exist and allow direct posting (after final codes computed)
     const assetAccountVal = canPostToAccount(finalAssetAccountCode);
     if (!assetAccountVal.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Invalid asset account: ${assetAccountVal.reason}` 
+      return res.status(400).json({
+        success: false,
+        error: `Invalid asset account: ${assetAccountVal.reason}`,
       });
     }
 
     const accumDepAccountVal = canPostToAccount(finalAccumDepAccountCode);
     if (!accumDepAccountVal.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Invalid accumulated depreciation account: ${accumDepAccountVal.reason}` 
+      return res.status(400).json({
+        success: false,
+        error: `Invalid accumulated depreciation account: ${accumDepAccountVal.reason}`,
       });
     }
 
     const depExpenseAccountVal = canPostToAccount(finalDepExpenseAccountCode);
     if (!depExpenseAccountVal.valid) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Invalid depreciation expense account: ${depExpenseAccountVal.reason}` 
+      return res.status(400).json({
+        success: false,
+        error: `Invalid depreciation expense account: ${depExpenseAccountVal.reason}`,
       });
     }
 
     // Get chart of account IDs
-    const assetAccountDoc = await ChartOfAccount.findOne({ 
-      company: companyId, 
-      code: finalAssetAccountCode 
+    const assetAccountDoc = await ChartOfAccount.findOne({
+      company: companyId,
+      code: finalAssetAccountCode,
     });
-    const accumDepAccountDoc = await ChartOfAccount.findOne({ 
-      company: companyId, 
-      code: finalAccumDepAccountCode 
+    const accumDepAccountDoc = await ChartOfAccount.findOne({
+      company: companyId,
+      code: finalAccumDepAccountCode,
     });
-    const depExpenseAccountDoc = await ChartOfAccount.findOne({ 
-      company: companyId, 
-      code: finalDepExpenseAccountCode 
+    const depExpenseAccountDoc = await ChartOfAccount.findOne({
+      company: companyId,
+      code: finalDepExpenseAccountCode,
     });
 
     // Create the asset
@@ -286,44 +366,77 @@ exports.createAsset = async (req, res) => {
       depreciationExpenseAccountCode: finalDepExpenseAccountCode,
       purchaseDate: new Date(purchaseDate),
       purchaseCost: mongoose.Types.Decimal128.fromString(String(purchaseCost)),
-      salvageValue: mongoose.Types.Decimal128.fromString(String(salvageValue || 0)),
+      salvageValue: mongoose.Types.Decimal128.fromString(
+        String(salvageValue || 0),
+      ),
       usefulLifeMonths: finalUsefulLifeMonths,
       depreciationMethod: finalDepreciationMethod,
-      decliningRate: finalDecliningRate ? mongoose.Types.Decimal128.fromString(String(finalDecliningRate)) : null,
+      decliningRate: finalDecliningRate
+        ? mongoose.Types.Decimal128.fromString(String(finalDecliningRate))
+        : null,
       supplierId: supplierId || null,
-      status: 'active',
-      createdBy
+      status: status || "active",
+      createdBy,
+      // New fields
+      serialNumber: serialNumber || null,
+      location: location || null,
+      departmentId: departmentId || null,
+      warrantyStartDate: warrantyStartDate ? new Date(warrantyStartDate) : null,
+      warrantyEndDate: warrantyEndDate ? new Date(warrantyEndDate) : null,
+      insuredValue: insuredValue
+        ? mongoose.Types.Decimal128.fromString(String(insuredValue))
+        : null,
     });
 
     try {
       await asset.save();
     } catch (err) {
       // Handle rare duplicate referenceNo race by regenerating ref and retrying a few times
-      if (err && err.code === 11000 && err.keyPattern && err.keyPattern.referenceNo) {
+      if (
+        err &&
+        err.code === 11000 &&
+        err.keyPattern &&
+        err.keyPattern.referenceNo
+      ) {
         let saved = false;
         let attempts = 0;
         const maxAttempts = 5;
         while (!saved && attempts < maxAttempts) {
           attempts += 1;
           try {
-            asset.referenceNo = await asset.constructor.generateReferenceNo(companyId);
+            asset.referenceNo =
+              await asset.constructor.generateReferenceNo(companyId);
             await asset.save();
             saved = true;
             break;
           } catch (err2) {
             // If still duplicate on referenceNo, loop and try next sequence value
-            if (err2 && err2.code === 11000 && err2.keyPattern && err2.keyPattern.referenceNo) {
-              console.warn(`Duplicate referenceNo on retry ${attempts}, regenerating...`);
+            if (
+              err2 &&
+              err2.code === 11000 &&
+              err2.keyPattern &&
+              err2.keyPattern.referenceNo
+            ) {
+              console.warn(
+                `Duplicate referenceNo on retry ${attempts}, regenerating...`,
+              );
               // continue to next attempt
             } else {
-              console.error('Error saving fixed asset after regenerating referenceNo:', err2);
-              return res.status(500).json({ success: false, error: err2.message });
+              console.error(
+                "Error saving fixed asset after regenerating referenceNo:",
+                err2,
+              );
+              return res
+                .status(500)
+                .json({ success: false, error: err2.message });
             }
           }
         }
 
         if (!saved) {
-          console.error('Failed to save fixed asset after multiple referenceNo regeneration attempts - falling back to timestamp ref');
+          console.error(
+            "Failed to save fixed asset after multiple referenceNo regeneration attempts - falling back to timestamp ref",
+          );
           // Final fallback: generate a timestamp+random based referenceNo to guarantee uniqueness
           try {
             const year = new Date().getFullYear();
@@ -331,8 +444,16 @@ exports.createAsset = async (req, res) => {
             await asset.save();
             saved = true;
           } catch (err3) {
-            console.error('Final fallback failed saving fixed asset with timestamp ref:', err3);
-            return res.status(500).json({ success: false, error: 'Failed to generate unique reference number for asset' });
+            console.error(
+              "Final fallback failed saving fixed asset with timestamp ref:",
+              err3,
+            );
+            return res
+              .status(500)
+              .json({
+                success: false,
+                error: "Failed to generate unique reference number for asset",
+              });
           }
         }
       } else {
@@ -347,32 +468,37 @@ exports.createAsset = async (req, res) => {
     // Narration: "Asset Purchase - [Asset Name] - AST#[ref]"
     const purchaseCostNum = parseFloat(purchaseCost);
     const entryNumber = await JournalEntry.generateEntryNumber(companyId);
-    const periodId = await PeriodService.getOpenPeriodId(companyId, new Date(purchaseDate));
+    const periodId = await PeriodService.getOpenPeriodId(
+      companyId,
+      new Date(purchaseDate),
+    );
     const journalEntry = await JournalEntry.create({
       company: companyId,
       entryNumber,
       date: new Date(purchaseDate),
       description: `Asset Purchase - ${name} - AST#${asset.referenceNo}`,
-      sourceType: 'asset_purchase',
+      sourceType: "asset_purchase",
       sourceId: asset._id,
       sourceReference: asset.referenceNo,
-      status: 'posted',
+      status: "posted",
       isAutoGenerated: true,
       lines: [
         {
           accountCode: finalAssetAccountCode,
-          accountName: CHART_OF_ACCOUNTS[finalAssetAccountCode]?.name || 'Fixed Asset',
+          accountName:
+            CHART_OF_ACCOUNTS[finalAssetAccountCode]?.name || "Fixed Asset",
           debit: purchaseCostNum,
           credit: 0,
-          description: `Asset purchase: ${asset.referenceNo}`
+          description: `Asset purchase: ${asset.referenceNo}`,
         },
         {
           accountCode: payAccountCode,
-          accountName: CHART_OF_ACCOUNTS[payAccountCode]?.name || 'Bank/Payable',
+          accountName:
+            CHART_OF_ACCOUNTS[payAccountCode]?.name || "Bank/Payable",
           debit: 0,
           credit: purchaseCostNum,
-          description: `Asset purchase: ${asset.referenceNo}`
-        }
+          description: `Asset purchase: ${asset.referenceNo}`,
+        },
       ],
       createdBy,
       postedBy: createdBy,
@@ -380,16 +506,41 @@ exports.createAsset = async (req, res) => {
       totalDebit: purchaseCostNum,
       totalCredit: purchaseCostNum,
       debitTotal: purchaseCostNum,
-      creditTotal: purchaseCostNum
+      creditTotal: purchaseCostNum,
     });
+
+    // ── Create BankTransaction to reduce bank balance ──────────────────────────
+    // Only when payment came from a specific bank account (not AP / credit purchase)
+    if (bankAccountDoc) {
+      try {
+        await bankAccountDoc.addTransaction({
+          type: "withdrawal",
+          amount: purchaseCostNum,
+          description: `Asset purchase: ${name} (${asset.referenceNo})`,
+          date: new Date(purchaseDate),
+          referenceNumber: asset.referenceNo,
+          referenceType: "Payment",
+          reference: asset._id,
+          createdBy,
+          notes: `Fixed asset purchase — ${asset.referenceNo}`,
+          journalEntryId: journalEntry._id,
+        });
+      } catch (btErr) {
+        console.error(
+          "BankTransaction creation failed for asset purchase:",
+          btErr.message,
+        );
+        // Non-fatal — journal entry already posted; balance recalculates on next fetch
+      }
+    }
 
     res.status(201).json({
       success: true,
       data: asset,
-      journalEntry
+      journalEntry,
     });
   } catch (error) {
-    console.error('Error creating fixed asset:', error);
+    console.error("Error creating fixed asset:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -403,13 +554,13 @@ exports.calculateDepreciation = async (req, res) => {
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
-    if (asset.status === 'disposed') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Cannot calculate depreciation for disposed asset' 
+    if (asset.status === "disposed") {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot calculate depreciation for disposed asset",
       });
     }
 
@@ -423,16 +574,18 @@ exports.calculateDepreciation = async (req, res) => {
         referenceNo: asset.referenceNo,
         periodDate: period,
         depreciationAmount,
-        currentAccumulatedDepreciation: parseFloat(asset.accumulatedDepreciation?.toString() || 0),
+        currentAccumulatedDepreciation: parseFloat(
+          asset.accumulatedDepreciation?.toString() || 0,
+        ),
         netBookValue: parseFloat(asset.netBookValue?.toString() || 0),
         purchaseCost: parseFloat(asset.purchaseCost?.toString() || 0),
         salvageValue: parseFloat(asset.salvageValue?.toString() || 0),
         usefulLifeMonths: asset.usefulLifeMonths,
-        depreciationMethod: asset.depreciationMethod
-      }
+        depreciationMethod: asset.depreciationMethod,
+      },
     });
   } catch (error) {
-    console.error('Error calculating depreciation:', error);
+    console.error("Error calculating depreciation:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -443,60 +596,72 @@ exports.postDepreciation = async (req, res) => {
     const { id } = req.params;
     const companyId = req.user.company._id;
     const { periodDate, postedBy } = req.body;
+    const userId = req.user._id;
+    
+    // Use postedBy from body or fall back to authenticated user
+    const postedByUserId = postedBy || userId;
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
-    if (asset.status === 'disposed') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Cannot post depreciation for disposed asset' 
+    if (asset.status === "disposed") {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot post depreciation for disposed asset",
       });
     }
 
     const period = periodDate ? new Date(periodDate) : new Date();
-    
+    // Normalize to midnight UTC to avoid time-based duplicate key errors
+    period.setUTCHours(0, 0, 0, 0);
+
     // Check if depreciation already posted for this period (idempotency)
     const existingEntry = await DepreciationEntry.findOne({
       asset: asset._id,
       periodDate: {
         $gte: new Date(period.getFullYear(), period.getMonth(), 1),
-        $lt: new Date(period.getFullYear(), period.getMonth() + 1, 1)
+        $lt: new Date(period.getFullYear(), period.getMonth() + 1, 1),
       },
       isReversed: false,
-      isDeleted: false
+      isDeleted: false,
     });
 
     if (existingEntry) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Depreciation already posted for this period' 
+      return res.status(400).json({
+        success: false,
+        error: "Depreciation already posted for this period",
       });
     }
 
     // Calculate depreciation
     const depreciationAmount = asset.calculateDepreciation(period);
-    
+
     if (depreciationAmount <= 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'No depreciation to post (asset may be fully depreciated)' 
+      return res.status(400).json({
+        success: false,
+        error: "No depreciation to post (asset may be fully depreciated)",
       });
     }
 
     // Get current accumulated depreciation
-    const currentAccumDep = parseFloat(asset.accumulatedDepreciation?.toString() || 0);
+    const currentAccumDep = parseFloat(
+      asset.accumulatedDepreciation?.toString() || 0,
+    );
     const newAccumDep = currentAccumDep + depreciationAmount;
-    const newNetBookValue = parseFloat(asset.purchaseCost?.toString() || 0) - newAccumDep;
+    const newNetBookValue =
+      parseFloat(asset.purchaseCost?.toString() || 0) - newAccumDep;
 
     // Create journal entry for depreciation (per Module 5.4 spec)
     // DR depreciation_expense_account_id depreciation_amount
     // CR accum_depreciation_account_id depreciation_amount
     // source_type: depreciation
     // Narration: "Depreciation - [Asset Name] - [Month Year] - AST#[ref]"
-    const monthYear = period.toLocaleString('default', { month: 'long', year: 'numeric' });
+    const monthYear = period.toLocaleString("default", {
+      month: "long",
+      year: "numeric",
+    });
     const entryNumber = await JournalEntry.generateEntryNumber(asset.company);
     const periodId = await PeriodService.getOpenPeriodId(asset.company, period);
     const journalEntry = await JournalEntry.create({
@@ -504,34 +669,38 @@ exports.postDepreciation = async (req, res) => {
       entryNumber,
       date: period,
       description: `Depreciation - ${asset.name} - ${monthYear} - AST#${asset.referenceNo}`,
-      sourceType: 'depreciation',
+      sourceType: "depreciation",
       sourceId: asset._id,
       sourceReference: asset.referenceNo,
-      status: 'posted',
+      status: "posted",
       isAutoGenerated: true,
       lines: [
         {
           accountCode: asset.depreciationExpenseAccountCode,
-          accountName: CHART_OF_ACCOUNTS[asset.depreciationExpenseAccountCode]?.name || 'Depreciation Expense',
+          accountName:
+            CHART_OF_ACCOUNTS[asset.depreciationExpenseAccountCode]?.name ||
+            "Depreciation Expense",
           debit: depreciationAmount,
           credit: 0,
-          description: `Depreciation: ${asset.referenceNo}`
+          description: `Depreciation: ${asset.referenceNo}`,
         },
         {
           accountCode: asset.accumDepreciationAccountCode,
-          accountName: CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name || 'Accumulated Depreciation',
+          accountName:
+            CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name ||
+            "Accumulated Depreciation",
           debit: 0,
           credit: depreciationAmount,
-          description: `Depreciation: ${asset.referenceNo}`
-        }
+          description: `Depreciation: ${asset.referenceNo}`,
+        },
       ],
-      createdBy: postedBy,
-      postedBy: postedBy,
+      createdBy: postedByUserId,
+      postedBy: postedByUserId,
       period: periodId,
       totalDebit: depreciationAmount,
       totalCredit: depreciationAmount,
       debitTotal: depreciationAmount,
-      creditTotal: depreciationAmount
+      creditTotal: depreciationAmount,
     });
 
     // Create depreciation entry record (for idempotency)
@@ -539,25 +708,37 @@ exports.postDepreciation = async (req, res) => {
       company: asset.company,
       asset: asset._id,
       periodDate: period,
-      depreciationAmount: mongoose.Types.Decimal128.fromString(depreciationAmount.toString()),
-      accumulatedBefore: mongoose.Types.Decimal128.fromString(currentAccumDep.toString()),
-      accumulatedAfter: mongoose.Types.Decimal128.fromString(newAccumDep.toString()),
-      netBookValueAfter: mongoose.Types.Decimal128.fromString(newNetBookValue.toString()),
+      depreciationAmount: mongoose.Types.Decimal128.fromString(
+        depreciationAmount.toString(),
+      ),
+      accumulatedBefore: mongoose.Types.Decimal128.fromString(
+        currentAccumDep.toString(),
+      ),
+      accumulatedAfter: mongoose.Types.Decimal128.fromString(
+        newAccumDep.toString(),
+      ),
+      netBookValueAfter: mongoose.Types.Decimal128.fromString(
+        newNetBookValue.toString(),
+      ),
       journalEntryId: journalEntry._id,
-      postedBy
+      postedBy: postedByUserId,
     });
 
     // Update asset
-    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString(newAccumDep.toString());
-    asset.netBookValue = mongoose.Types.Decimal128.fromString(newNetBookValue.toString());
+    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString(
+      newAccumDep.toString(),
+    );
+    asset.netBookValue = mongoose.Types.Decimal128.fromString(
+      newNetBookValue.toString(),
+    );
     asset.lastDepreciationDate = period;
-    
+
     // Check if fully depreciated (NBV <= salvage_value)
     const salvageValue = parseFloat(asset.salvageValue?.toString() || 0);
     if (newNetBookValue <= salvageValue) {
-      asset.status = 'fully_depreciated';
+      asset.status = "fully_depreciated";
     }
-    
+
     await asset.save();
 
     res.status(201).json({
@@ -565,11 +746,11 @@ exports.postDepreciation = async (req, res) => {
       data: {
         asset,
         depreciationEntry,
-        journalEntry
-      }
+        journalEntry,
+      },
     });
   } catch (error) {
-    console.error('Error posting depreciation:', error);
+    console.error("Error posting depreciation:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -579,17 +760,19 @@ exports.disposeAsset = async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = req.user.company._id;
-    const { disposalDate, disposalProceeds, createdBy } = req.body;
+    // createdBy always from session
+    const createdBy = req.user._id;
+    const { disposalDate, disposalProceeds, bankAccountId } = req.body;
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
-    if (asset.status === 'disposed') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Asset already disposed' 
+    if (asset.status === "disposed") {
+      return res.status(400).json({
+        success: false,
+        error: "Asset already disposed",
       });
     }
 
@@ -597,7 +780,9 @@ exports.disposeAsset = async (req, res) => {
     const proceeds = disposalProceeds ? parseFloat(disposalProceeds) : 0;
     const netBookValue = parseFloat(asset.netBookValue?.toString() || 0);
     const purchaseCost = parseFloat(asset.purchaseCost?.toString() || 0);
-    const accumulatedDepreciation = parseFloat(asset.accumulatedDepreciation?.toString() || 0);
+    const accumulatedDepreciation = parseFloat(
+      asset.accumulatedDepreciation?.toString() || 0,
+    );
     const gainLoss = proceeds - netBookValue;
 
     // Create journal entry for disposal (per Module 5.6 spec)
@@ -607,36 +792,56 @@ exports.disposeAsset = async (req, res) => {
     // If gain: CR 4200 Other Income gain_amount
     // If loss: DR 6xxx Loss on Disposal loss_amount
     // source_type: asset_disposal
-    
+
     const lines = [
       // Remove accumulated depreciation
       {
         accountCode: asset.accumDepreciationAccountCode,
-        accountName: CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name || 'Accumulated Depreciation',
+        accountName:
+          CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name ||
+          "Accumulated Depreciation",
         debit: accumulatedDepreciation,
         credit: 0,
-        description: `Disposal: ${asset.referenceNo}`
-      }
+        description: `Disposal: ${asset.referenceNo}`,
+      },
     ];
+
+    // Resolve bank account for proceeds
+    let proceedsBankDoc = null;
+    let proceedsAccountCode = "1100"; // default Cash at Bank
+    if (bankAccountId && proceeds > 0) {
+      proceedsBankDoc = await BankAccount.findOne({
+        _id: bankAccountId,
+        company: companyId,
+        isActive: true,
+      });
+      if (proceedsBankDoc) {
+        proceedsAccountCode = proceedsBankDoc.ledgerAccountId || "1100";
+      }
+    }
 
     // Add proceeds if any (DR Bank)
     if (proceeds > 0) {
       lines.push({
-        accountCode: '1100',
-        accountName: CHART_OF_ACCOUNTS['1100']?.name || 'Cash at Bank',
+        accountCode: proceedsAccountCode,
+        accountName:
+          proceedsBankDoc?.name ||
+          CHART_OF_ACCOUNTS[proceedsAccountCode]?.name ||
+          "Cash at Bank",
         debit: proceeds,
         credit: 0,
-        description: `Disposal proceeds: ${asset.referenceNo}`
+        description: `Disposal proceeds: ${asset.referenceNo}`,
       });
     }
 
     // Remove original asset cost (CR Fixed Asset)
     lines.push({
       accountCode: asset.assetAccountCode,
-      accountName: CHART_OF_ACCOUNTS[asset.assetAccountCode]?.name || 'Fixed Asset',
+      accountName:
+        CHART_OF_ACCOUNTS[asset.assetAccountCode]?.name || "Fixed Asset",
       debit: 0,
       credit: purchaseCost,
-      description: `Disposal: ${asset.referenceNo}`
+      description: `Disposal: ${asset.referenceNo}`,
     });
 
     // Handle gain or loss
@@ -644,36 +849,41 @@ exports.disposeAsset = async (req, res) => {
       if (gainLoss > 0) {
         // Gain on disposal - CR Other Income
         lines.push({
-          accountCode: DEFAULT_ACCOUNTS.gainOnDisposal || '4200',
-          accountName: CHART_OF_ACCOUNTS['4200']?.name || 'Gain on Asset Disposal',
+          accountCode: DEFAULT_ACCOUNTS.gainOnDisposal || "4200",
+          accountName:
+            CHART_OF_ACCOUNTS["4200"]?.name || "Gain on Asset Disposal",
           debit: 0,
           credit: gainLoss,
-          description: `Gain on disposal: ${asset.referenceNo}`
+          description: `Gain on disposal: ${asset.referenceNo}`,
         });
       } else {
         // Loss on disposal - DR Loss on Disposal
         lines.push({
-          accountCode: DEFAULT_ACCOUNTS.lossOnDisposal || '6050',
-          accountName: CHART_OF_ACCOUNTS['6050']?.name || 'Loss on Asset Disposal',
+          accountCode: DEFAULT_ACCOUNTS.lossOnDisposal || "6050",
+          accountName:
+            CHART_OF_ACCOUNTS["6050"]?.name || "Loss on Asset Disposal",
           debit: Math.abs(gainLoss),
           credit: 0,
-          description: `Loss on disposal: ${asset.referenceNo}`
+          description: `Loss on disposal: ${asset.referenceNo}`,
         });
       }
     }
 
     const entryNumber = await JournalEntry.generateEntryNumber(asset.company);
-    const disposalPeriodId = await PeriodService.getOpenPeriodId(asset.company, disposalDateVal);
+    const disposalPeriodId = await PeriodService.getOpenPeriodId(
+      asset.company,
+      disposalDateVal,
+    );
     const totalAmount = lines.reduce((sum, l) => sum + (l.debit || 0), 0);
     const journalEntry = await JournalEntry.create({
       company: asset.company,
       entryNumber,
       date: disposalDateVal,
       description: `Asset Disposal - ${asset.name} - AST#${asset.referenceNo}`,
-      sourceType: 'asset_disposal',
+      sourceType: "asset_disposal",
       sourceId: asset._id,
       sourceReference: asset.referenceNo,
-      status: 'posted',
+      status: "posted",
       isAutoGenerated: true,
       lines,
       createdBy,
@@ -682,28 +892,54 @@ exports.disposeAsset = async (req, res) => {
       totalDebit: totalAmount,
       totalCredit: totalAmount,
       debitTotal: totalAmount,
-      creditTotal: totalAmount
+      creditTotal: totalAmount,
     });
 
     // Update asset - set NBV to 0 after disposal
-    asset.status = 'disposed';
+    asset.status = "disposed";
     asset.disposalDate = disposalDateVal;
-    asset.disposalProceeds = proceeds > 0 ? mongoose.Types.Decimal128.fromString(proceeds.toString()) : null;
+    asset.disposalProceeds =
+      proceeds > 0
+        ? mongoose.Types.Decimal128.fromString(proceeds.toString())
+        : null;
     asset.disposalJournalEntryId = journalEntry._id;
-    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString('0');
-    asset.netBookValue = mongoose.Types.Decimal128.fromString('0');
+    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString("0");
+    asset.netBookValue = mongoose.Types.Decimal128.fromString("0");
     await asset.save();
+
+    // ── Create BankTransaction to increase bank balance with disposal proceeds ──
+    if (proceedsBankDoc && proceeds > 0) {
+      try {
+        await proceedsBankDoc.addTransaction({
+          type: "deposit",
+          amount: proceeds,
+          description: `Asset disposal proceeds: ${asset.name} (${asset.referenceNo})`,
+          date: disposalDateVal,
+          referenceNumber: asset.referenceNo,
+          referenceType: "Payment",
+          reference: asset._id,
+          createdBy,
+          notes: `Fixed asset disposal — ${asset.referenceNo}`,
+          journalEntryId: journalEntry._id,
+        });
+      } catch (btErr) {
+        console.error(
+          "BankTransaction creation failed for asset disposal proceeds:",
+          btErr.message,
+        );
+      }
+    }
 
     res.json({
       success: true,
       data: {
         asset,
         journalEntry,
-        gainLoss
-      }
+        gainLoss,
+      },
     });
   } catch (error) {
-    console.error('Error disposing asset:', error);
+    console.error("Error disposing asset:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -713,25 +949,39 @@ exports.updateAsset = async (req, res) => {
   try {
     const { id } = req.params;
     const companyId = req.user.company._id;
-    const { name, description, usefulLifeMonths, depreciationMethod, decliningRate } = req.body;
+    const {
+      name,
+      description,
+      usefulLifeMonths,
+      depreciationMethod,
+      decliningRate,
+      // New fields
+      serialNumber,
+      location,
+      departmentId,
+      warrantyStartDate,
+      warrantyEndDate,
+      insuredValue,
+    } = req.body;
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
     // Check if any depreciation has been posted
-    const hasDepreciation = await DepreciationEntry.countDocuments({
-      asset: asset._id,
-      company: companyId,
-      isReversed: false,
-      isDeleted: false
-    }) > 0;
+    const hasDepreciation =
+      (await DepreciationEntry.countDocuments({
+        asset: asset._id,
+        company: companyId,
+        isReversed: false,
+        isDeleted: false,
+      })) > 0;
 
     if (hasDepreciation) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Cannot edit asset after depreciation has been posted' 
+      return res.status(400).json({
+        success: false,
+        error: "Cannot edit asset after depreciation has been posted",
       });
     }
 
@@ -740,16 +990,32 @@ exports.updateAsset = async (req, res) => {
     if (description !== undefined) asset.description = description;
     if (usefulLifeMonths) asset.usefulLifeMonths = usefulLifeMonths;
     if (depreciationMethod) asset.depreciationMethod = depreciationMethod;
-    if (decliningRate) asset.decliningRate = mongoose.Types.Decimal128.fromString(String(decliningRate));
+    if (decliningRate)
+      asset.decliningRate = mongoose.Types.Decimal128.fromString(
+        String(decliningRate),
+      );
+    
+    // Update new fields
+    if (serialNumber !== undefined) asset.serialNumber = serialNumber || null;
+    if (location !== undefined) asset.location = location || null;
+    if (departmentId !== undefined) asset.departmentId = departmentId || null;
+    if (warrantyStartDate !== undefined) 
+      asset.warrantyStartDate = warrantyStartDate ? new Date(warrantyStartDate) : null;
+    if (warrantyEndDate !== undefined)
+      asset.warrantyEndDate = warrantyEndDate ? new Date(warrantyEndDate) : null;
+    if (insuredValue !== undefined)
+      asset.insuredValue = insuredValue
+        ? mongoose.Types.Decimal128.fromString(String(insuredValue))
+        : null;
 
     await asset.save();
 
     res.json({
       success: true,
-      data: asset
+      data: asset,
     });
   } catch (error) {
-    console.error('Error updating fixed asset:', error);
+    console.error("Error updating fixed asset:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -759,25 +1025,27 @@ exports.getDepreciationReport = async (req, res) => {
   try {
     const companyId = req.user.company._id;
 
-    const query = { 
-      company: companyId, 
+    const query = {
+      company: companyId,
       isDeleted: false,
-      status: { $ne: 'disposed' }
+      status: { $ne: "disposed" },
     };
 
     const assets = await FixedAsset.find(query)
-      .populate('assetAccountId', 'code name')
-      .populate('depreciationExpenseAccountId', 'code name');
+      .populate("assetAccountId", "code name")
+      .populate("depreciationExpenseAccountId", "code name");
 
-    const report = assets.map(asset => {
+    const report = assets.map((asset) => {
       const purchaseCost = parseFloat(asset.purchaseCost?.toString() || 0);
-      const accumulatedDep = parseFloat(asset.accumulatedDepreciation?.toString() || 0);
+      const accumulatedDep = parseFloat(
+        asset.accumulatedDepreciation?.toString() || 0,
+      );
       const netBookValue = parseFloat(asset.netBookValue?.toString() || 0);
       const salvageValue = parseFloat(asset.salvageValue?.toString() || 0);
-      
+
       // Calculate monthly depreciation
       let monthlyDep = 0;
-      if (asset.depreciationMethod === 'straight_line') {
+      if (asset.depreciationMethod === "straight_line") {
         monthlyDep = (purchaseCost - salvageValue) / asset.usefulLifeMonths;
       }
 
@@ -791,18 +1059,26 @@ exports.getDepreciationReport = async (req, res) => {
         netBookValue,
         monthlyDepreciation: Math.round(monthlyDep * 100) / 100,
         status: asset.status,
-        depreciationMethod: asset.depreciationMethod
+        depreciationMethod: asset.depreciationMethod,
       };
     });
 
     // Calculate totals
-    const totals = report.reduce((acc, asset) => {
-      acc.purchaseCost += asset.purchaseCost;
-      acc.accumulatedDepreciation += asset.accumulatedDepreciation;
-      acc.netBookValue += asset.netBookValue;
-      acc.monthlyDepreciation += asset.monthlyDepreciation;
-      return acc;
-    }, { purchaseCost: 0, accumulatedDepreciation: 0, netBookValue: 0, monthlyDepreciation: 0 });
+    const totals = report.reduce(
+      (acc, asset) => {
+        acc.purchaseCost += asset.purchaseCost;
+        acc.accumulatedDepreciation += asset.accumulatedDepreciation;
+        acc.netBookValue += asset.netBookValue;
+        acc.monthlyDepreciation += asset.monthlyDepreciation;
+        return acc;
+      },
+      {
+        purchaseCost: 0,
+        accumulatedDepreciation: 0,
+        netBookValue: 0,
+        monthlyDepreciation: 0,
+      },
+    );
 
     res.json({
       success: true,
@@ -810,14 +1086,16 @@ exports.getDepreciationReport = async (req, res) => {
         assets: report,
         totals: {
           purchaseCost: Math.round(totals.purchaseCost * 100) / 100,
-          accumulatedDepreciation: Math.round(totals.accumulatedDepreciation * 100) / 100,
+          accumulatedDepreciation:
+            Math.round(totals.accumulatedDepreciation * 100) / 100,
           netBookValue: Math.round(totals.netBookValue * 100) / 100,
-          monthlyDepreciation: Math.round(totals.monthlyDepreciation * 100) / 100
-        }
-      }
+          monthlyDepreciation:
+            Math.round(totals.monthlyDepreciation * 100) / 100,
+        },
+      },
     });
   } catch (error) {
-    console.error('Error getting depreciation report:', error);
+    console.error("Error getting depreciation report:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -831,31 +1109,36 @@ exports.deleteAsset = async (req, res) => {
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
     // Guard 1: Block if already disposed
-    if (asset.status === 'disposed') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'ASSET_ALREADY_DISPOSED: Asset is already disposed. Use the disposal endpoint, not delete.' 
+    if (asset.status === "disposed") {
+      return res.status(400).json({
+        success: false,
+        error:
+          "ASSET_ALREADY_DISPOSED: Asset is already disposed. Use the disposal endpoint, not delete.",
       });
     }
 
     // Guard 2: Block if depreciation has been posted
-    const accumulatedDep = parseFloat(asset.accumulatedDepreciation?.toString() || 0);
+    const accumulatedDep = parseFloat(
+      asset.accumulatedDepreciation?.toString() || 0,
+    );
     if (accumulatedDep > 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'ASSET_HAS_DEPRECIATION_HISTORY: Cannot delete asset after depreciation has been posted. Financial history exists.' 
+      return res.status(400).json({
+        success: false,
+        error:
+          "ASSET_HAS_DEPRECIATION_HISTORY: Cannot delete asset after depreciation has been posted. Financial history exists.",
       });
     }
 
     // Guard 3: Block if purchase journal entry was posted
     if (asset.purchaseJournalEntryId) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'ASSET_HAS_POSTED_JOURNAL: Cannot delete asset after purchase journal entry was posted. Reversing this requires an accounting operation, not a delete.' 
+      return res.status(400).json({
+        success: false,
+        error:
+          "ASSET_HAS_POSTED_JOURNAL: Cannot delete asset after purchase journal entry was posted. Reversing this requires an accounting operation, not a delete.",
       });
     }
 
@@ -866,10 +1149,10 @@ exports.deleteAsset = async (req, res) => {
 
     res.json({
       success: true,
-      data: { message: 'Asset deleted successfully', assetId: asset._id }
+      data: { message: "Asset deleted successfully", assetId: asset._id },
     });
   } catch (error) {
-    console.error('Error deleting asset:', error);
+    console.error("Error deleting asset:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -883,25 +1166,28 @@ exports.reverseDepreciation = async (req, res) => {
 
     const asset = await FixedAsset.findOne({ _id: id, company: companyId });
     if (!asset) {
-      return res.status(404).json({ success: false, error: 'Asset not found' });
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
 
     // Find the depreciation entry
-    const entry = await DepreciationEntry.findOne({ 
-      _id: entryId, 
+    const entry = await DepreciationEntry.findOne({
+      _id: entryId,
       asset: asset._id,
-      company: companyId 
+      company: companyId,
     });
-    
+
     if (!entry) {
-      return res.status(404).json({ success: false, error: 'Depreciation entry not found' });
+      return res
+        .status(404)
+        .json({ success: false, error: "Depreciation entry not found" });
     }
 
     // Guard 1: Check if already reversed
     if (entry.isReversed) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'ENTRY_ALREADY_REVERSED: This depreciation entry has already been reversed' 
+      return res.status(400).json({
+        success: false,
+        error:
+          "ENTRY_ALREADY_REVERSED: This depreciation entry has already been reversed",
       });
     }
 
@@ -910,50 +1196,61 @@ exports.reverseDepreciation = async (req, res) => {
       asset: asset._id,
       company: companyId,
       isReversed: false,
-      isDeleted: false
+      isDeleted: false,
     }).sort({ periodDate: -1, createdAt: -1 });
 
     if (!latestEntry || latestEntry._id.toString() !== entryId) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'REVERSAL_ORDER_VIOLATION: Can only reverse the most recent depreciation entry. Later entries must be reversed first.' 
+      return res.status(400).json({
+        success: false,
+        error:
+          "REVERSAL_ORDER_VIOLATION: Can only reverse the most recent depreciation entry. Later entries must be reversed first.",
       });
     }
 
     // Get the accumulated value BEFORE this entry (stored in the entry)
-    const accumulatedBefore = parseFloat(entry.accumulatedBefore?.toString() || 0);
-    const newNetBookValue = parseFloat(asset.purchaseCost?.toString() || 0) - accumulatedBefore;
+    const accumulatedBefore = parseFloat(
+      entry.accumulatedBefore?.toString() || 0,
+    );
+    const newNetBookValue =
+      parseFloat(asset.purchaseCost?.toString() || 0) - accumulatedBefore;
 
     // Create reversing journal entry
     // Reverse the original: DR Accum Depreciation, CR Depreciation Expense
     const entryNumber = await JournalEntry.generateEntryNumber(companyId);
     const revDepAmount = parseFloat(entry.depreciationAmount?.toString() || 0);
-    const reversalPeriodId = await PeriodService.getOpenPeriodId(companyId, new Date());
+    const reversalPeriodId = await PeriodService.getOpenPeriodId(
+      companyId,
+      new Date(),
+    );
     const reversingEntry = await JournalEntry.create({
       company: companyId,
       entryNumber,
       date: new Date(),
-      description: `Depreciation Reversal - ${asset.name} - AST#${asset.referenceNo} - ${reason || 'Reversal'}`,
-      sourceType: 'depreciation_reversal',
+      description: `Depreciation Reversal - ${asset.name} - AST#${asset.referenceNo} - ${reason || "Reversal"}`,
+      sourceType: "depreciation_reversal",
       sourceId: asset._id,
       sourceReference: asset.referenceNo,
-      status: 'posted',
+      status: "posted",
       isAutoGenerated: true,
       lines: [
         {
           accountCode: asset.accumDepreciationAccountCode,
-          accountName: CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name || 'Accumulated Depreciation',
+          accountName:
+            CHART_OF_ACCOUNTS[asset.accumDepreciationAccountCode]?.name ||
+            "Accumulated Depreciation",
           debit: 0,
           credit: revDepAmount,
-          description: `Reversal: ${asset.referenceNo}`
+          description: `Reversal: ${asset.referenceNo}`,
         },
         {
           accountCode: asset.depreciationExpenseAccountCode,
-          accountName: CHART_OF_ACCOUNTS[asset.depreciationExpenseAccountCode]?.name || 'Depreciation Expense',
+          accountName:
+            CHART_OF_ACCOUNTS[asset.depreciationExpenseAccountCode]?.name ||
+            "Depreciation Expense",
           debit: revDepAmount,
           credit: 0,
-          description: `Reversal: ${asset.referenceNo}`
-        }
+          description: `Reversal: ${asset.referenceNo}`,
+        },
       ],
       createdBy: reversedBy,
       postedBy: reversedBy,
@@ -961,7 +1258,7 @@ exports.reverseDepreciation = async (req, res) => {
       totalDebit: revDepAmount,
       totalCredit: revDepAmount,
       debitTotal: revDepAmount,
-      creditTotal: revDepAmount
+      creditTotal: revDepAmount,
     });
 
     // Update the depreciation entry as reversed
@@ -971,14 +1268,18 @@ exports.reverseDepreciation = async (req, res) => {
     await entry.save();
 
     // Roll back the asset's accumulated depreciation to the value BEFORE this entry
-    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString(accumulatedBefore.toString());
-    asset.netBookValue = mongoose.Types.Decimal128.fromString(newNetBookValue.toString());
-    
+    asset.accumulatedDepreciation = mongoose.Types.Decimal128.fromString(
+      accumulatedBefore.toString(),
+    );
+    asset.netBookValue = mongoose.Types.Decimal128.fromString(
+      newNetBookValue.toString(),
+    );
+
     // Restore status to active if it was fully_depreciated
-    if (asset.status === 'fully_depreciated') {
-      asset.status = 'active';
+    if (asset.status === "fully_depreciated") {
+      asset.status = "active";
     }
-    
+
     asset.lastDepreciationDate = null;
     await asset.save();
 
@@ -988,11 +1289,41 @@ exports.reverseDepreciation = async (req, res) => {
         asset,
         reversedEntry: entry,
         reversingJournalEntry: reversingEntry,
-        message: 'Depreciation reversed successfully'
-      }
+        message: "Depreciation reversed successfully",
+      },
     });
   } catch (error) {
-    console.error('Error reversing depreciation:', error);
+    console.error("Error reversing depreciation:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// Get depreciation entries for an asset
+exports.getDepreciationEntries = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.company._id;
+
+    const asset = await FixedAsset.findOne({ _id: id, company: companyId });
+    if (!asset) {
+      return res.status(404).json({ success: false, error: "Asset not found" });
+    }
+
+    const entries = await DepreciationEntry.find({
+      asset: asset._id,
+      company: companyId,
+      isReversed: false,
+      isDeleted: false,
+    })
+      .sort({ periodDate: 1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: entries,
+    });
+  } catch (error) {
+    console.error("Error getting depreciation entries:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };

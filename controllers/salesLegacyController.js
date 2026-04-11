@@ -3,6 +3,7 @@ const Client = require('../models/Client');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
+const { BankAccount } = require('../models/BankAccount');
 const mongoose = require('mongoose');
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
@@ -32,7 +33,8 @@ exports.createDirectSale = async (req, res, next) => {
       paymentReference,
       notes,
       dueDate,
-      terms
+      terms,
+      bankAccountId
     } = req.body;
 
     // Validation
@@ -156,6 +158,8 @@ exports.createDirectSale = async (req, res, next) => {
 
     // Calculate totals
     const subtotal = invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0);
+    const totalDiscount = invoiceLines.reduce((sum, line) => sum + (line.lineSubtotal * (line.discountPct || 0) / 100), 0);
+    const netSales = subtotal - totalDiscount;
     const totalTax = invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0);
     const grandTotal = invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0);
 
@@ -321,14 +325,42 @@ exports.createDirectSale = async (req, res, next) => {
         // Build Revenue journal lines
         const revenueLines = [];
         
-        // Dr Accounts Receivable (or Cash if fully paid)
+        // Determine which account to debit - cash, bank, or AR
+        let debitAccount;
+        const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+        
+        console.log('[createDirectSale] paymentMethod:', paymentMethod, 'bankAccountId:', bankAccountId, 'amountPaid:', amountPaid, 'grandTotal:', grandTotal);
+        
         if (amountPaid >= grandTotal) {
-          const cashAccount = await JournalService.getMappedAccountCode(
-            companyId, 'cash', 'cashOnHand', 
-            DEFAULT_ACCOUNTS.cashOnHand || '1000'
-          );
+          if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
+            // Use bank account for bank payments
+            const bankAccount = await BankAccount.findOne({
+              _id: bankAccountId,
+              company: companyId,
+              isActive: true,
+            });
+            console.log('[createDirectSale] Found bank account:', bankAccount ? bankAccount.name : 'NOT FOUND', 'ledgerAccountId:', bankAccount?.ledgerAccountId);
+            if (bankAccount && bankAccount.ledgerAccountId) {
+              debitAccount = bankAccount.ledgerAccountId;
+            } else {
+              debitAccount = await JournalService.getMappedAccountCode(
+                companyId, 'cash', 'cashAtBank', 
+                DEFAULT_ACCOUNTS.cashAtBank || '1100'
+              );
+            }
+          } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
+            debitAccount = await JournalService.getMappedAccountCode(
+              companyId, 'cash', 'cashOnHand', 
+              DEFAULT_ACCOUNTS.cashOnHand || '1000'
+            );
+          } else {
+            debitAccount = await JournalService.getMappedAccountCode(
+              companyId, 'cash', 'cashAtBank', 
+              DEFAULT_ACCOUNTS.cashAtBank || '1100'
+            );
+          }
           revenueLines.push(
-            JournalService.createDebitLine(cashAccount, grandTotal, 
+            JournalService.createDebitLine(debitAccount, grandTotal, 
               `Cash sale - Invoice ${invoice.referenceNo}`)
           );
         } else {
@@ -338,10 +370,10 @@ exports.createDirectSale = async (req, res, next) => {
           );
         }
 
-        // Cr Sales Revenue
-        if (subtotal > 0) {
+        // Cr Sales Revenue (net of discount)
+        if (netSales > 0) {
           revenueLines.push(
-            JournalService.createCreditLine(salesAccount, subtotal, 
+            JournalService.createCreditLine(salesAccount, netSales, 
               `Sales revenue - Invoice ${invoice.referenceNo}`)
           );
         }
@@ -427,6 +459,36 @@ exports.createDirectSale = async (req, res, next) => {
           client.outstandingBalance = (client.outstandingBalance || 0) + amountOutstanding;
         }
         await client.save({ session });
+
+        // 5. Create bank transaction for bank-based payment methods (deposit adds to balance)
+        const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+        if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
+          try {
+            const bankAccount = await BankAccount.findOne({
+              _id: bankAccountId,
+              company: companyId,
+              isActive: true,
+            });
+
+            if (bankAccount) {
+              await bankAccount.addTransaction({
+                type: 'deposit',
+                amount: paidAmount,
+                description: `POS Sale - Invoice #${invoice.invoiceNumber}`,
+                date: new Date(),
+                referenceNumber: paymentReference || invoice.invoiceNumber,
+                paymentMethod,
+                status: 'completed',
+                reference: invoice._id,
+                referenceType: 'Invoice',
+                createdBy: req.user.id,
+                notes: `POS sale payment from ${client.name}`,
+              });
+            }
+          } catch (bankErr) {
+            console.error('[createDirectSale] Error creating bank transaction:', bankErr);
+          }
+        }
       }
     });
 

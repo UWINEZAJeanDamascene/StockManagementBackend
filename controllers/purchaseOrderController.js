@@ -1,5 +1,6 @@
 const PurchaseOrder = require('../models/PurchaseOrder');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const BudgetService = require('../services/budgetService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 exports.createPurchaseOrder = async (req, res, next) => {
@@ -38,14 +39,92 @@ exports.updatePurchaseOrder = async (req, res, next) => {
 exports.approvePurchaseOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const userId = req.user.id;
     const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
     if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft POs can be approved' });
 
+    // Update PO status
     po.status = 'approved';
-    po.approvedBy = req.user.id;
+    po.approvedBy = userId;
     po.approvedAt = new Date();
     await po.save();
+
+    // Auto-create encumbrances for budget tracking
+    const encumbranceIds = [];
+    try {
+      if (po.lines && po.lines.length > 0) {
+        const BudgetLine = require('../models/BudgetLine');
+        
+        const encumbrancePromises = po.lines
+          .filter(line => line.budgetId && line.accountId)
+          .map(async (line, index) => {
+            try {
+              // Find budget line from budgetId and accountId
+              const budgetLine = await BudgetLine.findOne({
+                budget_id: line.budgetId,
+                account_id: line.accountId,
+                company_id: companyId
+              });
+
+              if (!budgetLine) {
+                console.log('[PO] No budget line found for budget:', line.budgetId, 'account:', line.accountId);
+                return { success: false, error: 'No budget line found' };
+              }
+
+              const budget_line_id = budgetLine._id;
+
+              // Calculate line total including tax
+              const lineSubtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
+              const lineTax = lineSubtotal * ((Number(line.taxRate) || 0) / 100);
+              const lineTotal = lineSubtotal + lineTax;
+
+              if (lineTotal <= 0) return null;
+
+              const encumbrance = await BudgetService.createEncumbrance(
+                companyId,
+                {
+                  budget_id: line.budgetId,
+                  budget_line_id: budget_line_id,
+                  account_id: line.accountId,
+                  source_type: "purchase_order",
+                  source_id: po._id.toString(),
+                  source_number: po.referenceNo || po._id.toString(),
+                  description: `PO: ${po.referenceNo || ''} - ${line.product?.name || 'Item'}`,
+                  amount: lineTotal,
+                  expected_liquidation_date: po.expectedDeliveryDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                  notes: `Auto-created from Purchase Order approval`,
+                },
+                userId
+              );
+
+              // Store encumbrance_id back to the PO line for tracking
+              if (encumbrance && encumbrance._id) {
+                po.lines[index].encumbrance_id = encumbrance._id;
+                po.lines[index].budget_line_id = budget_line_id;
+                encumbranceIds.push({ lineIndex: index, encumbranceId: encumbrance._id });
+              }
+
+              return { success: true, encumbranceId: encumbrance._id };
+            } catch (encErr) {
+              console.error('Error creating encumbrance for PO line:', encErr);
+              return { success: false, error: encErr.message };
+            }
+          });
+
+        await Promise.all(encumbrancePromises);
+
+        // Save PO with updated encumbrance_ids
+        if (encumbranceIds.length > 0) {
+          await po.save();
+          console.log('[PO] Saved encumbrance_ids to PO lines:', encumbranceIds);
+        }
+      }
+    } catch (encErr) {
+      // Log error but don't fail the approval
+      console.error('Failed to create encumbrances for PO:', encErr.message);
+    }
+
     res.json({ success: true, data: po });
   } catch (err) { next(err); }
 };
@@ -125,7 +204,9 @@ exports.getPurchaseOrder = async (req, res, next) => {
       .populate('warehouse', 'name code')
       .populate('createdBy', 'name email')
       .populate('approvedBy', 'name email')
-      .populate('lines.product', 'name sku unit');
+      .populate('lines.product', 'name sku unit trackingType')
+      .populate('lines.budgetId', 'name fiscalYear')
+      .populate('lines.accountId', 'code name');
     
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
 
@@ -177,23 +258,26 @@ exports.recordPOPayment = async (req, res, next) => {
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
     if (po.status === 'cancelled') return res.status(409).json({ success: false, message: 'Cannot pay a cancelled PO' });
 
-    const { amount, paymentMethod, reference, notes } = req.body;
+    const { amount, paymentMethod, reference, notes, bankAccountId } = req.body;
     const payAmount = parseFloat(amount);
     if (!payAmount || payAmount <= 0) return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
 
     const remaining = (po.totalAmount || 0) - (po.amountPaid || 0);
     if (payAmount > remaining) return res.status(400).json({ success: false, message: `Amount exceeds remaining balance (${remaining})` });
 
+    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+
     po.payments.push({
       amount: payAmount,
       paymentMethod: paymentMethod || 'bank_transfer',
       reference: reference || null,
       notes: notes || null,
+      bankAccountId: bankAccountId || null,
       paidDate: new Date(),
       createdBy: req.user.id
     });
 
-    po.amountPaid = (po.amountPaid || 0) + payAmount;
+    po.amountPaid = Number(po.amountPaid || 0) + payAmount;
     po.balance = po.totalAmount - po.amountPaid;
     po.paymentStatus = po.balance <= 0 ? 'paid' : 'partial';
 
@@ -202,42 +286,64 @@ exports.recordPOPayment = async (req, res, next) => {
     // Create journal entry: Dr AP, Cr Cash/Bank
     try {
       const JournalService = require('../services/journalService');
-      const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
+      const { BankAccount } = require('../models/BankAccount');
       
-      let cashAccount;
-      if (paymentMethod === 'bank_transfer' || paymentMethod === 'cheque') {
-        cashAccount = DEFAULT_ACCOUNTS.cashAtBank;
-      } else if (paymentMethod === 'mobile_money') {
-        cashAccount = DEFAULT_ACCOUNTS.mtnMoMo;
-      } else {
-        cashAccount = DEFAULT_ACCOUNTS.cashInHand;
+      let bankAccountCode;
+      // Use specific bank account if provided
+      if (bankAccountId) {
+        const bankAccount = await BankAccount.findOne({ _id: bankAccountId, company: companyId });
+        if (bankAccount && bankAccount.accountCode) {
+          bankAccountCode = bankAccount.accountCode;
+        }
       }
 
-      const lines = [];
-      // Debit: Accounts Payable
-      lines.push(JournalService.createDebitLine(
-        await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable),
-        payAmount,
-        `Payment for PO ${po.referenceNo}`
-      ));
-      // Credit: Cash/Bank
-      lines.push(JournalService.createCreditLine(
-        cashAccount,
-        payAmount,
-        `Payment for PO ${po.referenceNo}`
-      ));
-
-      await JournalService.createEntry(companyId, req.user.id, {
+      await JournalService.createPurchasePaymentEntry(companyId, req.user.id, {
+        purchaseNumber: po.referenceNo,
         date: new Date(),
-        description: `Payment made for purchase order ${po.referenceNo}`,
-        sourceType: 'payment',
-        sourceReference: po.referenceNo,
-        lines,
-        isAutoGenerated: true
+        amount: payAmount,
+        paymentMethod: paymentMethod,
+        bankAccountCode: bankAccountCode,
+        vatAmount: po.vatAmount || 0,
+        netAmount: po.subtotal || (payAmount - (po.vatAmount || 0)),
       });
     } catch (jeErr) {
       console.error('Failed to create journal entry for PO payment:', jeErr);
       // Don't fail the payment if journal entry fails
+    }
+
+    // Create bank transaction for bank-based payment methods (withdrawal reduces balance)
+    if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
+      console.log('[PO Payment] Creating bank transaction - bankAccountId:', bankAccountId, 'amount:', payAmount);
+      try {
+        const { BankAccount } = require('../models/BankAccount');
+        const bankAccount = await BankAccount.findOne({
+          _id: bankAccountId,
+          company: companyId,
+          isActive: true,
+        });
+        
+        console.log('[PO Payment] Found bank account:', bankAccount ? bankAccount.name : 'NOT FOUND');
+
+        if (bankAccount) {
+          const tx = await bankAccount.addTransaction({
+            type: 'withdrawal',
+            amount: payAmount,
+            description: `Payment for PO ${po.referenceNo}`,
+            date: new Date(),
+            referenceNumber: reference || po.referenceNo,
+            paymentMethod,
+            status: 'completed',
+            reference: po._id,
+            referenceType: 'PurchaseOrder',
+            createdBy: req.user.id,
+            notes: notes || `Payment for purchase order ${po.referenceNo}`,
+          });
+          console.log('[PO Payment] Bank transaction created:', tx._id);
+        }
+      } catch (bankErr) {
+        console.error('[PO Payment] Error creating bank transaction:', bankErr);
+        // Non-fatal — journal entry already posted
+      }
     }
 
     // Update linked GRNs payment status
@@ -262,6 +368,74 @@ exports.recordPOPayment = async (req, res, next) => {
       }
     } catch (grnErr) {
       console.error('Failed to update GRN payment status:', grnErr);
+    }
+
+    // Liquidate encumbrances when PO is paid (fully or partially)
+    try {
+      const Encumbrance = require('../models/Encumbrance');
+      const BudgetLine = require('../models/BudgetLine');
+
+      const encumbrances = await Encumbrance.find({
+        source_type: 'purchase_order',
+        source_id: po._id.toString(),
+        status: { $in: ['active', 'partially_liquidated'] }
+      });
+
+      for (const encumbrance of encumbrances) {
+        const encumberedAmount = Number(encumbrance.encumbered_amount?.toString() || 0);
+        const currentLiquidated = Number(encumbrance.liquidated_amount?.toString() || 0);
+        const remainingToLiquidate = encumberedAmount - currentLiquidated;
+
+        if (remainingToLiquidate <= 0) continue;
+
+        // Calculate how much of this encumbrance to liquidate based on payment ratio
+        const paymentRatio = po.totalAmount > 0 ? payAmount / po.totalAmount : 0;
+        const liquidationAmount = Math.min(remainingToLiquidate, encumberedAmount * paymentRatio);
+
+        if (liquidationAmount <= 0) continue;
+
+        const newLiquidated = currentLiquidated + liquidationAmount;
+
+        // Update encumbrance
+        encumbrance.liquidated_amount = newLiquidated;
+        encumbrance.remaining_amount = encumberedAmount - newLiquidated;
+        encumbrance.liquidations.push({
+          document_type: 'payment',
+          document_id: po._id.toString(),
+          document_number: po.referenceNo || `PO-${po._id.toString().slice(-5)}`,
+          amount: liquidationAmount,
+          date: new Date(),
+          notes: `PO payment - reference: ${reference || 'N/A'}, method: ${paymentMethod || 'N/A'}`
+        });
+
+        if (newLiquidated >= encumberedAmount) {
+          encumbrance.status = 'fully_liquidated';
+          encumbrance.liquidated_at = new Date();
+        } else {
+          encumbrance.status = 'partially_liquidated';
+        }
+
+        await encumbrance.save();
+
+        // Update budget line: reduce encumbered, increase actual (consume budget)
+        if (!encumbrance.budget_line_id) {
+          throw new Error('Encumbrance missing budget_line_id');
+        }
+        
+        const budgetLine = await BudgetLine.findById(encumbrance.budget_line_id);
+        if (!budgetLine) {
+          throw new Error(`BudgetLine not found: ${encumbrance.budget_line_id}`);
+        }
+        
+        const currentEncumbered = Number(budgetLine.encumbered_amount?.toString() || 0);
+        const currentActual = Number(budgetLine.actual_amount?.toString() || 0);
+
+        budgetLine.encumbered_amount = Math.max(0, currentEncumbered - liquidationAmount);
+        budgetLine.actual_amount = currentActual + liquidationAmount;
+        await budgetLine.save();
+      }
+    } catch (encErr) {
+      console.error('Error liquidating encumbrances for PO payment:', encErr);
     }
 
     res.json({ success: true, data: po });

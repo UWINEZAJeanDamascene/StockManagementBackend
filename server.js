@@ -69,6 +69,8 @@ require('./models/Testimonial');
 require('./models/DeliveryNote');
 require('./models/PettyCash');
 require('./models/BankAccount');
+require('./models/Encumbrance');
+require('./models/BudgetLine');
 require('./models/StockTransfer');
 require('./models/StockTransferLine');
 require('./models/StockBatch');
@@ -156,6 +158,10 @@ app.use(compression({
 // Body parser - increased limit for CSV imports
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Serve uploaded files
+const path = require('path');
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Cookie parser (needed for httpOnly cookie sessions)
 app.use(cookieParser());
@@ -250,6 +256,18 @@ apiRouter.use('/export', require('./src/routes/v1/export.routes'));
 app.use('/api', apiRouter);
 app.use('/api/v1', apiRouter);
 
+// Test-only upload endpoint (no auth) to validate upload middleware and storage
+// NOTE: This is temporary for debugging; remove or protect in production.
+try {
+  const { uploadFor } = require('./middleware/upload');
+  app.post('/api/test/upload/avatar', uploadFor('users').single('avatar'), (req, res) => {
+    if (!req.file) return res.status(422).json({ success: false, message: 'No file uploaded' });
+    return res.json({ success: true, path: `/uploads/users/${req.file.filename}` });
+  });
+} catch (e) {
+  console.warn('Could not register test upload route:', e && e.message ? e.message : e);
+}
+
 // Admin: Reset rate limit for IP (for testing)
 app.post('/admin/reset-rate-limit', async (req, res) => {
   try {
@@ -321,7 +339,6 @@ if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
   try {
     const backupScheduler = require('./services/backupScheduler');
     backupScheduler.startBackupScheduler();
-    backupScheduler.startVerificationScheduler();
   } catch (err) {
     console.warn('Could not start backup scheduler', err);
   }

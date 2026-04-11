@@ -32,8 +32,8 @@ class CompanyService {
       companyId: company._id,
       userId: createdByUserId,
       action: 'company.create',
-      entity_type: 'company',
-      entity_id: company._id,
+      entityType: 'company',
+      entityId: company._id,
       changes: data
     });
 
@@ -294,8 +294,8 @@ class CompanyService {
       companyId,
       userId,
       action: 'company.update',
-      entity_type: 'company',
-      entity_id: companyId,
+      entityType: 'company',
+      entityId: companyId,
       changes: data
     });
 
@@ -318,8 +318,8 @@ class CompanyService {
       companyId,
       userId,
       action: 'company.logo_upload',
-      entity_type: 'company',
-      entity_id: companyId,
+      entityType: 'company',
+      entityId: companyId,
       changes: { logo_url: logoUrl }
     });
 
@@ -402,8 +402,8 @@ class CompanyService {
       companyId,
       userId,
       action: 'company.delete',
-      entity_type: 'company',
-      entity_id: companyId
+      entityType: 'company',
+      entityId: companyId
     });
 
     return company;

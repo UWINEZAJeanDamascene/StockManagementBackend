@@ -1,4 +1,4 @@
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 const {
   getPayrollRecords,
@@ -11,44 +11,48 @@ const {
   calculatePayroll,
   bulkCreatePayroll,
   finalisePayroll,
-  getPayslip
-} = require('../controllers/payrollController');
-const { protect, authorize } = require('../middleware/auth');
+  getPayslip,
+  backfillPayrollJournals,
+} = require("../controllers/payrollController");
+const { protect, authorize } = require("../middleware/auth");
 
 router.use(protect);
 
 // Calculate payroll (preview)
-router.route('/calculate')
-  .post(calculatePayroll);
+router.route("/calculate").post(calculatePayroll);
 
 // Summary
-router.route('/summary')
-  .get(getPayrollSummary);
+router.route("/summary").get(getPayrollSummary);
 
 // Bulk create
-router.route('/bulk')
-  .post(bulkCreatePayroll);
+router.route("/bulk").post(bulkCreatePayroll);
+
+// Backfill missing journal entries for existing finalised/paid payroll records
+// GET  ?dry_run=true  → preview only (no writes)
+// POST               → apply backfill
+router
+  .route("/backfill-journals")
+  .get(authorize("admin", "manager"), backfillPayrollJournals)
+  .post(authorize("admin", "manager"), backfillPayrollJournals);
 
 // CRUD
-router.route('/')
-  .get(getPayrollRecords)
-  .post(createPayroll);
+router.route("/").get(getPayrollRecords).post(createPayroll);
 
-router.route('/:id')
+router
+  .route("/:id")
   .get(getPayrollById)
   .put(updatePayroll)
   .delete(deletePayroll);
 
 // Process payment
-router.route('/:id/pay')
-  .post(authorize('admin', 'manager'), processPayment);
+router.route("/:id/pay").post(authorize("admin", "manager"), processPayment);
 
 // Finalise payroll record (ready for PayrollRun)
-router.route('/:id/finalise')
-  .post(authorize('admin', 'manager'), finalisePayroll);
+router
+  .route("/:id/finalise")
+  .post(authorize("admin", "manager"), finalisePayroll);
 
 // Get payslip
-router.route('/:id/payslip')
-  .get(getPayslip);
+router.route("/:id/payslip").get(getPayslip);
 
 module.exports = router;

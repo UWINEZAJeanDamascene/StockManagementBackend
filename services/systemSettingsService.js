@@ -37,8 +37,8 @@ class SystemSettingsService {
       companyId,
       userId,
       action: 'settings.update',
-      entity_type: 'system_settings',
-      entity_id: settings._id,
+      entityType: 'system_settings',
+      entityId: settings._id,
       changes: data
     })
 

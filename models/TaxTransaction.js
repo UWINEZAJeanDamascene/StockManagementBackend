@@ -81,6 +81,7 @@ const taxTransactionSchema = new mongoose.Schema({
       'invoice',              // Sales invoice
       'credit_note',          // Credit note
       'purchase',             // Purchase / GRN
+      'purchase_order',       // Purchase order
       'purchase_return',      // Purchase return
       'expense',              // Expense
       'petty_cash_expense',   // Petty cash expense

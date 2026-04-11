@@ -1,20 +1,25 @@
-const Invoice = require('../models/Invoice');
-const Product = require('../models/Product');
-const Client = require('../models/Client');
-const StockMovement = require('../models/StockMovement');
-const InventoryBatch = require('../models/InventoryBatch');
-const InvoiceReceiptMetadata = require('../models/InvoiceReceiptMetadata');
-const PDFDocument = require('pdfkit');
-const notificationService = require('../services/notificationHelper');
-const emailService = require('../services/emailService');
-const Company = require('../models/Company');
-const cacheService = require('../services/cacheService');
-const { BankAccount, BankTransaction } = require('../models/BankAccount');
-const JournalService = require('../services/journalService');
-const { runInTransaction } = require('../services/transactionService');
-const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const Invoice = require("../models/Invoice");
+const Product = require("../models/Product");
+const Client = require("../models/Client");
+const StockMovement = require("../models/StockMovement");
+const InventoryBatch = require("../models/InventoryBatch");
+const InvoiceReceiptMetadata = require("../models/InvoiceReceiptMetadata");
+const PDFDocument = require("pdfkit");
+const notificationService = require("../services/notificationHelper");
+const emailService = require("../services/emailService");
+const Company = require("../models/Company");
+const cacheService = require("../services/cacheService");
+const { BankAccount, BankTransaction } = require("../models/BankAccount");
+const JournalService = require("../services/journalService");
+const { runInTransaction } = require("../services/transactionService");
+const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 
-const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notifyInvoiceSent } = require('../services/notificationHelper');
+const {
+  notifyInvoiceCreated,
+  notifyPaymentReceived,
+  notifyPaymentOverdue,
+  notifyInvoiceSent,
+} = require("../services/notificationHelper");
 
 // @desc    Get all invoices
 // @route   GET /api/invoices
@@ -22,37 +27,37 @@ const { notifyInvoiceCreated, notifyPaymentReceived, notifyPaymentOverdue, notif
 exports.getInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      page = 1, 
-      limit = 20, 
-      status, 
-      clientId, 
-      startDate, 
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      clientId,
+      startDate,
       endDate,
       date_from,
       date_to,
       expiry_before,
-      quotation_id
+      quotation_id,
     } = req.query;
     const query = { company: companyId };
 
     // Status filter - support both old and new status names, and comma-separated list
     if (status) {
       // Check if status contains comma (multiple statuses)
-      if (status.includes(',')) {
-        const statuses = status.split(',').map(s => s.trim());
+      if (status.includes(",")) {
+        const statuses = status.split(",").map((s) => s.trim());
         // Map old statuses to new
         const statusMap = {
-          'partial': 'partially_paid',
-          'paid': 'fully_paid'
+          partial: "partially_paid",
+          paid: "fully_paid",
         };
-        const mappedStatuses = statuses.map(s => statusMap[s] || s);
+        const mappedStatuses = statuses.map((s) => statusMap[s] || s);
         query.status = { $in: mappedStatuses };
       } else {
         // Single status - Map old status to new
         const statusMap = {
-          'partial': 'partially_paid',
-          'paid': 'fully_paid'
+          partial: "partially_paid",
+          paid: "fully_paid",
         };
         query.status = statusMap[status] || status;
       }
@@ -83,12 +88,12 @@ exports.getInvoices = async (req, res, next) => {
 
     const total = await Invoice.countDocuments(query);
     const invoices = await Invoice.find(query)
-      .populate('client', 'name code contact')
-      .populate('lines.product', 'name sku unit')
-      .populate('createdBy', 'name email')
-      .populate('quotation', 'referenceNo')
-      .populate('revenueJournalEntry')
-      .populate('cogsJournalEntry')
+      .populate("client", "name code contact")
+      .populate("lines.product", "name sku unit")
+      .populate("createdBy", "name email")
+      .populate("quotation", "referenceNo")
+      .populate("revenueJournalEntry")
+      .populate("cogsJournalEntry")
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -99,7 +104,7 @@ exports.getInvoices = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       currentPage: page,
-      data: invoices
+      data: invoices,
     });
   } catch (error) {
     next(error);
@@ -112,32 +117,38 @@ exports.getInvoices = async (req, res, next) => {
 exports.getInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('client', 'name code contact type taxId')
-      .populate('lines.product', 'name sku unit')
-      .populate('createdBy', 'name email')
-      .populate('quotation', 'referenceNo')
-      .populate('payments.recordedBy', 'name email')
-      .populate('revenueJournalEntry')
-      .populate('cogsJournalEntry')
-      .populate('lines.warehouse');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("client", "name code contact type taxId")
+      .populate("lines.product", "name sku unit")
+      .populate("createdBy", "name email")
+      .populate("quotation", "referenceNo")
+      .populate("payments.recordedBy", "name email")
+      .populate("revenueJournalEntry")
+      .populate("cogsJournalEntry")
+      .populate("lines.warehouse");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Get receipt metadata if exists
-    const receiptMetadata = await InvoiceReceiptMetadata.findOne({ invoice: invoice._id, company: companyId });
+    const receiptMetadata = await InvoiceReceiptMetadata.findOne({
+      invoice: invoice._id,
+      company: companyId,
+    });
 
     res.json({
       success: true,
       data: {
         ...invoice.toObject(),
-        receiptMetadata
-      }
+        receiptMetadata,
+      },
     });
   } catch (error) {
     next(error);
@@ -150,51 +161,54 @@ exports.getInvoice = async (req, res, next) => {
 exports.createInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      lines,  // Module 6 naming
-      items,  // Legacy naming
-      client: clientId, 
+    const {
+      lines, // Module 6 naming
+      items, // Legacy naming
+      client: clientId,
       quotation,
-      currencyCode,  // Module 6 naming
-      currency,  // Legacy naming
+      currencyCode, // Module 6 naming
+      currency, // Legacy naming
       exchangeRate,
-      paymentTerms, 
-      customerTin, 
-      customerAddress, 
+      paymentTerms,
+      customerTin,
+      customerAddress,
       customerName,
       dueDate,
-      invoiceDate
+      invoiceDate,
     } = req.body;
 
     // Support both lines (Module 6) and items (legacy)
     const invoiceLines = lines || items;
-    const currencyVal = currencyCode || currency || 'USD';
+    const currencyVal = currencyCode || currency || "USD";
 
     // Get client details for TIN and address
     const client = await Client.findOne({ _id: clientId, company: companyId });
     if (!client) {
       return res.status(404).json({
         success: false,
-        message: 'Client not found'
+        message: "Client not found",
       });
     }
 
     // Validate products and check stock
     const productMap = {};
     for (const line of invoiceLines) {
-      const product = await Product.findOne({ _id: line.product, company: companyId });
+      const product = await Product.findOne({
+        _id: line.product,
+        company: companyId,
+      });
       if (!product) {
         return res.status(400).json({
           success: false,
-          message: `Product not found: ${line.product}`
+          message: `Product not found: ${line.product}`,
         });
       }
       // Validate product is active
       if (product.isActive === false) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INACTIVE_PRODUCT',
-          message: `Product ${product.name} is inactive`
+          code: "ERR_INACTIVE_PRODUCT",
+          message: `Product ${product.name} is inactive`,
         });
       }
       productMap[line.product.toString()] = product;
@@ -202,8 +216,8 @@ exports.createInvoice = async (req, res, next) => {
       if (product.currentStock < qty) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INSUFFICIENT_STOCK',
-          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`
+          code: "ERR_INSUFFICIENT_STOCK",
+          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`,
         });
       }
     }
@@ -217,8 +231,13 @@ exports.createInvoice = async (req, res, next) => {
       const discountAmount = subtotal * (discountPct / 100);
       const netAmount = subtotal - discountAmount;
       const product = productMap[line.product.toString()];
-      const taxRate = (line.taxRate != null) ? line.taxRate : (product?.taxRate != null ? product.taxRate : 0);
-      const taxCode = line.taxCode || product?.taxCode || 'A';
+      const taxRate =
+        line.taxRate != null
+          ? line.taxRate
+          : product?.taxRate != null
+            ? product.taxRate
+            : 0;
+      const taxCode = line.taxCode || product?.taxCode || "A";
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
 
@@ -227,18 +246,20 @@ exports.createInvoice = async (req, res, next) => {
         productName: line.productName || product?.name,
         productCode: line.productCode || line.itemCode || product?.sku,
         qty: qty,
-        quantity: qty,  // backwards compat
+        quantity: qty, // backwards compat
         discountPct: discountPct,
-        discount: discountPct,  // backwards compat
+        discount: discountPct, // backwards compat
         taxCode,
         taxRate,
         lineSubtotal: subtotal,
-        subtotal: subtotal,  // backwards compat
+        subtotal: subtotal, // backwards compat
         lineTax: taxAmount,
-        taxAmount: taxAmount,  // backwards compat
+        taxAmount: taxAmount, // backwards compat
         lineTotal: totalWithTax,
-        totalWithTax: totalWithTax,  // backwards compat
-        ...(line.warehouse && line.warehouse.toString() !== '' ? { warehouse: line.warehouse } : {})
+        totalWithTax: totalWithTax, // backwards compat
+        ...(line.warehouse && line.warehouse.toString() !== ""
+          ? { warehouse: line.warehouse }
+          : {}),
       };
     });
 
@@ -246,27 +267,27 @@ exports.createInvoice = async (req, res, next) => {
       ...req.body,
       company: companyId,
       lines: processedLines,
-      items: processedLines,  // backwards compat
+      items: processedLines, // backwards compat
       client: clientId,
       quotation: quotation,
       currencyCode: currencyVal,
-      currency: currencyVal,  // backwards compat
+      currency: currencyVal, // backwards compat
       exchangeRate: exchangeRate || 1,
       customerTin: customerTin || client.taxId,
       customerName: customerName || client.name,
       customerAddress: customerAddress || client.contact?.address,
-      dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),  // Default 30 days
+      dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days
       invoiceDate: invoiceDate || new Date(),
-      createdBy: req.user.id
+      createdBy: req.user.id,
     });
 
-    await invoice.populate('client lines.product createdBy');
+    await invoice.populate("client lines.product createdBy");
 
     // Atomically consume inventory layers, create stock movements, update product stock,
     // and post COGS + Sales journal entries using the central transaction helper.
     // Only deduct stock if autoConfirm is true (instant confirmation)
     const autoConfirm = req.body.autoConfirm || false;
-    
+
     if (autoConfirm) {
       await runInTransaction(async (trx) => {
         // If trx is provided we run the transactional path, otherwise run the non-transactional fallback logic.
@@ -274,41 +295,49 @@ exports.createInvoice = async (req, res, next) => {
           let totalInvoiceCOGS = 0;
 
           for (const line of invoice.lines) {
-            const product = await Product.findOne({ _id: line.product._id, company: companyId }).session(trx);
+            const product = await Product.findOne({
+              _id: line.product._id,
+              company: companyId,
+            }).session(trx);
             if (!product) continue;
 
-            const inventoryService = require('../services/inventoryService');
+            const inventoryService = require("../services/inventoryService");
             const qty = line.qty || line.quantity || 0;
-            const consumeResult = await inventoryService.consume(companyId, product._id, qty, { method: 'fifo', session: trx });
+            const consumeResult = await inventoryService.consume(
+              companyId,
+              product._id,
+              qty,
+              { method: "fifo", session: trx },
+            );
             const itemCost = consumeResult.totalCost || 0;
             totalInvoiceCOGS += itemCost;
 
             const previousStock = product.currentStock || 0;
             const newStock = previousStock - qty;
 
-            const unitCost = qty > 0 ? (itemCost / qty) : 0;
-            
+            const unitCost = qty > 0 ? itemCost / qty : 0;
+
             // Update line with COGS info - Module 6
             line.unitCost = unitCost;
             line.cogsAmount = itemCost;
-            
+
             const sm = new StockMovement({
               company: companyId,
               product: product._id,
-              type: 'out',
-              reason: 'sale',
+              type: "out",
+              reason: "sale",
               quantity: qty,
               previousStock,
               newStock,
               unitCost,
               totalCost: itemCost,
-              referenceType: 'invoice',
+              referenceType: "invoice",
               referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
               referenceDocument: invoice._id,
-              referenceModel: 'Invoice',
+              referenceModel: "Invoice",
               notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
               performedBy: req.user.id,
-              movementDate: new Date()
+              movementDate: new Date(),
             });
             await sm.save({ session: trx });
 
@@ -321,7 +350,7 @@ exports.createInvoice = async (req, res, next) => {
           await invoice.save({ session: trx });
 
           invoice.stockDeducted = true;
-          invoice.status = 'confirmed';
+          invoice.status = "confirmed";
           invoice.confirmedDate = new Date();
           invoice.confirmedBy = req.user.id;
           await invoice.save({ session: trx });
@@ -332,77 +361,165 @@ exports.createInvoice = async (req, res, next) => {
           // Create revenue journal entry - Module 6
           try {
             // Build revenue and COGS entries and post them atomically
-            const arAccount = await JournalService.getMappedAccountCode(companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable);
-            const salesAcct = await JournalService.getMappedAccountCode(companyId, 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue);
-            const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
+            const arAccount = await JournalService.getMappedAccountCode(
+              companyId,
+              "sales",
+              "accountsReceivable",
+              DEFAULT_ACCOUNTS.accountsReceivable,
+            );
+            const salesAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "sales",
+              "salesRevenue",
+              DEFAULT_ACCOUNTS.salesRevenue,
+            );
+            const vatAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "tax",
+              "vatPayable",
+              DEFAULT_ACCOUNTS.vatPayable,
+            );
 
             const revenueLines = [];
-            revenueLines.push(JournalService.createDebitLine(arAccount, invoice.roundedAmount || 0, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`));
-            const subtotal = (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
-            if (subtotal > 0) revenueLines.push(JournalService.createCreditLine(salesAcct, subtotal, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`));
-            if ((invoice.totalTax || 0) > 0) revenueLines.push(JournalService.createCreditLine(vatAcct, invoice.totalTax || 0, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`));
+            revenueLines.push(
+              JournalService.createDebitLine(
+                arAccount,
+                invoice.roundedAmount || 0,
+                `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`,
+              ),
+            );
+            const subtotal =
+              (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
+            if (subtotal > 0)
+              revenueLines.push(
+                JournalService.createCreditLine(
+                  salesAcct,
+                  subtotal,
+                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`,
+                ),
+              );
+            if ((invoice.totalTax || 0) > 0)
+              revenueLines.push(
+                JournalService.createCreditLine(
+                  vatAcct,
+                  invoice.totalTax || 0,
+                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`,
+                ),
+              );
 
             const cogsLines = [];
-            const cogsAcct = await JournalService.getMappedAccountCode(companyId, 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold);
-            const invAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory);
-            cogsLines.push(JournalService.createDebitLine(cogsAcct, totalInvoiceCOGS, `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`));
-            cogsLines.push(JournalService.createCreditLine(invAcct, totalInvoiceCOGS, `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`));
+            const cogsAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "inventory",
+              "costOfGoodsSold",
+              DEFAULT_ACCOUNTS.costOfGoodsSold,
+            );
+            const invAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "purchases",
+              "inventory",
+              DEFAULT_ACCOUNTS.inventory,
+            );
+            cogsLines.push(
+              JournalService.createDebitLine(
+                cogsAcct,
+                totalInvoiceCOGS,
+                `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+              ),
+            );
+            cogsLines.push(
+              JournalService.createCreditLine(
+                invAcct,
+                totalInvoiceCOGS,
+                `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+              ),
+            );
 
-            const createdEntries = await JournalService.createEntriesAtomic(companyId, req.user.id, [
-              {
-                date: invoice.invoiceDate,
-                description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
-                sourceType: 'invoice',
-                sourceId: invoice._id,
-                sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                lines: revenueLines,
-                isAutoGenerated: true
-              },
-              {
-                date: invoice.invoiceDate,
-                description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
-                sourceType: 'cogs',
-                sourceId: invoice._id,
-                sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                lines: cogsLines,
-                isAutoGenerated: true
-              }
-            ], { session: trx });
+            const createdEntries = await JournalService.createEntriesAtomic(
+              companyId,
+              req.user.id,
+              [
+                {
+                  date: invoice.invoiceDate,
+                  description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
+                  sourceType: "invoice",
+                  sourceId: invoice._id,
+                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+                  lines: revenueLines,
+                  isAutoGenerated: true,
+                },
+                {
+                  date: invoice.invoiceDate,
+                  description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
+                  sourceType: "cogs",
+                  sourceId: invoice._id,
+                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+                  lines: cogsLines,
+                  isAutoGenerated: true,
+                },
+              ],
+              { session: trx },
+            );
 
             if (Array.isArray(createdEntries) && createdEntries.length > 0) {
               invoice.revenueJournalEntry = createdEntries[0]._id;
-              if (createdEntries[1]) invoice.cogsJournalEntry = createdEntries[1]._id;
+              if (createdEntries[1])
+                invoice.cogsJournalEntry = createdEntries[1]._id;
             }
           } catch (je) {
-            console.error('JournalService.createInvoiceEntry failed in transaction:', je);
+            console.error(
+              "JournalService.createInvoiceEntry failed in transaction:",
+              je,
+            );
           }
-          
-          
+
           await invoice.save({ session: trx });
         } else {
           // Non-transactional fallback path
           let totalInvoiceCOGS = 0;
-          const inventoryService = require('../services/inventoryService');
+          const inventoryService = require("../services/inventoryService");
           for (const line of invoice.lines) {
-            const product = await Product.findOne({ _id: line.product._id, company: companyId });
+            const product = await Product.findOne({
+              _id: line.product._id,
+              company: companyId,
+            });
             if (!product) continue;
             let consumeResult;
             const qty = line.qty || line.quantity || 0;
             try {
               const batchesReservedAgg = await InventoryBatch.aggregate([
                 { $match: { company: companyId, product: product._id } },
-                { $group: { _id: null, reserved: { $sum: { $ifNull: ["$reservedQuantity", 0] } } } }
+                {
+                  $group: {
+                    _id: null,
+                    reserved: { $sum: { $ifNull: ["$reservedQuantity", 0] } },
+                  },
+                },
               ]);
-              const reserved = (batchesReservedAgg[0] && batchesReservedAgg[0].reserved) || 0;
+              const reserved =
+                (batchesReservedAgg[0] && batchesReservedAgg[0].reserved) || 0;
               const available = (product.currentStock || 0) - reserved;
               if (available < qty) {
-                return res.status(409).json({ success: false, code: 'ERR_INSUFFICIENT_STOCK', message: 'Insufficient available stock to confirm invoice' });
+                return res.status(409).json({
+                  success: false,
+                  code: "ERR_INSUFFICIENT_STOCK",
+                  message: "Insufficient available stock to confirm invoice",
+                });
               }
 
-              consumeResult = await inventoryService.consume(companyId, product._id, qty, { method: 'fifo' });
+              consumeResult = await inventoryService.consume(
+                companyId,
+                product._id,
+                qty,
+                { method: "fifo" },
+              );
             } catch (cErr) {
-              if (cErr && cErr.code === 'ERR_INSUFFICIENT_STOCK') {
-                return res.status(409).json({ success: false, code: 'ERR_INSUFFICIENT_STOCK', message: 'Insufficient stock to confirm invoice' });
+              if (cErr && cErr.code === "ERR_INSUFFICIENT_STOCK") {
+                return res.status(409).json({
+                  success: false,
+                  code: "ERR_INSUFFICIENT_STOCK",
+                  message: "Insufficient stock to confirm invoice",
+                });
               }
               throw cErr;
             }
@@ -413,26 +530,27 @@ exports.createInvoice = async (req, res, next) => {
             const newStock = previousStock - qty;
 
             // Update line with COGS info - Module 6
-            line.unitCost = itemCost > 0 && qty > 0 ? (itemCost / qty) : line.unitPrice;
+            line.unitCost =
+              itemCost > 0 && qty > 0 ? itemCost / qty : line.unitPrice;
             line.cogsAmount = itemCost;
 
             await StockMovement.create({
               company: companyId,
               product: product._id,
-              type: 'out',
-              reason: 'sale',
+              type: "out",
+              reason: "sale",
               quantity: qty,
               previousStock,
               newStock,
               unitCost: line.unitCost,
               totalCost: itemCost,
-              referenceType: 'invoice',
+              referenceType: "invoice",
               referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
               referenceDocument: invoice._id,
-              referenceModel: 'Invoice',
+              referenceModel: "Invoice",
               notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
               performedBy: req.user.id,
-              movementDate: new Date()
+              movementDate: new Date(),
             });
 
             product.currentStock = Math.max(0, newStock);
@@ -444,7 +562,7 @@ exports.createInvoice = async (req, res, next) => {
           await invoice.save();
 
           invoice.stockDeducted = true;
-          invoice.status = 'confirmed';
+          invoice.status = "confirmed";
           invoice.confirmedDate = new Date();
           invoice.confirmedBy = req.user.id;
           await invoice.save();
@@ -455,64 +573,137 @@ exports.createInvoice = async (req, res, next) => {
           // Create revenue journal entry - Module 6
           try {
             // Build revenue and COGS entries and post them atomically (non-transactional fallback)
-            const arAccount = await JournalService.getMappedAccountCode(companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable);
-            const salesAcct = await JournalService.getMappedAccountCode(companyId, 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue);
-            const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
+            const arAccount = await JournalService.getMappedAccountCode(
+              companyId,
+              "sales",
+              "accountsReceivable",
+              DEFAULT_ACCOUNTS.accountsReceivable,
+            );
+            const salesAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "sales",
+              "salesRevenue",
+              DEFAULT_ACCOUNTS.salesRevenue,
+            );
+            const vatAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "tax",
+              "vatPayable",
+              DEFAULT_ACCOUNTS.vatPayable,
+            );
 
             const revenueLines = [];
-            revenueLines.push(JournalService.createDebitLine(arAccount, invoice.roundedAmount || 0, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`));
-            const subtotal = (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
-            if (subtotal > 0) revenueLines.push(JournalService.createCreditLine(salesAcct, subtotal, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`));
-            if ((invoice.totalTax || 0) > 0) revenueLines.push(JournalService.createCreditLine(vatAcct, invoice.totalTax || 0, `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`));
+            revenueLines.push(
+              JournalService.createDebitLine(
+                arAccount,
+                invoice.roundedAmount || 0,
+                `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`,
+              ),
+            );
+            const subtotal =
+              (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
+            if (subtotal > 0)
+              revenueLines.push(
+                JournalService.createCreditLine(
+                  salesAcct,
+                  subtotal,
+                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`,
+                ),
+              );
+            if ((invoice.totalTax || 0) > 0)
+              revenueLines.push(
+                JournalService.createCreditLine(
+                  vatAcct,
+                  invoice.totalTax || 0,
+                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`,
+                ),
+              );
 
             const cogsLines = [];
-            const cogsAcct = await JournalService.getMappedAccountCode(companyId, 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold);
-            const invAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory);
-            cogsLines.push(JournalService.createDebitLine(cogsAcct, totalInvoiceCOGS, `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`));
-            cogsLines.push(JournalService.createCreditLine(invAcct, totalInvoiceCOGS, `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`));
+            const cogsAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "inventory",
+              "costOfGoodsSold",
+              DEFAULT_ACCOUNTS.costOfGoodsSold,
+            );
+            const invAcct = await JournalService.getMappedAccountCode(
+              companyId,
+              "purchases",
+              "inventory",
+              DEFAULT_ACCOUNTS.inventory,
+            );
+            cogsLines.push(
+              JournalService.createDebitLine(
+                cogsAcct,
+                totalInvoiceCOGS,
+                `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+              ),
+            );
+            cogsLines.push(
+              JournalService.createCreditLine(
+                invAcct,
+                totalInvoiceCOGS,
+                `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+              ),
+            );
 
-            const createdEntries = await JournalService.createEntriesAtomic(companyId, req.user.id, [
-              {
-                date: invoice.invoiceDate,
-                description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
-                sourceType: 'invoice',
-                sourceId: invoice._id,
-                sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                lines: revenueLines,
-                isAutoGenerated: true
-              },
-              {
-                date: invoice.invoiceDate,
-                description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
-                sourceType: 'cogs',
-                sourceId: invoice._id,
-                sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                lines: cogsLines,
-                isAutoGenerated: true
-              }
-            ]);
+            const createdEntries = await JournalService.createEntriesAtomic(
+              companyId,
+              req.user.id,
+              [
+                {
+                  date: invoice.invoiceDate,
+                  description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
+                  sourceType: "invoice",
+                  sourceId: invoice._id,
+                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+                  lines: revenueLines,
+                  isAutoGenerated: true,
+                },
+                {
+                  date: invoice.invoiceDate,
+                  description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
+                  sourceType: "cogs",
+                  sourceId: invoice._id,
+                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
+                  lines: cogsLines,
+                  isAutoGenerated: true,
+                },
+              ],
+            );
 
             if (Array.isArray(createdEntries) && createdEntries.length > 0) {
               invoice.revenueJournalEntry = createdEntries[0]._id;
-              if (createdEntries[1]) invoice.cogsJournalEntry = createdEntries[1]._id;
+              if (createdEntries[1])
+                invoice.cogsJournalEntry = createdEntries[1]._id;
             }
           } catch (je) {
-            console.error('JournalService.createInvoiceEntry failed (non-transactional):', je);
+            console.error(
+              "JournalService.createInvoiceEntry failed (non-transactional):",
+              je,
+            );
           }
 
           // Create COGS journal entry - Module 6
           try {
-            const cogsEntry = await JournalService.createSaleCOGSEntry(companyId, req.user.id, {
-              invoiceId: invoice._id,
-              invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
-              date: invoice.invoiceDate,
-              totalCost: totalInvoiceCOGS
-            });
+            const cogsEntry = await JournalService.createSaleCOGSEntry(
+              companyId,
+              req.user.id,
+              {
+                invoiceId: invoice._id,
+                invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+                date: invoice.invoiceDate,
+                totalCost: totalInvoiceCOGS,
+              },
+            );
             invoice.cogsJournalEntry = cogsEntry._id;
           } catch (je2) {
-            console.error('JournalService.createSaleCOGSEntry failed (non-transactional):', je2);
+            console.error(
+              "JournalService.createSaleCOGSEntry failed (non-transactional):",
+              je2,
+            );
           }
-          
+
           await invoice.save();
         }
       });
@@ -525,9 +716,13 @@ exports.createInvoice = async (req, res, next) => {
         const company = await Company.findById(companyId);
         const clientData = await Client.findById(clientId);
         await emailService.sendInvoiceEmail(invoice, company, clientData);
-        try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
+        try {
+          await notifyInvoiceSent(companyId, invoice);
+        } catch (e) {
+          console.error("notifyInvoiceSent failed", e);
+        }
       } catch (emailErr) {
-        console.error('Invoice email error:', emailErr);
+        console.error("Invoice email error:", emailErr);
       }
     }
 
@@ -539,12 +734,12 @@ exports.createInvoice = async (req, res, next) => {
     try {
       await notifyInvoiceCreated(companyId, invoice);
     } catch (e) {
-      console.error('notifyInvoiceCreated failed', e);
+      console.error("notifyInvoiceCreated failed", e);
     }
 
     res.status(201).json({
       success: true,
-      data: invoice
+      data: invoice,
     });
   } catch (error) {
     next(error);
@@ -557,51 +752,58 @@ exports.createInvoice = async (req, res, next) => {
 exports.updateInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    let invoice = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    let invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Only draft invoices can be updated - Module 6 Business Rule
-    if (invoice.status !== 'draft') {
+    if (invoice.status !== "draft") {
       return res.status(409).json({
         success: false,
-        code: 'ERR_INVOICE_CONFIRMED',
-        message: 'Cannot edit invoice. Invoice is already confirmed. Cancel and create new instead.'
+        code: "ERR_INVOICE_CONFIRMED",
+        message:
+          "Cannot edit invoice. Invoice is already confirmed. Cancel and create new instead.",
       });
     }
 
     // Support both lines (Module 6) and items (legacy)
     const lines = req.body.lines || req.body.items;
-    
+
     // If lines are updated, validate stock and products
     if (lines) {
       // Validate products are active
       for (const line of lines) {
-        const product = await Product.findOne({ _id: line.product, company: companyId });
+        const product = await Product.findOne({
+          _id: line.product,
+          company: companyId,
+        });
         if (!product) {
           return res.status(400).json({
             success: false,
-            message: `Product not found: ${line.product}`
+            message: `Product not found: ${line.product}`,
           });
         }
         if (product.isActive === false) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_INACTIVE_PRODUCT',
-            message: `Product ${product.name} is inactive`
+            code: "ERR_INACTIVE_PRODUCT",
+            message: `Product ${product.name} is inactive`,
           });
         }
         const qty = line.qty || line.quantity || 0;
         if (product.currentStock < qty) {
           return res.status(400).json({
             success: false,
-            code: 'ERR_INSUFFICIENT_STOCK',
-            message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`
+            code: "ERR_INSUFFICIENT_STOCK",
+            message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`,
           });
         }
       }
@@ -628,22 +830,55 @@ exports.updateInvoice = async (req, res, next) => {
           lineTax: taxAmount,
           taxAmount: taxAmount,
           lineTotal: totalWithTax,
-          totalWithTax: totalWithTax
+          totalWithTax: totalWithTax,
         };
       });
-      req.body.items = req.body.lines;  // backwards compat
+      req.body.items = req.body.lines; // backwards compat
+    }
+
+    // Recalculate header totals from lines
+    if (req.body.lines && req.body.lines.length) {
+      let newSubtotal = 0;
+      let newTaxAmount = 0;
+      for (const line of req.body.lines) {
+        const qty = line.qty || line.quantity || 0;
+        const unitPrice = Number(line.unitPrice) || 0;
+        const discountPct = Number(line.discountPct || line.discount || 0);
+        const taxRate = Number(line.taxRate) || 0;
+        const lineSubtotal = qty * unitPrice;
+        const lineAfterDiscount = lineSubtotal * (1 - discountPct / 100);
+        const lineTax = lineAfterDiscount * (taxRate / 100);
+        newSubtotal += lineAfterDiscount;
+        newTaxAmount += lineTax;
+      }
+      const newTotalDiscount = req.body.lines.reduce((sum, l) => {
+        const qty = l.qty || l.quantity || 0;
+        const unitPrice = Number(l.unitPrice) || 0;
+        const discountPct = Number(l.discountPct || l.discount || 0);
+        return sum + (qty * unitPrice * discountPct) / 100;
+      }, 0);
+      const newTotal = newSubtotal + newTaxAmount;
+      req.body.subtotal = Math.round(newSubtotal * 100) / 100;
+      req.body.taxAmount = Math.round(newTaxAmount * 100) / 100;
+      req.body.totalDiscount = Math.round(newTotalDiscount * 100) / 100;
+      req.body.totalAmount = Math.round(newTotal * 100) / 100;
+      req.body.total = Math.round(newTotal * 100) / 100;
+      req.body.roundedAmount = Math.round(newTotal * 100) / 100;
+      req.body.amountOutstanding = Math.max(
+        0,
+        Math.round((newTotal - (invoice.amountPaid || 0)) * 100) / 100,
+      );
     }
 
     invoice = await Invoice.findOneAndUpdate(
       { _id: req.params.id, company: companyId },
       req.body,
-      { new: true, runValidators: true }
-    )
-      .populate('client lines.product createdBy');
+      { new: true, runValidators: true },
+    ).populate("client lines.product createdBy");
 
     res.json({
       success: true,
-      data: invoice
+      data: invoice,
     });
   } catch (error) {
     next(error);
@@ -656,20 +891,23 @@ exports.updateInvoice = async (req, res, next) => {
 exports.deleteInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Only draft invoices can be deleted
-    if (invoice.status !== 'draft') {
+    if (invoice.status !== "draft") {
       return res.status(400).json({
         success: false,
-        message: 'Only draft invoices can be deleted'
+        message: "Only draft invoices can be deleted",
       });
     }
 
@@ -677,7 +915,7 @@ exports.deleteInvoice = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Invoice deleted successfully'
+      message: "Invoice deleted successfully",
     });
   } catch (error) {
     next(error);
@@ -690,50 +928,67 @@ exports.deleteInvoice = async (req, res, next) => {
 exports.confirmInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('lines.product');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    }).populate("lines.product");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Only draft invoices can be confirmed - Module 6 Business Rule
-    if (invoice.status !== 'draft') {
+    if (invoice.status !== "draft") {
       return res.status(409).json({
         success: false,
-        code: 'ERR_INVOICE_CONFIRMED',
-        message: 'Cannot confirm invoice. Invoice is not in draft status. Edit confirmed invoice is blocked - cancel and create new.'
+        code: "ERR_INVOICE_CONFIRMED",
+        message:
+          "Cannot confirm invoice. Invoice is not in draft status. Edit confirmed invoice is blocked - cancel and create new.",
+      });
+    }
+
+    // Guard: must have at least one line item
+    if (!invoice.lines || invoice.lines.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: "ERR_EMPTY_INVOICE",
+        message: "Invoice must have at least one line item before confirming",
       });
     }
 
     // Check if delivery note exists for this invoice - Module 6 Business Rule
-    const DeliveryNote = require('../models/DeliveryNote');
-    const existingDeliveryNote = await DeliveryNote.findOne({ 
-      invoice: invoice._id, 
-      status: 'confirmed' 
+    const DeliveryNote = require("../models/DeliveryNote");
+    const existingDeliveryNote = await DeliveryNote.findOne({
+      invoice: invoice._id,
+      status: "confirmed",
     });
     if (existingDeliveryNote) {
       return res.status(409).json({
         success: false,
-        code: 'ERR_DELIVERY_EXISTS',
-        message: 'Cannot cancel invoice. A confirmed delivery note already exists for this invoice.'
+        code: "ERR_DELIVERY_EXISTS",
+        message:
+          "Cannot confirm invoice. A confirmed delivery note already exists for this invoice.",
       });
     }
 
     // Step 1: Pre-validation - Check products are active and stock available
-    const inventoryService = require('../services/inventoryService');
-    const warehouseService = require('../services/warehouseService');
+    const inventoryService = require("../services/inventoryService");
+    const warehouseService = require("../services/warehouseService");
     let totalInvoiceCOGS = 0;
     let hasStockableLines = false;
-    
+
     for (const line of invoice.lines) {
-      const product = await Product.findOne({ _id: line.product._id, company: companyId });
+      const product = await Product.findOne({
+        _id: line.product._id,
+        company: companyId,
+      });
       if (!product) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Product not found: ${line.product.name}` 
+        return res.status(400).json({
+          success: false,
+          message: `Product not found: ${line.product.name}`,
         });
       }
 
@@ -741,19 +996,19 @@ exports.confirmInvoice = async (req, res, next) => {
       if (product.isActive === false) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INACTIVE_PRODUCT',
-          message: `Product ${product.name} is inactive`
+          code: "ERR_INACTIVE_PRODUCT",
+          message: `Product ${product.name} is inactive`,
         });
       }
 
       const qty = line.qty || line.quantity || 0;
-      
+
       // Validate qty > 0 and unit_price >= 0 - Module 6 Step 1
       if (qty <= 0) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INVALID_LINE_QTY',
-          message: `Line quantity must be greater than 0`
+          code: "ERR_INVALID_LINE_QTY",
+          message: `Line quantity must be greater than 0`,
         });
       }
 
@@ -761,38 +1016,49 @@ exports.confirmInvoice = async (req, res, next) => {
       if (unitPrice < 0) {
         return res.status(400).json({
           success: false,
-          code: 'ERR_INVALID_UNIT_PRICE',
-          message: `Unit price cannot be negative`
+          code: "ERR_INVALID_UNIT_PRICE",
+          message: `Unit price cannot be negative`,
         });
       }
 
       // Check if product is stockable
       const isStockable = product.isStockable !== false;
-      
+
       if (isStockable) {
         hasStockableLines = true;
-        
+
         // Step 2: Resolve COGS cost per line - FIFO or WAC (peek, NOT consume)
         let unitCost = 0;
-        
-        if (product.costMethod === 'fifo') {
+
+        if (product.costMethod === "fifo") {
           // FIFO: peek at oldest inventory layer cost (do NOT consume yet)
-          const InventoryLayer = require('../models/InventoryLayer');
+          const InventoryLayer = require("../models/InventoryLayer");
           const oldestLayer = await InventoryLayer.findOne({
             company: companyId,
             product: product._id,
-            qtyRemaining: { $gt: 0 }
+            qtyRemaining: { $gt: 0 },
           }).sort({ receiptDate: 1 });
 
           if (oldestLayer) {
-            unitCost = parseFloat(oldestLayer.unitCost && oldestLayer.unitCost.toString ? oldestLayer.unitCost.toString() : oldestLayer.unitCost) || 0;
+            unitCost =
+              parseFloat(
+                oldestLayer.unitCost && oldestLayer.unitCost.toString
+                  ? oldestLayer.unitCost.toString()
+                  : oldestLayer.unitCost,
+              ) || 0;
           } else {
             // No layers found - check if product has cost set directly
-            unitCost = parseFloat(product.cost && product.cost.toString ? product.cost.toString() : product.cost) || 0;
+            unitCost =
+              parseFloat(
+                product.cost && product.cost.toString
+                  ? product.cost.toString()
+                  : product.cost,
+              ) || 0;
           }
-        } else if (product.costMethod === 'wac') {
+        } else if (product.costMethod === "wac") {
           // WAC: use avg_cost from product
-          unitCost = parseFloat(product.avgCost) || parseFloat(product.cost) || 0;
+          unitCost =
+            parseFloat(product.avgCost) || parseFloat(product.cost) || 0;
         } else {
           // Default or non-stockable
           unitCost = parseFloat(product.cost) || 0;
@@ -802,8 +1068,8 @@ exports.confirmInvoice = async (req, res, next) => {
         if (unitCost === 0) {
           return res.status(500).json({
             success: false,
-            code: 'ERR_COST_LOOKUP_FAILED',
-            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`
+            code: "ERR_COST_LOOKUP_FAILED",
+            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`,
           });
         }
 
@@ -818,10 +1084,14 @@ exports.confirmInvoice = async (req, res, next) => {
         // Step 1: Check stock availability at warehouse
         const warehouseId = line.warehouse || product.defaultWarehouse;
         let availableQty = 0;
-        
+
         if (warehouseId) {
           // Get warehouse stock level
-          const stockLevel = await warehouseService.getStockLevel(companyId, product._id, warehouseId);
+          const stockLevel = await warehouseService.getStockLevel(
+            companyId,
+            product._id,
+            warehouseId,
+          );
           availableQty = stockLevel.qty_available || 0;
         } else {
           // Use product's current stock
@@ -830,24 +1100,29 @@ exports.confirmInvoice = async (req, res, next) => {
 
         // Module 6 Step 1: If insufficient stock, return 409 INSUFFICIENT_STOCK
         if (availableQty < qty) {
-          return res.status(409).json({ 
-            success: false, 
-            code: 'ERR_INSUFFICIENT_STOCK', 
+          return res.status(409).json({
+            success: false,
+            code: "ERR_INSUFFICIENT_STOCK",
             product_id: product._id,
-            message: `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}` 
+            message: `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}`,
           });
         }
 
         // Step 3: Reserve stock - central helper
         try {
-          const stockValidationService = require('../services/stockValidationService');
-          await stockValidationService.reserveForOrder(companyId, product._id, qty, warehouseId);
+          const stockValidationService = require("../services/stockValidationService");
+          await stockValidationService.reserveForOrder(
+            companyId,
+            product._id,
+            qty,
+            warehouseId,
+          );
         } catch (reserveErr) {
-          console.error('Stock reservation error:', reserveErr);
-          return res.status(409).json({ 
-            success: false, 
-            code: 'ERR_INSUFFICIENT_STOCK', 
-            message: `Failed to reserve stock for ${product.name}` 
+          console.error("Stock reservation error:", reserveErr);
+          return res.status(409).json({
+            success: false,
+            code: "ERR_INSUFFICIENT_STOCK",
+            message: `Failed to reserve stock for ${product.name}`,
           });
         }
       } else {
@@ -862,32 +1137,36 @@ exports.confirmInvoice = async (req, res, next) => {
 
     // Step 4: Post Entry A (Revenue Recognition) - Module 6
     // Uses TaxAutomationService for centralized tax computation
-    const TaxAutomationService = require('../services/taxAutomationService');
+    const TaxAutomationService = require("../services/taxAutomationService");
     const subtotal = parseFloat(invoice.subtotal) || 0;
     const taxAmount = parseFloat(invoice.taxAmount) || 0;
     const totalAmount = subtotal + taxAmount;
 
     // Build line items for TaxAutomationService
-    const taxLines = invoice.lines.map(line => {
+    const taxLines = invoice.lines.map((line) => {
       const lineQty = line.qty || line.quantity || 0;
       const lineUnitPrice = line.unitPrice || 0;
       const lineDiscount = line.discount || 0;
-      const lineNet = (lineQty * lineUnitPrice) - lineDiscount;
+      const lineNet = lineQty * lineUnitPrice - lineDiscount;
       return {
         netAmount: lineNet,
         taxRatePct: line.taxRate || 0,
-        productId: line.product?._id || line.product
+        productId: line.product?._id || line.product,
       };
     });
 
-    const salesTax = await TaxAutomationService.computeSalesTax(companyId, taxLines, invoice.invoiceDate);
+    const salesTax = await TaxAutomationService.computeSalesTax(
+      companyId,
+      taxLines,
+      invoice.invoiceDate,
+    );
 
     let revenueEntry = null;
     try {
       revenueEntry = await JournalService.createEntry(companyId, req.user.id, {
         date: invoice.invoiceDate,
         description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue Recognition`,
-        sourceType: 'invoice',
+        sourceType: "invoice",
         sourceId: invoice._id,
         sourceReference: invoice.referenceNo || invoice.invoiceNumber,
         lines: salesTax.journalLines,
@@ -896,12 +1175,12 @@ exports.confirmInvoice = async (req, res, next) => {
           vatAmount: salesTax.totals.tax,
           netAmount: salesTax.totals.net,
           grossAmount: salesTax.totals.gross,
-          taxBreakdown: salesTax.lines
-        }
+          taxBreakdown: salesTax.lines,
+        },
       });
       invoice.revenueJournalEntry = revenueEntry._id;
     } catch (journalError) {
-      console.error('Error creating revenue journal entry:', journalError);
+      console.error("Error creating revenue journal entry:", journalError);
       // Don't fail if journal entry fails, but log it
     }
 
@@ -909,61 +1188,70 @@ exports.confirmInvoice = async (req, res, next) => {
     // Only for stockable products
     if (hasStockableLines && totalInvoiceCOGS > 0) {
       try {
-        const cogsEntry = await JournalService.createCOGSEntry(companyId, req.user.id, {
-          invoiceId: invoice._id,
-          invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
-          clientName: invoice.client?.name || 'Unknown Client',
-          date: invoice.invoiceDate,
-          totalCost: totalInvoiceCOGS,
-          lines: invoice.lines.filter(l => l.cogsAmount > 0).map(l => ({
-            productId: l.product._id,
-            cogsAmount: l.cogsAmount
-          }))
-        });
+        const cogsEntry = await JournalService.createCOGSEntry(
+          companyId,
+          req.user.id,
+          {
+            invoiceId: invoice._id,
+            invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
+            clientName: invoice.client?.name || "Unknown Client",
+            date: invoice.invoiceDate,
+            totalCost: totalInvoiceCOGS,
+            lines: invoice.lines
+              .filter((l) => l.cogsAmount > 0)
+              .map((l) => ({
+                productId: l.product._id,
+                cogsAmount: l.cogsAmount,
+              })),
+          },
+        );
         invoice.cogsJournalEntry = cogsEntry._id;
       } catch (journalError) {
-        console.error('Error creating COGS journal entry:', journalError);
+        console.error("Error creating COGS journal entry:", journalError);
       }
     }
 
     // Step 6: Update invoice status - Module 6
     // Also deduct stock and create stock movements
-    invoice.status = 'confirmed';
+    invoice.status = "confirmed";
     invoice.confirmedDate = new Date();
     invoice.confirmedBy = req.user.id;
     invoice.stockReserved = true;
-    
+
     // Deduct stock for each line
     for (const line of invoice.lines) {
-      const product = await Product.findOne({ _id: line.product._id, company: companyId });
+      const product = await Product.findOne({
+        _id: line.product._id,
+        company: companyId,
+      });
       if (product && product.isStockable) {
         const qty = line.qty || line.quantity || 0;
         if (qty > 0) {
           const previousStock = product.currentStock || 0;
           const newStock = Math.max(0, previousStock - qty);
-          
+
           // Create stock movement
-          const StockMovement = require('../models/StockMovement');
+          const StockMovement = require("../models/StockMovement");
           const sm = new StockMovement({
             company: companyId,
             product: product._id,
-            type: 'out',
-            reason: 'sale',
+            type: "out",
+            reason: "sale",
             quantity: qty,
             previousStock,
             newStock,
             unitCost: line.unitCost || 0,
             totalCost: line.cogsAmount || 0,
-            referenceType: 'invoice',
+            referenceType: "invoice",
             referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
             referenceDocument: invoice._id,
-            referenceModel: 'Invoice',
+            referenceModel: "Invoice",
             notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
             performedBy: req.user.id,
-            movementDate: new Date()
+            movementDate: new Date(),
           });
           await sm.save();
-          
+
           // Update product stock
           product.currentStock = newStock;
           product.lastSaleDate = new Date();
@@ -971,12 +1259,15 @@ exports.confirmInvoice = async (req, res, next) => {
         }
       }
     }
-    
+
     invoice.stockDeducted = true;
     await invoice.save();
 
     // Update client outstanding balance
-    const client = await Client.findOne({ _id: invoice.client, company: companyId });
+    const client = await Client.findOne({
+      _id: invoice.client,
+      company: companyId,
+    });
     if (client) {
       client.outstandingBalance += invoice.roundedAmount || 0;
       await client.save();
@@ -984,11 +1275,11 @@ exports.confirmInvoice = async (req, res, next) => {
 
     // Update linked quotation if exists
     if (invoice.quotation) {
-      const Quotation = require('../models/Quotation');
+      const Quotation = require("../models/Quotation");
       await Quotation.findByIdAndUpdate(invoice.quotation, {
-        status: 'converted',
+        status: "converted",
         convertedToInvoice: invoice._id,
-        conversionDate: new Date()
+        conversionDate: new Date(),
       });
     }
 
@@ -996,20 +1287,20 @@ exports.confirmInvoice = async (req, res, next) => {
     try {
       await notifyPaymentReceived(companyId, invoice, 0);
     } catch (e) {
-      console.error('notifyPaymentReceived failed', e);
+      console.error("notifyPaymentReceived failed", e);
     }
 
     // Invalidate report cache
     try {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
-      console.error('Cache invalidation failed:', e);
+      console.error("Cache invalidation failed:", e);
     }
 
     res.json({
       success: true,
-      message: 'Invoice confirmed and stock reserved',
-      data: invoice
+      message: "Invoice confirmed and stock reserved",
+      data: invoice,
     });
   } catch (error) {
     next(error);
@@ -1024,30 +1315,33 @@ exports.recordPayment = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { amount, paymentMethod, reference, notes } = req.body;
 
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    }).populate("lines.product");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
-    if (invoice.status === 'cancelled') {
+    if (invoice.status === "cancelled") {
       return res.status(400).json({
         success: false,
-        code: 'ERR_INVALID_STATUS_TRANSITION',
-        message: 'Cannot record payment for cancelled invoice'
+        code: "ERR_INVALID_STATUS_TRANSITION",
+        message: "Cannot record payment for cancelled invoice",
       });
     }
 
-    const balance = invoice.balance || parseFloat(invoice.amountOutstanding) || 0;
+    const balance =
+      invoice.balance || parseFloat(invoice.amountOutstanding) || 0;
     if (amount > balance) {
       return res.status(400).json({
         success: false,
-        code: 'ERR_PAYMENT_EXCEEDS_BALANCE',
-        message: 'Payment amount exceeds invoice balance'
+        code: "ERR_PAYMENT_EXCEEDS_BALANCE",
+        message: "Payment amount exceeds invoice balance",
       });
     }
 
@@ -1057,7 +1351,7 @@ exports.recordPayment = async (req, res, next) => {
       paymentMethod,
       reference,
       notes,
-      recordedBy: req.user.id
+      recordedBy: req.user.id,
     });
 
     // Update amount paid - handle Decimal128
@@ -1065,18 +1359,22 @@ exports.recordPayment = async (req, res, next) => {
     invoice.amountPaid = currentPaid + amount;
 
     // Explicitly recalculate balance
-    const grandTotal = invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
+    const grandTotal =
+      invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
     invoice.balance = grandTotal - invoice.amountPaid;
     if (invoice.balance < 0) invoice.balance = 0;
-    
+
     // Update amountOutstanding - Module 6
     invoice.amountOutstanding = grandTotal - invoice.amountPaid;
 
     // Auto-confirm if stock not yet deducted and payment is made
-    if (!invoice.stockDeducted && invoice.status === 'draft') {
+    if (!invoice.stockDeducted && invoice.status === "draft") {
       for (const line of invoice.lines) {
-        const product = await Product.findOne({ _id: line.product._id, company: companyId });
-        
+        const product = await Product.findOne({
+          _id: line.product._id,
+          company: companyId,
+        });
+
         if (product) {
           const qty = line.qty || line.quantity || 0;
           if (product.currentStock >= qty) {
@@ -1086,19 +1384,19 @@ exports.recordPayment = async (req, res, next) => {
             await StockMovement.create({
               company: companyId,
               product: product._id,
-              type: 'out',
-              reason: 'sale',
+              type: "out",
+              reason: "sale",
               quantity: qty,
               previousStock,
               newStock,
               unitCost: line.unitPrice,
               totalCost: line.totalWithTax,
-              referenceType: 'invoice',
+              referenceType: "invoice",
               referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
               referenceDocument: invoice._id,
-              referenceModel: 'Invoice',
+              referenceModel: "Invoice",
               notes: `Sale via invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              performedBy: req.user.id
+              performedBy: req.user.id,
             });
 
             product.currentStock = newStock;
@@ -1109,13 +1407,16 @@ exports.recordPayment = async (req, res, next) => {
       }
 
       invoice.stockDeducted = true;
-      invoice.status = 'confirmed';
+      invoice.status = "confirmed";
       invoice.confirmedDate = new Date();
       invoice.confirmedBy = req.user.id;
     }
 
     // Update client stats
-    const client = await Client.findOne({ _id: invoice.client, company: companyId });
+    const client = await Client.findOne({
+      _id: invoice.client,
+      company: companyId,
+    });
     if (client) {
       client.totalPurchases += amount;
       client.outstandingBalance -= amount;
@@ -1130,72 +1431,69 @@ exports.recordPayment = async (req, res, next) => {
     try {
       // Get bank account code if bank payment
       let bankAccountCode = null;
-      if ((paymentMethod === 'bank_transfer' || paymentMethod === 'cheque' || paymentMethod === 'mobile_money') && req.body.bankAccountId) {
+      if (
+        (paymentMethod === "bank_transfer" ||
+          paymentMethod === "cheque" ||
+          paymentMethod === "mobile_money") &&
+        req.body.bankAccountId
+      ) {
         const bankAccount = await BankAccount.findOne({
           _id: req.body.bankAccountId,
           company: companyId,
-          isActive: true
+          isActive: true,
         });
-        if (bankAccount && bankAccount.accountCode) {
-          bankAccountCode = bankAccount.accountCode;
+        if (bankAccount && bankAccount.ledgerAccountId) {
+          bankAccountCode = bankAccount.ledgerAccountId;
         }
       }
-      
+
       await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
         invoiceNumber: invoice.invoiceNumber,
         date: new Date(),
         amount: amount,
         paymentMethod: paymentMethod,
-        bankAccountCode: bankAccountCode
+        bankAccountCode: bankAccountCode,
       });
     } catch (journalError) {
-      console.error('Error creating journal entry for payment:', journalError);
+      console.error("Error creating journal entry for payment:", journalError);
       // Don't fail the payment if journal entry fails
     }
 
-    // Create bank transaction if payment method is bank transfer and bank account is specified
+    // Create bank transaction for ALL bank-based payment methods (bank_transfer, cheque, mobile_money)
+    // Uses addTransaction() so cachedBalance is properly reduced and balanceAfter is correct
     let bankTransaction = null;
-    if (paymentMethod === 'bank_transfer' && req.body.bankAccountId) {
+    const bankPaymentMethods = ["bank_transfer", "cheque", "mobile_money"];
+    if (bankPaymentMethods.includes(paymentMethod) && req.body.bankAccountId) {
       try {
         const bankAccount = await BankAccount.findOne({
           _id: req.body.bankAccountId,
           company: companyId,
-          isActive: true
+          isActive: true,
         });
-        
+
         if (bankAccount) {
-          // Get current balance
-          const currentBalance = bankAccount.currentBalance;
-          
-          // Create deposit transaction
-          const transaction = new BankTransaction({
-            company: companyId,
-            account: bankAccount._id,
-            type: 'deposit',
+          bankTransaction = await bankAccount.addTransaction({
+            type: "deposit",
             amount: amount,
-            balanceAfter: currentBalance + amount,
             description: `Payment received: Invoice #${invoice.invoiceNumber}`,
             date: new Date(),
             referenceNumber: reference || invoice.invoiceNumber,
-            paymentMethod: 'bank_transfer',
-            status: 'completed',
+            paymentMethod,
+            status: "completed",
             reference: invoice._id,
-            referenceType: 'Invoice',
+            referenceType: "Invoice",
             createdBy: req.user._id,
-            notes: notes || `Payment for invoice ${invoice.invoiceNumber} from ${invoice.client?.name || 'Customer'}`
+            notes:
+              notes ||
+              `Payment for invoice ${invoice.invoiceNumber} from ${invoice.client?.name || "Customer"}`,
           });
-          
-          await transaction.save();
-          
-          // Update bank account balance
-          bankAccount.currentBalance = currentBalance + amount;
-          await bankAccount.save();
-          
-          bankTransaction = transaction;
         }
       } catch (bankError) {
-        console.error('Error creating bank transaction:', bankError);
-        // Don't fail the payment if bank transaction fails
+        console.error(
+          "Error creating bank transaction for invoice payment:",
+          bankError,
+        );
+        // Non-fatal — journal entry already posted
       }
     }
 
@@ -1203,29 +1501,34 @@ exports.recordPayment = async (req, res, next) => {
     try {
       await notifyPaymentReceived(companyId, invoice, amount);
     } catch (e) {
-      console.error('notifyPaymentReceived failed', e);
+      console.error("notifyPaymentReceived failed", e);
     }
 
     // Invalidate report cache
     try {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
-      console.error('Cache invalidation failed:', e);
+      console.error("Cache invalidation failed:", e);
     }
 
     // Record AR tracking transaction for payment
     try {
-      const ARTrackingService = require('../services/arTrackingService');
-      await ARTrackingService.recordPayment(invoice, amount, paymentMethod, req.user.id);
+      const ARTrackingService = require("../services/arTrackingService");
+      await ARTrackingService.recordPayment(
+        invoice,
+        amount,
+        paymentMethod,
+        req.user.id,
+      );
     } catch (trackingError) {
-      console.error('AR tracking error for payment:', trackingError);
+      console.error("AR tracking error for payment:", trackingError);
     }
 
     res.json({
       success: true,
-      message: 'Payment recorded successfully',
+      message: "Payment recorded successfully",
       data: invoice,
-      bankTransaction: bankTransaction
+      bankTransaction: bankTransaction,
     });
   } catch (error) {
     next(error);
@@ -1240,55 +1543,68 @@ exports.cancelInvoice = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { reason } = req.body;
 
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId }).populate('lines.product');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    }).populate("lines.product");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     // Cannot cancel fully paid invoices - Module 6 Business Rule
-    if (invoice.status === 'fully_paid') {
+    if (invoice.status === "fully_paid") {
       return res.status(400).json({
         success: false,
-        code: 'ERR_INVALID_STATUS_TRANSITION',
-        message: 'Cannot cancel fully paid invoice. Please contact administrator'
+        code: "ERR_INVALID_STATUS_TRANSITION",
+        message:
+          "Cannot cancel fully paid invoice. Please contact administrator",
       });
     }
 
     // Module 6 Business Rule: Cannot cancel if delivery note exists
-    const DeliveryNote = require('../models/DeliveryNote');
-    const existingDeliveryNote = await DeliveryNote.findOne({ 
-      invoice: invoice._id, 
-      status: 'confirmed' 
+    const DeliveryNote = require("../models/DeliveryNote");
+    const existingDeliveryNote = await DeliveryNote.findOne({
+      invoice: invoice._id,
+      status: "confirmed",
     });
     if (existingDeliveryNote) {
       return res.status(409).json({
         success: false,
-        code: 'ERR_DELIVERY_EXISTS',
-        message: 'Cannot cancel invoice. A confirmed delivery note already exists for this invoice.'
+        code: "ERR_DELIVERY_EXISTS",
+        message:
+          "Cannot cancel invoice. A confirmed delivery note already exists for this invoice.",
       });
     }
 
     // Reverse stock if reserved - Module 6: release qty_reserved
     if (invoice.stockReserved) {
-      const warehouseService = require('../services/warehouseService');
-      
+      const warehouseService = require("../services/warehouseService");
+
       for (const line of invoice.lines) {
-        const product = await Product.findOne({ _id: line.product._id, company: companyId });
+        const product = await Product.findOne({
+          _id: line.product._id,
+          company: companyId,
+        });
         if (!product) continue;
-        
+
         const qty = line.qty || line.quantity || 0;
         const warehouseId = line.warehouse || product.defaultWarehouse;
-        
+
         if (warehouseId) {
           // Release from warehouse reservation
           try {
-            await warehouseService.releaseStock(companyId, product._id, warehouseId, qty);
+            await warehouseService.releaseStock(
+              companyId,
+              product._id,
+              warehouseId,
+              qty,
+            );
           } catch (relErr) {
-            console.error('Failed to release warehouse stock:', relErr);
+            console.error("Failed to release warehouse stock:", relErr);
           }
         } else {
           // Release from product qtyReserved
@@ -1306,27 +1622,31 @@ exports.cancelInvoice = async (req, res, next) => {
         if (invoice.revenueJournalEntry) {
           await JournalService.reverse(companyId, req.user.id, {
             entryId: invoice.revenueJournalEntry,
-            narration: `Reversed: Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`
+            narration: `Reversed: Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`,
           });
         }
-        
+
         // Reverse COGS entry
         if (invoice.cogsJournalEntry) {
           await JournalService.reverse(companyId, req.user.id, {
             entryId: invoice.cogsJournalEntry,
-            narration: `Reversed: COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`
+            narration: `Reversed: COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber} cancelled`,
           });
         }
       } catch (reverseErr) {
-        console.error('Failed to reverse journal entries:', reverseErr);
+        console.error("Failed to reverse journal entries:", reverseErr);
         // Don't fail the cancellation, just log the error
       }
     }
 
     // Update client outstanding balance
-    const client = await Client.findOne({ _id: invoice.client, company: companyId });
+    const client = await Client.findOne({
+      _id: invoice.client,
+      company: companyId,
+    });
     if (client) {
-      const grandTotal = invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
+      const grandTotal =
+        invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
       const paid = parseFloat(invoice.amountPaid) || 0;
       const unpaidAmount = grandTotal - paid;
       client.outstandingBalance -= unpaidAmount;
@@ -1334,7 +1654,7 @@ exports.cancelInvoice = async (req, res, next) => {
       await client.save();
     }
 
-    invoice.status = 'cancelled';
+    invoice.status = "cancelled";
     invoice.cancelledDate = new Date();
     invoice.cancelledBy = req.user.id;
     invoice.cancellationReason = reason;
@@ -1345,13 +1665,14 @@ exports.cancelInvoice = async (req, res, next) => {
     try {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
-      console.error('Cache invalidation failed:', e);
+      console.error("Cache invalidation failed:", e);
     }
 
     res.json({
       success: true,
-      message: 'Invoice cancelled, journal entries reversed, and stock reservations released',
-      data: invoice
+      message:
+        "Invoice cancelled, journal entries reversed, and stock reservations released",
+      data: invoice,
     });
   } catch (error) {
     next(error);
@@ -1364,24 +1685,46 @@ exports.cancelInvoice = async (req, res, next) => {
 exports.saveReceiptMetadata = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { sdcId, receiptNumber, receiptSignature, internalData, mrcCode, deviceId, fiscalDate } = req.body;
+    const {
+      sdcId,
+      receiptNumber,
+      receiptSignature,
+      internalData,
+      mrcCode,
+      deviceId,
+      fiscalDate,
+    } = req.body;
 
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
-    let metadata = await InvoiceReceiptMetadata.findOne({ invoice: invoice._id, company: companyId });
+    let metadata = await InvoiceReceiptMetadata.findOne({
+      invoice: invoice._id,
+      company: companyId,
+    });
 
     if (metadata) {
       metadata = await InvoiceReceiptMetadata.findByIdAndUpdate(
         metadata._id,
-        { sdcId, receiptNumber, receiptSignature, internalData, mrcCode, deviceId, fiscalDate },
-        { new: true }
+        {
+          sdcId,
+          receiptNumber,
+          receiptSignature,
+          internalData,
+          mrcCode,
+          deviceId,
+          fiscalDate,
+        },
+        { new: true },
       );
     } else {
       metadata = await InvoiceReceiptMetadata.create({
@@ -1393,13 +1736,13 @@ exports.saveReceiptMetadata = async (req, res, next) => {
         internalData,
         mrcCode,
         deviceId,
-        fiscalDate: fiscalDate || new Date()
+        fiscalDate: fiscalDate || new Date(),
       });
     }
 
     res.json({
       success: true,
-      data: metadata
+      data: metadata,
     });
   } catch (error) {
     next(error);
@@ -1412,15 +1755,18 @@ exports.saveReceiptMetadata = async (req, res, next) => {
 exports.getClientInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoices = await Invoice.find({ client: req.params.clientId, company: companyId })
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
+    const invoices = await Invoice.find({
+      client: req.params.clientId,
+      company: companyId,
+    })
+      .populate("lines.product", "name sku")
+      .populate("createdBy", "name email")
       .sort({ invoiceDate: -1 });
 
     res.json({
       success: true,
       count: invoices.length,
-      data: invoices
+      data: invoices,
     });
   } catch (error) {
     next(error);
@@ -1433,15 +1779,18 @@ exports.getClientInvoices = async (req, res, next) => {
 exports.getProductInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoices = await Invoice.find({ 'lines.product': req.params.productId, company: companyId })
-      .populate('client', 'name code')
-      .populate('createdBy', 'name email')
+    const invoices = await Invoice.find({
+      "lines.product": req.params.productId,
+      company: companyId,
+    })
+      .populate("client", "name code")
+      .populate("createdBy", "name email")
       .sort({ invoiceDate: -1 });
 
     res.json({
       success: true,
       count: invoices.length,
-      data: invoices
+      data: invoices,
     });
   } catch (error) {
     next(error);
@@ -1454,15 +1803,18 @@ exports.getProductInvoices = async (req, res, next) => {
 exports.generateInvoicePDF = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('client')
-      .populate('lines.product')
-      .populate('createdBy');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("client")
+      .populate("lines.product")
+      .populate("createdBy");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
@@ -1470,20 +1822,35 @@ exports.generateInvoicePDF = async (req, res, next) => {
     const company = await Company.findById(companyId);
 
     // Create PDF document with more breathable layout
-    const doc = new PDFDocument({ margin: 50, size: 'A4', bufferPages: true });
+    const doc = new PDFDocument({ margin: 50, size: "A4", bufferPages: true });
 
     // Set response headers
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=invoice-${invoice.referenceNo || invoice.invoiceNumber}.pdf`);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=invoice-${invoice.referenceNo || invoice.invoiceNumber}.pdf`,
+    );
 
     // Pipe PDF to response
     doc.pipe(res);
 
-    const currency = invoice.currencyCode || invoice.currency || 'USD';
-    const currencySymbol = currency === 'USD' ? '$' : currency === 'EUR' ? '€' : currency === 'GBP' ? '£' : currency === 'LBP' ? 'LL' : '$';
+    const currency = invoice.currencyCode || invoice.currency || "USD";
+    const currencySymbol =
+      currency === "USD"
+        ? "$"
+        : currency === "EUR"
+          ? "€"
+          : currency === "GBP"
+            ? "£"
+            : currency === "LBP"
+              ? "LL"
+              : "$";
 
     // Helper to format money
-    const fmt = (v) => (currencySymbol ? `${currencySymbol} ${Number(v || 0).toFixed(2)}` : Number(v || 0).toLocaleString());
+    const fmt = (v) =>
+      currencySymbol
+        ? `${currencySymbol} ${Number(v || 0).toFixed(2)}`
+        : Number(v || 0).toLocaleString();
 
     // Page counter
     let pageNumber = 1;
@@ -1491,84 +1858,126 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Draw header - reusable for first page and subsequent pages
     const drawHeader = () => {
       // Clear top area
-      doc.fillColor('#1f2937').font('Helvetica-Bold').fontSize(20);
-      doc.text(company?.name || 'Company', 50, 48);
+      doc.fillColor("#1f2937").font("Helvetica-Bold").fontSize(20);
+      doc.text(company?.name || "Company", 50, 48);
 
-      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
+      doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
       const contactX = 50;
       let contactY = 70;
-      if (company?.address) { doc.text(company.address, contactX, contactY, { width: 260 }); contactY += 12; }
-      if (company?.phone) { doc.text(`Phone: ${company.phone}`, contactX, contactY); contactY += 12; }
-      if (company?.email) { doc.text(`Email: ${company.email}`, contactX, contactY); }
+      if (company?.address) {
+        doc.text(company.address, contactX, contactY, { width: 260 });
+        contactY += 12;
+      }
+      if (company?.phone) {
+        doc.text(`Phone: ${company.phone}`, contactX, contactY);
+        contactY += 12;
+      }
+      if (company?.email) {
+        doc.text(`Email: ${company.email}`, contactX, contactY);
+      }
 
       // Invoice title block
-      doc.fontSize(26).fillColor('#111827').font('Helvetica-Bold');
-      doc.text('INVOICE', 0, 50, { align: 'right' });
-      doc.fontSize(10).font('Helvetica').fillColor('#6b7280');
-      doc.text(`# ${invoice.invoiceNumber}`, 0, 80, { align: 'right' });
+      doc.fontSize(26).fillColor("#111827").font("Helvetica-Bold");
+      doc.text("INVOICE", 0, 50, { align: "right" });
+      doc.fontSize(10).font("Helvetica").fillColor("#6b7280");
+      doc.text(`# ${invoice.invoiceNumber}`, 0, 80, { align: "right" });
 
       // Status badge
       const statusColors = {
-        'draft': ['#6b7280', 'Draft'],
-        'confirmed': ['#f59e0b', 'Confirmed'],
-        'paid': ['#10b981', 'Paid'],
-        'partial': ['#3b82f6', 'Partial'],
-        'cancelled': ['#ef4444', 'Cancelled']
+        draft: ["#6b7280", "Draft"],
+        confirmed: ["#f59e0b", "Confirmed"],
+        paid: ["#10b981", "Paid"],
+        partial: ["#3b82f6", "Partial"],
+        cancelled: ["#ef4444", "Cancelled"],
       };
-      const statusInfo = statusColors[invoice.status] || ['#6b7280', invoice.status];
-      doc.fillColor(statusInfo[0]).font('Helvetica-Bold').fontSize(10);
-      doc.text(statusInfo[1].toUpperCase(), 0, 98, { align: 'right' });
+      const statusInfo = statusColors[invoice.status] || [
+        "#6b7280",
+        invoice.status,
+      ];
+      doc.fillColor(statusInfo[0]).font("Helvetica-Bold").fontSize(10);
+      doc.text(statusInfo[1].toUpperCase(), 0, 98, { align: "right" });
 
       // Horizontal rule
-      doc.moveTo(50, 120).lineTo(doc.page.width - 50, 120).lineWidth(0.5).strokeColor('#e5e7eb').stroke();
+      doc
+        .moveTo(50, 120)
+        .lineTo(doc.page.width - 50, 120)
+        .lineWidth(0.5)
+        .strokeColor("#e5e7eb")
+        .stroke();
     };
 
     // Footer: page numbers and timestamp
     const drawFooter = (pn) => {
       const bottom = doc.page.height - 40;
-      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
-      doc.text(`Generated: ${new Date().toLocaleString()}`, 50, bottom, { align: 'left' });
-      doc.text(`Page ${pn}`, 0, bottom, { align: 'right' });
+      doc.fontSize(8).fillColor("#9ca3af").font("Helvetica");
+      doc.text(`Generated: ${new Date().toLocaleString()}`, 50, bottom, {
+        align: "left",
+      });
+      doc.text(`Page ${pn}`, 0, bottom, { align: "right" });
     };
 
     // Draw invoice details and bill-to box
     const drawInvoiceDetails = (startY) => {
       // Dates box
-      doc.rect(50, startY, 230, 80).fillAndStroke('#ffffff', '#e5e7eb');
-      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
-      doc.text('INVOICE DETAILS', 60, startY + 8);
+      doc.rect(50, startY, 230, 80).fillAndStroke("#ffffff", "#e5e7eb");
+      doc.fillColor("#374151").fontSize(10).font("Helvetica-Bold");
+      doc.text("INVOICE DETAILS", 60, startY + 8);
 
-      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
-      doc.text('Invoice Date:', 60, startY + 26);
-      doc.fillColor('#111827').text(new Date(invoice.invoiceDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }), 140, startY + 26);
+      doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
+      doc.text("Invoice Date:", 60, startY + 26);
+      doc.fillColor("#111827").text(
+        new Date(invoice.invoiceDate).toLocaleDateString("en-GB", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+        }),
+        140,
+        startY + 26,
+      );
 
-      doc.fillColor('#6b7280').text('Due Date:', 60, startY + 42);
-      doc.fillColor('#111827').text(invoice.dueDate ? new Date(invoice.dueDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'On Delivery', 140, startY + 42);
+      doc.fillColor("#6b7280").text("Due Date:", 60, startY + 42);
+      doc.fillColor("#111827").text(
+        invoice.dueDate
+          ? new Date(invoice.dueDate).toLocaleDateString("en-GB", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "On Delivery",
+        140,
+        startY + 42,
+      );
 
-      doc.fillColor('#6b7280').text('Currency:', 60, startY + 58);
-      doc.fillColor('#111827').text(currency, 140, startY + 58);
+      doc.fillColor("#6b7280").text("Currency:", 60, startY + 58);
+      doc.fillColor("#111827").text(currency, 140, startY + 58);
 
       // Bill To
-      doc.rect(300, startY, 250, 80).fillAndStroke('#ffffff', '#e5e7eb');
-      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
-      doc.text('BILL TO', 310, startY + 8);
-      doc.font('Helvetica').fontSize(10).fillColor('#111827');
-      doc.text(invoice.customerName || invoice.client?.name || 'N/A', 310, startY + 28);
-      doc.fontSize(9).fillColor('#6b7280');
-      if (invoice.customerTin) doc.text(`TIN: ${invoice.customerTin}`, 310, startY + 44);
-      if (invoice.customerAddress) doc.text(invoice.customerAddress, 310, startY + 58, { width: 230 });
+      doc.rect(300, startY, 250, 80).fillAndStroke("#ffffff", "#e5e7eb");
+      doc.fillColor("#374151").fontSize(10).font("Helvetica-Bold");
+      doc.text("BILL TO", 310, startY + 8);
+      doc.font("Helvetica").fontSize(10).fillColor("#111827");
+      doc.text(
+        invoice.customerName || invoice.client?.name || "N/A",
+        310,
+        startY + 28,
+      );
+      doc.fontSize(9).fillColor("#6b7280");
+      if (invoice.customerTin)
+        doc.text(`TIN: ${invoice.customerTin}`, 310, startY + 44);
+      if (invoice.customerAddress)
+        doc.text(invoice.customerAddress, 310, startY + 58, { width: 230 });
     };
 
     // Table header renderer (callable on new pages)
     const tableHeader = (y) => {
-      doc.rect(50, y, doc.page.width - 100, 28).fill('#111827');
-      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
-      doc.text('#', 56, y + 8);
-      doc.text('Item / Description', 80, y + 8);
-      doc.text('Qty', 320, y + 8, { width: 30, align: 'right' });
-      doc.text('Unit Price', 370, y + 8, { width: 70, align: 'right' });
-      doc.text('Tax', 450, y + 8, { width: 50, align: 'right' });
-      doc.text('Total', 510, y + 8, { width: 70, align: 'right' });
+      doc.rect(50, y, doc.page.width - 100, 28).fill("#111827");
+      doc.fillColor("#ffffff").fontSize(10).font("Helvetica-Bold");
+      doc.text("#", 56, y + 8);
+      doc.text("Item / Description", 80, y + 8);
+      doc.text("Qty", 320, y + 8, { width: 30, align: "right" });
+      doc.text("Unit Price", 370, y + 8, { width: 70, align: "right" });
+      doc.text("Tax", 450, y + 8, { width: 50, align: "right" });
+      doc.text("Total", 510, y + 8, { width: 70, align: "right" });
     };
 
     // Start first page
@@ -1579,7 +1988,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
     let y = 230;
     tableHeader(y);
     y += 36;
-    doc.font('Helvetica').fontSize(9).fillColor('#111827');
+    doc.font("Helvetica").fontSize(9).fillColor("#111827");
 
     // Rows with automatic page breaks and repeated header
     invoice.items.forEach((item, idx) => {
@@ -1593,23 +2002,29 @@ exports.generateInvoicePDF = async (req, res, next) => {
         y = 140; // position after header
         tableHeader(y);
         y += 36;
-        doc.font('Helvetica').fontSize(9).fillColor('#111827');
+        doc.font("Helvetica").fontSize(9).fillColor("#111827");
       }
 
       // Alternate background
       if (idx % 2 === 0) {
-        doc.rect(50, y - 6, doc.page.width - 100, 18).fill('#f9fafb');
-        doc.fillColor('#111827');
+        doc.rect(50, y - 6, doc.page.width - 100, 18).fill("#f9fafb");
+        doc.fillColor("#111827");
       }
 
-      const productName = item.product?.name || item.description || 'N/A';
-      doc.fillColor('#111827');
+      const productName = item.product?.name || item.description || "N/A";
+      doc.fillColor("#111827");
       doc.text(`${idx + 1}`, 56, y);
       doc.text(productName, 80, y, { width: 230 });
-      doc.text((item.quantity || 0).toString(), 320, y, { width: 40, align: 'right' });
-      doc.text(fmt(item.unitPrice), 370, y, { width: 70, align: 'right' });
-      doc.text(`${item.taxCode || 'A'} (${item.taxRate}%)`, 450, y, { width: 50, align: 'right' });
-      doc.text(fmt(item.totalWithTax), 510, y, { width: 70, align: 'right' });
+      doc.text((item.quantity || 0).toString(), 320, y, {
+        width: 40,
+        align: "right",
+      });
+      doc.text(fmt(item.unitPrice), 370, y, { width: 70, align: "right" });
+      doc.text(`${item.taxCode || "A"} (${item.taxRate}%)`, 450, y, {
+        width: 50,
+        align: "right",
+      });
+      doc.text(fmt(item.totalWithTax), 510, y, { width: 70, align: "right" });
       y += 20;
     });
 
@@ -1623,44 +2038,72 @@ exports.generateInvoicePDF = async (req, res, next) => {
     }
 
     const totalsX = doc.page.width - 260;
-    doc.rect(totalsX - 10, y, 230, 110).fill('#ffffff').stroke('#e5e7eb');
+    doc
+      .rect(totalsX - 10, y, 230, 110)
+      .fill("#ffffff")
+      .stroke("#e5e7eb");
     let ty = y + 8;
-    doc.fillColor('#6b7280').fontSize(10).font('Helvetica');
-    doc.text('Subtotal', totalsX, ty, { width: 140, align: 'left' });
-    doc.fillColor('#111827').text(fmt(invoice.subtotal), totalsX + 100, ty, { width: 120, align: 'right' });
+    doc.fillColor("#6b7280").fontSize(10).font("Helvetica");
+    doc.text("Subtotal", totalsX, ty, { width: 140, align: "left" });
+    doc.fillColor("#111827").text(fmt(invoice.subtotal), totalsX + 100, ty, {
+      width: 120,
+      align: "right",
+    });
     ty += 18;
 
     if (invoice.totalDiscount > 0) {
-      doc.fillColor('#10b981').text('Discount', totalsX, ty);
-      doc.fillColor('#10b981').text(`- ${fmt(invoice.totalDiscount)}`, totalsX + 100, ty, { width: 120, align: 'right' });
+      doc.fillColor("#10b981").text("Discount", totalsX, ty);
+      doc
+        .fillColor("#10b981")
+        .text(`- ${fmt(invoice.totalDiscount)}`, totalsX + 100, ty, {
+          width: 120,
+          align: "right",
+        });
       ty += 18;
     }
 
-    doc.fillColor('#6b7280').text('Tax', totalsX, ty);
-    doc.fillColor('#111827').text(fmt(invoice.totalTax), totalsX + 100, ty, { width: 120, align: 'right' });
+    doc.fillColor("#6b7280").text("Tax", totalsX, ty);
+    doc.fillColor("#111827").text(fmt(invoice.totalTax), totalsX + 100, ty, {
+      width: 120,
+      align: "right",
+    });
     ty += 18;
 
     if (invoice.roundedAmount && invoice.roundedAmount !== invoice.grandTotal) {
-      doc.fillColor('#6b7280').text('Rounded', totalsX, ty);
-      doc.fillColor('#111827').text(fmt(invoice.roundedAmount), totalsX + 100, ty, { width: 120, align: 'right' });
+      doc.fillColor("#6b7280").text("Rounded", totalsX, ty);
+      doc
+        .fillColor("#111827")
+        .text(fmt(invoice.roundedAmount), totalsX + 100, ty, {
+          width: 120,
+          align: "right",
+        });
       ty += 18;
     }
 
-    doc.rect(totalsX - 10, ty - 6, 230, 40).fill('#111827');
-    doc.fillColor('#ffffff').fontSize(12).font('Helvetica-Bold');
-    doc.text('GRAND TOTAL', totalsX, ty, { width: 140, align: 'left' });
-    doc.text(fmt(invoice.grandTotal), totalsX + 100, ty + 2, { width: 120, align: 'right' });
+    doc.rect(totalsX - 10, ty - 6, 230, 40).fill("#111827");
+    doc.fillColor("#ffffff").fontSize(12).font("Helvetica-Bold");
+    doc.text("GRAND TOTAL", totalsX, ty, { width: 140, align: "left" });
+    doc.text(fmt(invoice.grandTotal), totalsX + 100, ty + 2, {
+      width: 120,
+      align: "right",
+    });
     ty += 52;
 
     if (invoice.amountPaid > 0) {
-      doc.fillColor('#10b981').fontSize(10).font('Helvetica');
-      doc.text('Paid', totalsX, ty - 8, { width: 140, align: 'left' });
-      doc.text(`- ${fmt(invoice.amountPaid)}`, totalsX + 100, ty - 8, { width: 120, align: 'right' });
+      doc.fillColor("#10b981").fontSize(10).font("Helvetica");
+      doc.text("Paid", totalsX, ty - 8, { width: 140, align: "left" });
+      doc.text(`- ${fmt(invoice.amountPaid)}`, totalsX + 100, ty - 8, {
+        width: 120,
+        align: "right",
+      });
       ty += 18;
 
-      doc.fillColor('#ef4444').fontSize(11).font('Helvetica-Bold');
-      doc.text('BALANCE DUE', totalsX, ty - 8, { width: 140, align: 'left' });
-      doc.text(fmt(invoice.balance), totalsX + 100, ty - 8, { width: 120, align: 'right' });
+      doc.fillColor("#ef4444").fontSize(11).font("Helvetica-Bold");
+      doc.text("BALANCE DUE", totalsX, ty - 8, { width: 140, align: "left" });
+      doc.text(fmt(invoice.balance), totalsX + 100, ty - 8, {
+        width: 120,
+        align: "right",
+      });
     }
 
     // Payment history
@@ -1674,12 +2117,12 @@ exports.generateInvoicePDF = async (req, res, next) => {
         y = 140;
       }
 
-      doc.rect(50, y, doc.page.width - 100, 20).fill('#f0fdf4');
-      doc.fillColor('#166534').fontSize(10).font('Helvetica-Bold');
-      doc.text('PAYMENT HISTORY', 56, y + 5);
+      doc.rect(50, y, doc.page.width - 100, 20).fill("#f0fdf4");
+      doc.fillColor("#166534").fontSize(10).font("Helvetica-Bold");
+      doc.text("PAYMENT HISTORY", 56, y + 5);
       y += 28;
 
-      doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      doc.font("Helvetica").fontSize(9).fillColor("#111827");
       invoice.payments.forEach((payment, idx) => {
         if (y > doc.page.height - 100) {
           drawFooter(pageNumber);
@@ -1689,10 +2132,18 @@ exports.generateInvoicePDF = async (req, res, next) => {
           y = 140;
         }
 
-        doc.text(`${idx + 1}. ${payment.paymentMethod?.replace(/_/g, ' ').toUpperCase() || 'Payment'}`, 56, y);
-        doc.text(fmt(payment.amount), 510, y, { width: 70, align: 'right' });
-        doc.text(`Ref: ${payment.reference || 'N/A'}`, 300, y);
-        doc.text(`Date: ${payment.paidDate ? new Date(payment.paidDate).toLocaleDateString() : 'N/A'}`, 380, y);
+        doc.text(
+          `${idx + 1}. ${payment.paymentMethod?.replace(/_/g, " ").toUpperCase() || "Payment"}`,
+          56,
+          y,
+        );
+        doc.text(fmt(payment.amount), 510, y, { width: 70, align: "right" });
+        doc.text(`Ref: ${payment.reference || "N/A"}`, 300, y);
+        doc.text(
+          `Date: ${payment.paidDate ? new Date(payment.paidDate).toLocaleDateString() : "N/A"}`,
+          380,
+          y,
+        );
         y += 16;
       });
     }
@@ -1707,11 +2158,11 @@ exports.generateInvoicePDF = async (req, res, next) => {
         drawHeader();
         y = 140;
       }
-      doc.rect(50, y, doc.page.width - 100, 30).fill('#fffbeb');
-      doc.fillColor('#92400e').fontSize(10).font('Helvetica-Bold');
-      doc.text('TERMS & CONDITIONS', 56, y + 6);
+      doc.rect(50, y, doc.page.width - 100, 30).fill("#fffbeb");
+      doc.fillColor("#92400e").fontSize(10).font("Helvetica-Bold");
+      doc.text("TERMS & CONDITIONS", 56, y + 6);
       y += 20;
-      doc.font('Helvetica').fontSize(9).fillColor('#111827');
+      doc.font("Helvetica").fontSize(9).fillColor("#111827");
       doc.text(invoice.terms, 56, y + 6, { width: doc.page.width - 120 });
       y += 40;
     }
@@ -1724,10 +2175,10 @@ exports.generateInvoicePDF = async (req, res, next) => {
         drawHeader();
         y = 140;
       }
-      doc.fillColor('#374151').fontSize(10).font('Helvetica-Bold');
-      doc.text('NOTES', 56, y);
+      doc.fillColor("#374151").fontSize(10).font("Helvetica-Bold");
+      doc.text("NOTES", 56, y);
       y += 14;
-      doc.font('Helvetica').fontSize(9).fillColor('#6b7280');
+      doc.font("Helvetica").fontSize(9).fillColor("#6b7280");
       doc.text(invoice.notes, 56, y, { width: doc.page.width - 120 });
     }
 
@@ -1745,37 +2196,43 @@ exports.generateInvoicePDF = async (req, res, next) => {
 exports.sendInvoiceEmail = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('client');
+    const invoice = await Invoice.findOne({
+      _id: req.params.id,
+      company: companyId,
+    }).populate("client");
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: 'Invoice not found'
+        message: "Invoice not found",
       });
     }
 
     const company = await Company.findById(companyId);
     const clientData = await Client.findById(invoice.client);
-    
+
     // Check if client has email
     const clientEmail = clientData?.contact?.email || invoice.customerEmail;
     if (!clientEmail) {
       return res.status(400).json({
         success: false,
-        message: 'Client does not have an email address'
+        message: "Client does not have an email address",
       });
     }
 
     // Send the invoice email
     await emailService.sendInvoiceEmail(invoice, company, clientData);
-    
+
     // Notify invoice sent
-    try { await notifyInvoiceSent(companyId, invoice); } catch (e) { console.error('notifyInvoiceSent failed', e); }
-    
+    try {
+      await notifyInvoiceSent(companyId, invoice);
+    } catch (e) {
+      console.error("notifyInvoiceSent failed", e);
+    }
+
     res.json({
       success: true,
-      message: 'Invoice sent to ' + clientEmail
+      message: "Invoice sent to " + clientEmail,
     });
   } catch (error) {
     next(error);

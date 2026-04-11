@@ -58,9 +58,28 @@ exports.createGRN = async (req, res, next) => {
           });
         }
         // Enrich line with taxRate from PO line for frontend display
+        let mfgDate = null;
+        let expDate = null;
+        
+        if (line.manufactureDate && typeof line.manufactureDate === 'string' && line.manufactureDate.trim()) {
+          const parsed = new Date(line.manufactureDate);
+          if (!isNaN(parsed.getTime())) {
+            mfgDate = parsed;
+          }
+        }
+        
+        if (line.expiryDate && typeof line.expiryDate === 'string' && line.expiryDate.trim()) {
+          const parsed = new Date(line.expiryDate);
+          if (!isNaN(parsed.getTime())) {
+            expDate = parsed;
+          }
+        }
+        
         enrichedLines.push({
           ...line,
           taxRate: line.taxRate != null ? line.taxRate : poLine.taxRate || 0,
+          manufactureDate: mfgDate,
+          expiryDate: expDate,
         });
       } else {
         enrichedLines.push(line);
@@ -203,6 +222,17 @@ exports.confirmGRN = async (req, res, next) => {
       );
       const trackingType = product.trackingType || "none";
 
+      // Helper to parse date safely
+      const parseLineDate = (dateVal) => {
+        if (!dateVal) return null;
+        if (dateVal instanceof Date) return dateVal;
+        const parsed = new Date(dateVal);
+        return isNaN(parsed.getTime()) ? null : parsed;
+      };
+
+      const lineMfgDate = parseLineDate(line.manufactureDate);
+      const lineExpDate = parseLineDate(line.expiryDate);
+
       // Handle batch tracking
       if (trackingType === "batch" && line.batchNo) {
         // Check if batch already exists
@@ -221,9 +251,19 @@ exports.confirmGRN = async (req, res, next) => {
           // Update existing batch
           stockBatch.qtyOnHand =
             (Number(stockBatch.qtyOnHand) || 0) + Number(line.qtyReceived);
+          // Update manufacture and expiry dates if provided
+          if (lineMfgDate) {
+            stockBatch.manufactureDate = lineMfgDate;
+          }
+          if (lineExpDate) {
+            stockBatch.expiryDate = lineExpDate;
+          }
           await stockBatch.save(useSession ? { session: sess } : {});
         } else {
           // Create new batch
+          const mfgDate = lineMfgDate;
+          const expDate = lineExpDate;
+          
           stockBatch = new StockBatch({
             company: companyId,
             product: line.product,
@@ -233,8 +273,8 @@ exports.confirmGRN = async (req, res, next) => {
             qtyReceived: line.qtyReceived,
             qtyOnHand: line.qtyReceived,
             unitCost: line.unitCost,
-            manufactureDate: line.manufactureDate || null,
-            expiryDate: line.expiryDate || null,
+            manufactureDate: mfgDate,
+            expiryDate: expDate,
             isQuarantined: false,
           });
           await stockBatch.save(useSession ? { session: sess } : {});
@@ -418,9 +458,40 @@ exports.confirmGRN = async (req, res, next) => {
       (s, l) => s + (l.qtyReceived || 0),
       0,
     );
-    po.status =
-      totalReceived >= totalOrdered ? "fully_received" : "partially_received";
+    const wasFullyReceived = totalReceived >= totalOrdered;
+    po.status = wasFullyReceived ? "fully_received" : "partially_received";
     await po.save(useSession ? { session: sess } : {});
+
+    // Liquidate encumbrances if PO is fully received
+    if (wasFullyReceived) {
+      try {
+        const BudgetService = require('../services/budgetService');
+        for (const line of po.lines) {
+          if (line.encumbrance_id) {
+            try {
+              await BudgetService.liquidateEncumbrance(
+                companyId,
+                'purchase_order',
+                po._id.toString(),
+                {
+                  document_type: 'goods_received_note',
+                  document_id: grn._id.toString(),
+                  document_number: grn.referenceNo,
+                  amount: parseFloat(line.lineTotal?.toString() || 0),
+                  notes: `GRN confirmed - PO fully received`
+                },
+                req.user.id
+              );
+              console.log(`[GRN] Liquidated encumbrance ${line.encumbrance_id} for PO line`);
+            } catch (liqErr) {
+              console.error('Error liquidating encumbrance:', liqErr);
+            }
+          }
+        }
+      } catch (encErr) {
+        console.error('Error processing encumbrance liquidation:', encErr);
+      }
+    }
 
     // Use TaxAutomationService for centralized tax computation
     const purchaseTax = await TaxAutomationService.computePurchaseTax(
@@ -669,6 +740,88 @@ exports.listGRNs = async (req, res, next) => {
   }
 };
 
+// Update GRN (only for draft status)
+exports.updateGRN = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { referenceNo, supplierInvoiceNo, receivedDate, lines } = req.body;
+
+    const grn = await GoodsReceivedNote.findOne({
+      _id: id,
+      company: companyId,
+    });
+
+    if (!grn) {
+      return res.status(404).json({ success: false, message: "GRN not found" });
+    }
+
+    if (grn.status === "confirmed") {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot update confirmed GRN"
+      });
+    }
+
+    if (referenceNo !== undefined) grn.referenceNo = referenceNo;
+    if (supplierInvoiceNo !== undefined) grn.supplierInvoiceNo = supplierInvoiceNo;
+    if (receivedDate !== undefined) grn.receivedDate = receivedDate;
+
+    if (lines && Array.isArray(lines)) {
+      grn.lines = [];
+      for (const line of lines) {
+        grn.lines.push({
+          product: line.product,
+          qtyReceived: line.qtyReceived,
+          unitCost: line.unitCost,
+          taxRate: line.taxRate || 0,
+          purchaseOrderLine: line.purchaseOrderLine,
+          batchNo: line.batchNo,
+          serialNumbers: line.serialNumbers,
+          manufactureDate: line.manufactureDate,
+          expiryDate: line.expiryDate,
+        });
+      }
+    }
+
+    await grn.save();
+
+    res.json({ success: true, data: grn });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// Delete GRN (only for draft status)
+exports.deleteGRN = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+
+    const grn = await GoodsReceivedNote.findOne({
+      _id: id,
+      company: companyId,
+    });
+
+    if (!grn) {
+      return res.status(404).json({ success: false, message: "GRN not found" });
+    }
+
+    if (grn.status === "confirmed") {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot delete confirmed GRN"
+      });
+    }
+
+    await GoodsReceivedNote.findByIdAndDelete(id);
+
+    res.json({ success: true, message: "GRN deleted successfully" });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // Get single GRN by ID
 exports.getGRN = async (req, res, next) => {
   try {
@@ -685,7 +838,7 @@ exports.getGRN = async (req, res, next) => {
           select: "name sku",
         },
       })
-      .populate("lines.product", "name sku")
+      .populate("lines.product", "name sku trackingType")
       .populate("supplier", "name code contact")
       .populate("warehouse", "name code")
       .populate("createdBy", "name email")

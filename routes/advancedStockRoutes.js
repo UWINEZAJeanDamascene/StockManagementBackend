@@ -80,7 +80,9 @@ const {
   createGRN,
   confirmGRN,
   listGRNs,
-  getGRN
+  getGRN,
+  updateGRN,
+  deleteGRN
 } = require('../controllers/grnController');
 
 const {
@@ -88,7 +90,8 @@ const {
   updatePurchaseReturn,
   confirmPurchaseReturn,
   listPurchaseReturns,
-  getPurchaseReturn
+  getPurchaseReturn,
+  processRefund
 } = require('../controllers/purchaseReturnController');
 
 const { protect, authorize } = require('../middleware/auth');
@@ -203,6 +206,8 @@ router.post('/purchase-orders/:id/payment', authorize('admin', 'stock_manager'),
 router.get('/grn', authorize('admin', 'stock_manager'), listGRNs);
 router.post('/grn', authorize('admin', 'stock_manager'), logAction('stock'), createGRN);
 router.get('/grn/:id', authorize('admin', 'stock_manager'), getGRN);
+router.put('/grn/:id', authorize('admin', 'stock_manager'), logAction('stock'), updateGRN);
+router.delete('/grn/:id', authorize('admin', 'stock_manager'), logAction('stock'), deleteGRN);
 router.post('/grn/:id/confirm', authorize('admin', 'stock_manager'), logAction('stock'), confirmGRN);
 
 // ========== PURCHASE RETURNS ==========
@@ -217,5 +222,8 @@ router.route('/purchase-returns/:id')
 router.route('/purchase-returns/:id/confirm')
   .post(authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn)
   .put(authorize('admin', 'stock_manager'), logAction('stock'), confirmPurchaseReturn);
+
+router.route('/purchase-returns/:id/refund')
+  .post(authorize('admin', 'stock_manager'), logAction('stock'), processRefund);
 
 module.exports = router;

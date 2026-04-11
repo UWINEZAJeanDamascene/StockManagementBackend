@@ -86,6 +86,25 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Profile avatar/image
+  avatar: {
+    type: String,
+    default: null
+  },
+  // User profile information
+  phone: {
+    type: String,
+    default: null
+  },
+  jobTitle: {
+    type: String,
+    default: null
+  },
+  bio: {
+    type: String,
+    default: null,
+    maxlength: 500
+  },
   // Two-factor authentication (TOTP)
   twoFAEnabled: { type: Boolean, default: false },
   twoFASecret: { type: String, select: false, default: null },

@@ -131,8 +131,7 @@ const reportSnapshotSchema = new mongoose.Schema({
   },
   // The actual report data (P&L, Balance Sheet, etc.)
   data: {
-    type: mongoose.Schema.Types.Mixed,
-    required: true
+    type: mongoose.Schema.Types.Mixed
   },
   // Summary metrics for quick display
   summary: {
@@ -206,7 +205,7 @@ const reportSnapshotSchema = new mongoose.Schema({
 });
 
 // Compound index for efficient querying
-reportSnapshotSchema.index({ company: 1, periodType: 1, year: 1, periodNumber: 1 }, { unique: true });
+reportSnapshotSchema.index({ company: 1, reportType: 1, periodType: 1, year: 1, periodNumber: 1 }, { unique: true });
 reportSnapshotSchema.index({ company: 1, periodType: 1, periodStart: -1 });
 reportSnapshotSchema.index({ generatedAt: 1 }, { expireAfterSeconds: 31536000 }); // Auto-expire after 1 year (configurable)
 

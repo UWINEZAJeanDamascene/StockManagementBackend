@@ -1448,11 +1448,28 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
           }
         };
 
-        snapshot = await ReportSnapshot.findOneAndUpdate(snapshotFilter, upsertDoc, {
-          upsert: true,
-          new: true,
-          setDefaultsOnInsert: true
-        });
+        try {
+          snapshot = await ReportSnapshot.findOneAndUpdate(snapshotFilter, upsertDoc, {
+            upsert: true,
+            new: true,
+            setDefaultsOnInsert: true
+          });
+        } catch (err) {
+          if (err.code === 11000) {
+            snapshot = await ReportSnapshot.findOne(snapshotFilter);
+            if (snapshot && snapshot.status === 'completed') {
+              snapshots.push(snapshot);
+              continue;
+            }
+            if (snapshot) {
+              snapshot.status = 'in-progress';
+              snapshot.data = null;
+              await snapshot.save();
+            }
+          } else {
+            throw err;
+          }
+        }
       } else {
         snapshot.status = 'in-progress';
         await snapshot.save();
@@ -1460,10 +1477,19 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
 
       // Generate the report data
       let data;
-      if (type === 'balance-sheet') {
-        data = await generator(companyId, endDate);
-      } else {
-        data = await generator(companyId, startDate, endDate);
+      try {
+        if (type === 'balance-sheet') {
+          data = await generator(companyId, endDate);
+        } else {
+          data = await generator(companyId, startDate, endDate);
+        }
+      } catch (genError) {
+        console.error(`Error generating ${type} data:`, genError.message);
+        data = { error: genError.message };
+      }
+
+      if (!data) {
+        data = {};
       }
 
       // Create summary
@@ -1546,11 +1572,12 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
       snapshots.push(snapshot);
     } catch (error) {
       console.error(`Error generating ${type} snapshot:`, error);
-      // Mark as failed
-      await ReportSnapshot.findOneAndUpdate(
-        { company: companyId, reportType: type, periodType, year, periodNumber },
-        { status: 'failed', errorMessage: error.message }
-      );
+      if (snapshot?._id) {
+        await ReportSnapshot.findOneAndUpdate(
+          { _id: snapshot._id },
+          { status: 'failed', errorMessage: error.message }
+        );
+      }
     }
   }
 

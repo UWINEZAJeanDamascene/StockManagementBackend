@@ -1,9 +1,9 @@
-const Expense = require('../models/Expense');
-const mongoose = require('mongoose');
-const { BankAccount, BankTransaction } = require('../models/BankAccount');
-const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalService = require('../services/journalService');
-const JournalEntry = require('../models/JournalEntry');
+const Expense = require("../models/Expense");
+const mongoose = require("mongoose");
+const { BankAccount, BankTransaction } = require("../models/BankAccount");
+const ChartOfAccount = require("../models/ChartOfAccount");
+const JournalService = require("../services/journalService");
+const JournalEntry = require("../models/JournalEntry");
 
 // @desc    Get all expenses for a company
 // @route   GET /api/expenses
@@ -11,86 +11,92 @@ const JournalEntry = require('../models/JournalEntry');
 exports.getExpenses = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      type, 
-      startDate, 
-      endDate, 
-      expenseAccountId, 
+    const {
+      type,
+      startDate,
+      endDate,
+      expenseAccountId,
       paymentMethod,
-      page = 1, 
-      limit = 50 
+      page = 1,
+      limit = 50,
     } = req.query;
-    
+
     const query = { company: companyId };
-    
+
     if (type) {
       query.type = type;
     }
-    
+
     // Filter by expense account
     if (expenseAccountId) {
       query.expense_account_id = expenseAccountId;
     }
-    
+
     // Filter by payment method
     if (paymentMethod) {
       query.payment_method = paymentMethod;
     }
-    
+
     if (startDate || endDate) {
       query.expenseDate = {};
       if (startDate) query.expenseDate.$gte = new Date(startDate);
       if (endDate) query.expenseDate.$lte = new Date(endDate);
     }
-    
+
     const expenses = await Expense.find(query)
-      .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email')
-      .populate('expense_account_id', 'code name')
-      .populate('bank_account_id', 'accountCode accountName')
-      .populate('petty_cash_fund_id', 'name')
+      .populate("createdBy", "name email")
+      .populate("approvedBy", "name email")
+      .populate("expense_account_id", "code name")
+      .populate("bank_account_id", "accountCode accountName")
+      .populate("petty_cash_fund_id", "name")
       .sort({ expenseDate: -1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
-    
+
     const total = await Expense.countDocuments(query);
-    
+
     // Transform to include populated Account and Method columns
-    const transformedExpenses = expenses.map(exp => ({
+    const transformedExpenses = expenses.map((exp) => ({
       _id: exp._id,
       reference: exp.reference_no || exp.expenseNumber,
       date: exp.expenseDate || exp.expense_date,
       description: exp.description,
-      account: exp.expense_account_id ? {
-        _id: exp.expense_account_id._id,
-        code: exp.expense_account_id.code,
-        name: exp.expense_account_id.name
-      } : null,
+      account: exp.expense_account_id
+        ? {
+            _id: exp.expense_account_id._id,
+            code: exp.expense_account_id.code,
+            name: exp.expense_account_id.name,
+          }
+        : null,
       method: exp.payment_method || exp.paymentMethod,
       amount: exp.amount,
       taxAmount: exp.tax_amount || exp.vatAmount,
-      totalAmount: exp.total_amount || (exp.amount + (exp.tax_amount || 0)),
+      totalAmount: exp.total_amount || exp.amount + (exp.tax_amount || 0),
       status: exp.status,
-      bankAccount: exp.bank_account_id ? {
-        _id: exp.bank_account_id._id,
-        code: exp.bank_account_id.accountCode,
-        name: exp.bank_account_id.accountName
-      } : null,
-      pettyCashFund: exp.petty_cash_fund_id ? {
-        _id: exp.petty_cash_fund_id._id,
-        name: exp.petty_cash_fund_id.name
-      } : null,
+      bankAccount: exp.bank_account_id
+        ? {
+            _id: exp.bank_account_id._id,
+            code: exp.bank_account_id.accountCode,
+            name: exp.bank_account_id.accountName,
+          }
+        : null,
+      pettyCashFund: exp.petty_cash_fund_id
+        ? {
+            _id: exp.petty_cash_fund_id._id,
+            name: exp.petty_cash_fund_id.name,
+          }
+        : null,
       receiptRef: exp.receipt_ref,
       createdAt: exp.createdAt,
-      updatedAt: exp.updatedAt
+      updatedAt: exp.updatedAt,
     }));
-    
+
     res.json({
       success: true,
       count: transformedExpenses.length,
       total,
       pages: Math.ceil(total / limit),
-      data: transformedExpenses
+      data: transformedExpenses,
     });
   } catch (error) {
     next(error);
@@ -103,54 +109,65 @@ exports.getExpenses = async (req, res, next) => {
 exports.getExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
+
     const expense = await Expense.findOne({
       _id: req.params.id,
-      company: companyId
-    }).populate('createdBy', 'name email').populate('approvedBy', 'name email');
-    
+      company: companyId,
+    })
+      .populate("createdBy", "name email")
+      .populate("approvedBy", "name email");
+
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
-    
+
     // Transform expense to include account info
     const transformedExpense = {
       _id: expense._id,
       reference: expense.reference_no || expense.expenseNumber,
       date: expense.expenseDate || expense.expense_date,
       description: expense.description,
-      account: expense.expense_account_id ? {
-        _id: expense.expense_account_id._id,
-        code: expense.expense_account_id.code,
-        name: expense.expense_account_id.name
-      } : null,
+      account: expense.expense_account_id
+        ? {
+            _id: expense.expense_account_id._id,
+            code: expense.expense_account_id.code,
+            name: expense.expense_account_id.name,
+          }
+        : null,
       method: expense.payment_method || expense.paymentMethod,
       amount: expense.amount,
       taxAmount: expense.tax_amount || expense.vatAmount,
-      totalAmount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
+      totalAmount:
+        expense.total_amount || expense.amount + (expense.tax_amount || 0),
       status: expense.status,
       type: expense.type,
       category: expense.category,
       notes: expense.notes,
-      bankAccount: expense.bank_account_id ? {
-        _id: expense.bank_account_id._id,
-        code: expense.bank_account_id.accountCode,
-        name: expense.bank_account_id.accountName
-      } : null,
-      pettyCashFund: expense.petty_cash_fund_id ? {
-        _id: expense.petty_cash_fund_id._id,
-        name: expense.petty_cash_fund_id.name
-      } : null,
+      bankAccount: expense.bank_account_id
+        ? {
+            _id: expense.bank_account_id._id,
+            code: expense.bank_account_id.accountCode,
+            name: expense.bank_account_id.accountName,
+          }
+        : null,
+      pettyCashFund: expense.petty_cash_fund_id
+        ? {
+            _id: expense.petty_cash_fund_id._id,
+            name: expense.petty_cash_fund_id.name,
+          }
+        : null,
       receiptRef: expense.receipt_ref,
       createdBy: expense.createdBy,
       approvedBy: expense.approvedBy,
       createdAt: expense.createdAt,
-      updatedAt: expense.updatedAt
+      updatedAt: expense.updatedAt,
     };
-    
+
     res.json({
       success: true,
-      data: transformedExpense
+      data: transformedExpense,
     });
   } catch (error) {
     next(error);
@@ -163,10 +180,11 @@ exports.getExpense = async (req, res, next) => {
 exports.createExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      bankAccountId, 
-      paid, 
-      paymentMethod, 
+    const {
+      bankAccountId,
+      bank_account_id,
+      paid,
+      paymentMethod,
       payment_method,
       expense_account_id,
       expenseAccountId,
@@ -182,17 +200,22 @@ exports.createExpense = async (req, res, next) => {
       notes,
       status, // Allow setting status (e.g. if admin wants to create directly as 'posted')
       isRecurring,
-      recurringFrequency
+      recurringFrequency,
+      budget_id,
+      budget_line_id,
     } = req.body;
-    
+
     // Normalize payment method - use payment_method if sent from frontend
-    const normalizedPaymentMethod = payment_method || paymentMethod || 'bank';
+    const normalizedPaymentMethod = payment_method || paymentMethod || "bank";
+    // Normalize bank account ID
+    const normalizedBankAccountId = bankAccountId || bank_account_id;
     // Use snake_case for backend fields
     const normalizedExpenseAccountId = expense_account_id || expenseAccountId;
     const normalizedExpenseDate = expense_date || expenseDate || new Date();
-    const normalizedTotalAmount = total_amount || (amount + (tax_amount || taxAmount || 0));
+    const normalizedTotalAmount =
+      total_amount || amount + (tax_amount || taxAmount || 0);
     const normalizedTaxAmount = tax_amount || taxAmount || 0;
-    
+
     const expense = new Expense({
       company: companyId,
       createdBy: req.user._id,
@@ -209,89 +232,149 @@ exports.createExpense = async (req, res, next) => {
       reference,
       notes,
       amount: amount,
-      status: status || 'pending', // Default to pending
+      status: status || "pending", // Default to pending
       isRecurring: isRecurring || false,
-      recurringFrequency: recurringFrequency || 'monthly'
+      recurringFrequency: recurringFrequency || "monthly",
+      budget_id: budget_id || null,
+      budget_line_id: budget_line_id || null,
     });
-    
+
     await expense.save();
-    
+
+    // Create encumbrance if budget is specified
+    if (expense.budget_id && expense.budget_line_id) {
+      try {
+        const BudgetService = require('../services/budgetService');
+        await BudgetService.createEncumbranceFromExpense(expense, req.user._id);
+        console.log('[createExpense] Encumbrance created for expense:', expense._id);
+      } catch (encErr) {
+        console.error('Error creating encumbrance for expense:', encErr);
+        // Don't fail the expense creation if encumbrance fails
+      }
+    }
+
     // If expense is paid immediately, create journal entry and bank transaction
     // Only do this if status is 'posted' or 'approved' (if auto-posting is allowed)
     // For now, let's only create journals if explicitly paid and status allows it
-    if (paid && paymentMethod && (expense.status === 'posted' || expense.status === 'approved')) {
-      const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+    console.log('[createExpense] paid:', paid, 'paymentMethod:', normalizedPaymentMethod, 'status:', expense.status, 'bankAccountId:', bankAccountId);
+    if (
+      paid &&
+      normalizedPaymentMethod &&
+      (expense.status === "posted" || expense.status === "approved" || expense.status === "pending")
+    ) {
+      const bankPaymentMethods = ["bank_transfer", "cheque", "mobile_money", "bank", "cash", "petty_cash", "credit_card", "payable"];
       let bankAccountCode = null;
       let bankAccount = null;
-      
+
       // Get bank account info if needed
-      if (bankAccountId && bankPaymentMethods.includes(paymentMethod)) {
+      if (normalizedBankAccountId && bankPaymentMethods.includes(normalizedPaymentMethod)) {
+        console.log('[createExpense] Fetching bank account:', normalizedBankAccountId);
         try {
           bankAccount = await BankAccount.findOne({
-            _id: bankAccountId,
+            _id: normalizedBankAccountId,
             company: companyId,
-            isActive: true
+            isActive: true,
           });
+          console.log('[createExpense] Bank account found:', bankAccount ? bankAccount._id : null, 'name:', bankAccount?.accountName);
           if (bankAccount) {
             bankAccountCode = bankAccount.accountCode;
           }
         } catch (err) {
-          console.error('Error fetching bank account:', err);
+          console.error("Error fetching bank account:", err);
         }
       }
-      
+
+      // Get expense account code for proper journal posting
+      let expenseAccountCode = null;
+      try {
+        const expenseAccount = await ChartOfAccount.findById(expense.expense_account_id);
+        if (expenseAccount) {
+          expenseAccountCode = expenseAccount.code;
+        }
+      } catch (err) {
+        console.error("Error fetching expense account:", err);
+      }
+
       // Create journal entry for expense payment
       try {
         await JournalService.createExpenseEntry(companyId, req.user.id, {
           _id: expense._id,
           description: expense.description || expense.type,
           date: expense.expenseDate || new Date(),
-          amount: expense.amount,
-          vatAmount: expense.vatAmount || 0,
+          amount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
+          vatAmount: expense.tax_amount || 0,
           category: expense.type,
-          paymentMethod: paymentMethod,
-          bankAccountCode: bankAccountCode
+          paymentMethod: normalizedPaymentMethod,
+          bankAccountCode: bankAccountCode,
+          expenseAccountCode: expenseAccountCode,
         });
       } catch (journalError) {
-        console.error('Error creating journal entry for expense:', journalError);
+        console.error(
+          "Error creating journal entry for expense:",
+          journalError,
+        );
       }
-      
-      // Create bank transaction if payment method requires it
-      if (bankAccount && bankPaymentMethods.includes(paymentMethod)) {
+
+      // Create Bank Transaction using addTransaction() so cachedBalance is correctly reduced
+      console.log('[createExpense] Checking bank transaction - bankAccount:', !!bankAccount, 'paymentMethod:', normalizedPaymentMethod, 'includes:', bankPaymentMethods.includes(normalizedPaymentMethod));
+      if (bankAccount && bankPaymentMethods.includes(normalizedPaymentMethod)) {
+        console.log('[createExpense] Creating bank transaction for expense:', expense._id);
         try {
-          const currentBalance = bankAccount.currentBalance;
-          
-          const transaction = new BankTransaction({
-            company: companyId,
-            account: bankAccount._id,
-            type: 'withdrawal',
-            amount: expense.amount,
-            balanceAfter: currentBalance - expense.amount,
+          await bankAccount.addTransaction({
+            type: "withdrawal",
+            amount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
             description: `Expense paid: ${expense.description || expense.type}`,
-            date: new Date(),
-            referenceNumber: expense.reference || '',
-            paymentMethod: paymentMethod,
-            status: 'completed',
+            date: expense.expenseDate || new Date(),
+            referenceNumber: expense.reference || "",
+            paymentMethod: expense.payment_method,
+            status: "completed",
             reference: expense._id,
-            referenceType: 'Expense',
+            referenceType: "Expense",
             createdBy: req.user._id,
-            notes: `Payment for expense: ${expense.description || expense.type}`
+            notes: `Payment for expense: ${expense.description || expense.type}`,
           });
-          
-          await transaction.save();
-          
-          // Update bank account balance
-          bankAccount.currentBalance = currentBalance - expense.amount;
-          await bankAccount.save();
         } catch (bankError) {
-          console.error('Error creating bank transaction:', bankError);
+          console.error(
+            "Error creating bank transaction for expense:",
+            bankError,
+          );
+        }
+      }
+
+      // Liquidate encumbrance immediately if expense is paid
+      if (expense.budget_id) {
+        try {
+          const Encumbrance = require('../models/Encumbrance');
+          const encumbrance = await Encumbrance.findOne({
+            source_type: 'expense_request',
+            source_id: expense._id.toString()
+          });
+
+          if (encumbrance) {
+            const totalAmount = expense.total_amount || (expense.amount + (expense.tax_amount || 0));
+            encumbrance.liquidated_amount = totalAmount;
+            encumbrance.remaining_amount = 0;
+            encumbrance.status = 'fully_liquidated';
+            encumbrance.liquidated_at = new Date();
+            encumbrance.liquidations.push({
+              document_type: 'payment',
+              document_id: expense._id.toString(),
+              document_number: expense.reference_no || `EXP-${expense._id.toString().slice(-5)}`,
+              amount: totalAmount,
+              date: new Date(),
+              notes: 'Expense created and paid immediately'
+            });
+            await encumbrance.save();
+          }
+        } catch (encErr) {
+          console.error('Error liquidating encumbrance on create:', encErr);
         }
       }
     }
-    
+
     res.status(201).json({
       success: true,
-      data: expense
+      data: expense,
     });
   } catch (error) {
     next(error);
@@ -304,24 +387,26 @@ exports.createExpense = async (req, res, next) => {
 exports.updateExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
+
     let expense = await Expense.findOne({
       _id: req.params.id,
-      company: companyId
+      company: companyId,
     });
-    
+
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
-    
+
     // Don't allow changing company or createdBy
     const { company, createdBy, bankAccountId, ...updateData } = req.body;
-    
+
     // Check if expense is being marked as paid with bank transfer
     const isBeingPaid = updateData.paid === true && !expense.paid;
-    const paymentMethod = updateData.paymentMethod;
-    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-    
+    const paymentMethod = updateData.paymentMethod || updateData.payment_method;
+    const bankPaymentMethods = ["bank_transfer", "cheque", "mobile_money", "bank", "cash", "petty_cash", "credit_card", "payable"];
+
     // Get bank account info if needed for journal entry and bank transaction
     let bankAccount = null;
     let bankAccountCode = null;
@@ -330,18 +415,29 @@ exports.updateExpense = async (req, res, next) => {
         bankAccount = await BankAccount.findOne({
           _id: bankAccountId,
           company: companyId,
-          isActive: true
+          isActive: true,
         });
         if (bankAccount) {
           bankAccountCode = bankAccount.accountCode;
         }
       } catch (err) {
-        console.error('Error fetching bank account:', err);
+        console.error("Error fetching bank account:", err);
       }
     }
-    
+
     Object.assign(expense, updateData);
     await expense.save();
+
+    // Get expense account code for proper journal posting
+    let expenseAccountCode = null;
+    try {
+      const expenseAccount = await ChartOfAccount.findById(expense.expense_account_id);
+      if (expenseAccount) {
+        expenseAccountCode = expenseAccount.code;
+      }
+    } catch (err) {
+      console.error("Error fetching expense account:", err);
+    }
 
     // Create journal entry for expense payment
     let journalEntry = null;
@@ -351,58 +447,86 @@ exports.updateExpense = async (req, res, next) => {
           _id: expense._id,
           description: expense.description || expense.type,
           date: expense.expenseDate || new Date(),
-          amount: expense.amount,
-          vatAmount: expense.vatAmount || 0,
+          amount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
+          vatAmount: expense.tax_amount || 0,
           category: expense.type,
-          paymentMethod: expense.paymentMethod,
-          bankAccountCode: bankAccountCode
+          paymentMethod: paymentMethod,
+          bankAccountCode: bankAccountCode,
+          expenseAccountCode: expenseAccountCode,
         });
       } catch (journalError) {
-        console.error('Error creating journal entry for expense:', journalError);
+        console.error(
+          "Error creating journal entry for expense:",
+          journalError,
+        );
         // Don't fail the expense update if journal entry fails
       }
     }
-    
+
     // Create bank transaction if expense is being marked as paid with bank transfer, cheque, or mobile money
     let bankTransaction = null;
-    if (isBeingPaid && bankPaymentMethods.includes(paymentMethod) && bankAccount) {
+    if (
+      isBeingPaid &&
+      bankPaymentMethods.includes(paymentMethod) &&
+      bankAccount
+    ) {
       try {
-        const currentBalance = bankAccount.currentBalance;
-        
-        // Create withdrawal transaction (debit) for expense payment
-        const transaction = new BankTransaction({
-          company: companyId,
-          account: bankAccount._id,
-          type: 'withdrawal',
-          amount: expense.amount,
-          balanceAfter: currentBalance - expense.amount,
+        const totalAmount = expense.total_amount || (expense.amount + (expense.tax_amount || 0));
+        // Use addTransaction which properly handles cachedBalance
+        const transaction = await bankAccount.addTransaction({
+          type: "withdrawal",
+          amount: totalAmount,
           description: `Expense paid: ${expense.description || expense.type}`,
           date: new Date(),
-          referenceNumber: expense.reference || '',
+          referenceNumber: expense.reference || "",
           paymentMethod: paymentMethod,
-          status: 'completed',
+          status: "completed",
           reference: expense._id,
-          referenceType: 'Expense',
+          referenceType: "Expense",
           createdBy: req.user._id,
-          notes: `Payment for expense: ${expense.description || expense.type}`
+          notes: `Payment for expense: ${expense.description || expense.type}`,
         });
-        
-        await transaction.save();
-        
-        // Update bank account balance
-        bankAccount.currentBalance = currentBalance - expense.amount;
-        await bankAccount.save();
-        
+
         bankTransaction = transaction;
       } catch (bankError) {
-        console.error('Error creating bank transaction:', bankError);
+        console.error("Error creating bank transaction:", bankError);
       }
     }
-    
+
+    // Liquidate encumbrance if expense is being paid and has budget
+    if (isBeingPaid && expense.budget_id) {
+      try {
+        const Encumbrance = require('../models/Encumbrance');
+        const encumbrance = await Encumbrance.findOne({
+          source_type: 'expense_request',
+          source_id: expense._id.toString()
+        });
+
+        if (encumbrance) {
+          const totalAmount = expense.total_amount || (expense.amount + (expense.tax_amount || 0));
+          encumbrance.liquidated_amount = totalAmount;
+          encumbrance.remaining_amount = 0;
+          encumbrance.status = 'fully_liquidated';
+          encumbrance.liquidated_at = new Date();
+          encumbrance.liquidations.push({
+            document_type: 'payment',
+            document_id: expense._id.toString(),
+            document_number: expense.reference_no || `EXP-${expense._id.toString().slice(-5)}`,
+            amount: totalAmount,
+            date: new Date(),
+            notes: 'Expense marked as paid'
+          });
+          await encumbrance.save();
+        }
+      } catch (encErr) {
+        console.error('Error liquidating encumbrance on update:', encErr);
+      }
+    }
+
     res.json({
       success: true,
       data: expense,
-      bankTransaction: bankTransaction
+      bankTransaction: bankTransaction,
     });
   } catch (error) {
     next(error);
@@ -415,23 +539,25 @@ exports.updateExpense = async (req, res, next) => {
 exports.deleteExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
+
     const expense = await Expense.findOne({
       _id: req.params.id,
-      company: companyId
+      company: companyId,
     });
-    
+
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
-    
+
     // Soft delete - mark as cancelled
-    expense.status = 'cancelled';
+    expense.status = "cancelled";
     await expense.save();
-    
+
     res.json({
       success: true,
-      message: 'Expense cancelled'
+      message: "Expense cancelled",
     });
   } catch (error) {
     next(error);
@@ -445,27 +571,33 @@ exports.reverseExpense = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { reason } = req.body;
-    
+
     const expense = await Expense.findOne({
       _id: req.params.id,
-      company: companyId
-    }).populate('expense_account_id', 'code name');
-    
+      company: companyId,
+    }).populate("expense_account_id", "code name");
+
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
-    
-    if (expense.status === 'reversed') {
-      return res.status(400).json({ success: false, message: 'Expense already reversed' });
+
+    if (expense.status === "reversed") {
+      return res
+        .status(400)
+        .json({ success: false, message: "Expense already reversed" });
     }
-    
+
     // Create reversal journal entry
     let reversalJournalEntry = null;
     if (expense.journal_entry_id) {
       try {
         // Get the original journal entry
-        const originalEntry = await JournalEntry.findById(expense.journal_entry_id);
-        
+        const originalEntry = await JournalEntry.findById(
+          expense.journal_entry_id,
+        );
+
         if (originalEntry) {
           // Create reversal entry with opposite debits/credits
           reversalJournalEntry = new JournalEntry({
@@ -473,38 +605,40 @@ exports.reverseExpense = async (req, res, next) => {
             date: new Date(),
             description: `REVERSAL: ${expense.description}`,
             reference: expense.reference_no,
-            referenceType: 'Expense',
+            referenceType: "Expense",
             referenceId: expense._id,
-            entries: originalEntry.entries.map(entry => ({
+            entries: originalEntry.entries.map((entry) => ({
               account: entry.account,
               accountCode: entry.accountCode,
               accountName: entry.accountName,
-              debit: entry.credit,  // Swap debit/credit
+              debit: entry.credit, // Swap debit/credit
               credit: entry.debit,
-              description: entry.description
+              description: entry.description,
             })),
-            status: 'posted',
+            status: "posted",
             postedBy: req.user._id,
-            notes: reason || `Reversal of expense ${expense.reference_no}`
+            notes: reason || `Reversal of expense ${expense.reference_no}`,
           });
-          
+
           await reversalJournalEntry.save();
         }
       } catch (journalError) {
-        console.error('Error creating reversal journal entry:', journalError);
+        console.error("Error creating reversal journal entry:", journalError);
       }
     }
-    
+
     // Update expense status to reversed
-    expense.status = 'reversed';
-    expense.reversal_journal_entry_id = reversalJournalEntry ? reversalJournalEntry._id : null;
+    expense.status = "reversed";
+    expense.reversal_journal_entry_id = reversalJournalEntry
+      ? reversalJournalEntry._id
+      : null;
     await expense.save();
-    
+
     res.json({
       success: true,
-      message: 'Expense reversed successfully',
+      message: "Expense reversed successfully",
       data: expense,
-      reversalJournalEntry: reversalJournalEntry
+      reversalJournalEntry: reversalJournalEntry,
     });
   } catch (error) {
     next(error);
@@ -518,29 +652,29 @@ exports.getExpenseSummary = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { startDate, endDate } = req.query;
-    
+
     const match = {
       company: companyId,
-      status: { $ne: 'cancelled' }
+      status: { $ne: "cancelled" },
     };
-    
+
     if (startDate || endDate) {
       match.expenseDate = {};
       if (startDate) match.expenseDate.$gte = new Date(startDate);
       if (endDate) match.expenseDate.$lte = new Date(endDate);
     }
-    
+
     const summary = await Expense.aggregate([
       { $match: match },
       {
         $group: {
-          _id: '$type',
-          total: { $sum: '$amount' },
-          count: { $sum: 1 }
-        }
-      }
+          _id: "$type",
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
     ]);
-    
+
     // Transform to object
     const result = {
       salariesWages: 0,
@@ -552,52 +686,52 @@ exports.getExpenseSummary = async (req, res, next) => {
       interestIncome: 0,
       otherIncome: 0,
       totalOperating: 0,
-      totalOtherIncome: 0
+      totalOtherIncome: 0,
     };
-    
-    summary.forEach(item => {
+
+    summary.forEach((item) => {
       const type = item._id;
       const total = item.total;
-      
+
       switch (type) {
-        case 'salaries_wages':
+        case "salaries_wages":
           result.salariesWages = total;
           result.totalOperating += total;
           break;
-        case 'rent':
+        case "rent":
           result.rent = total;
           result.totalOperating += total;
           break;
-        case 'utilities':
+        case "utilities":
           result.utilities = total;
           result.totalOperating += total;
           break;
-        case 'transport_delivery':
+        case "transport_delivery":
           result.transportDelivery = total;
           result.totalOperating += total;
           break;
-        case 'marketing_advertising':
+        case "marketing_advertising":
           result.marketingAdvertising = total;
           result.totalOperating += total;
           break;
-        case 'other_expense':
+        case "other_expense":
           result.otherExpenses = total;
           result.totalOperating += total;
           break;
-        case 'interest_income':
+        case "interest_income":
           result.interestIncome = total;
           result.totalOtherIncome += total;
           break;
-        case 'other_income':
+        case "other_income":
           result.otherIncome = total;
           result.totalOtherIncome += total;
           break;
       }
     });
-    
+
     res.json({
       success: true,
-      data: result
+      data: result,
     });
   } catch (error) {
     next(error);
@@ -610,30 +744,43 @@ exports.getExpenseSummary = async (req, res, next) => {
 exports.getExpenseAccounts = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
+
     // Debug: Log company ID
-    console.log(`[ExpenseController] Fetching accounts for company: ${companyId}`);
-    
+    console.log(
+      `[ExpenseController] Fetching accounts for company: ${companyId}`,
+    );
+
     // Fetch ALL active accounts for debugging
     const allAccounts = await ChartOfAccount.find({
       company: companyId,
-      isActive: true
-    }).select('_id code name type').sort({ code: 1 });
-    
-    console.log(`[ExpenseController] Total active accounts: ${allAccounts.length}`);
-    
+      isActive: true,
+    })
+      .select("_id code name type")
+      .sort({ code: 1 });
+
+    console.log(
+      `[ExpenseController] Total active accounts: ${allAccounts.length}`,
+    );
+
     // Filter for expense accounts
-    const accounts = allAccounts.filter(acc => acc.type === 'expense' || acc.type === 'cogs');
+    const accounts = allAccounts.filter(
+      (acc) => acc.type === "expense" || acc.type === "cogs",
+    );
 
     // Debug: Log count
-    console.log(`[ExpenseController] Found ${accounts.length} expense accounts`);
+    console.log(
+      `[ExpenseController] Found ${accounts.length} expense accounts`,
+    );
 
     res.json({
       success: true,
-      data: accounts
+      data: accounts,
     });
   } catch (error) {
-    console.error('[ExpenseController] Error fetching expense accounts:', error);
+    console.error(
+      "[ExpenseController] Error fetching expense accounts:",
+      error,
+    );
     next(error);
   }
 };
@@ -645,27 +792,29 @@ exports.bulkCreateExpenses = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { expenses } = req.body;
-    
+
     if (!expenses || !Array.isArray(expenses) || expenses.length === 0) {
-      return res.status(400).json({ success: false, message: 'No expenses provided' });
+      return res
+        .status(400)
+        .json({ success: false, message: "No expenses provided" });
     }
-    
+
     const createdExpenses = await Promise.all(
       expenses.map(async (expenseData) => {
         const expense = new Expense({
           ...expenseData,
           company: companyId,
-          createdBy: req.user._id
+          createdBy: req.user._id,
         });
         await expense.save();
         return expense;
-      })
+      }),
     );
-    
+
     res.status(201).json({
       success: true,
       count: createdExpenses.length,
-      data: createdExpenses
+      data: createdExpenses,
     });
   } catch (error) {
     next(error);
@@ -680,31 +829,41 @@ exports.approveExpense = async (req, res, next) => {
     const companyId = req.user.company._id;
     const expenseId = req.params.id;
 
-    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+    const expense = await Expense.findOne({
+      _id: expenseId,
+      company: companyId,
+    });
 
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
 
-    if (expense.status !== 'pending') {
-      return res.status(400).json({ success: false, message: `Expense is already ${expense.status}` });
+    if (expense.status !== "pending") {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Expense is already ${expense.status}`,
+        });
     }
 
-    expense.status = 'approved';
+    expense.status = "approved";
     expense.approvedBy = req.user._id;
     expense.approvedAt = new Date();
 
     // If the expense was paid on creation, we might want to post it now (create journal entries)
     // Or we might want to wait for a separate "Post" action. For now, let's just mark it approved.
     // If you want to auto-post upon approval:
-    // await postExpenseInternal(expense, req.user.id); 
+    // await postExpenseInternal(expense, req.user.id);
 
     await expense.save();
 
     res.json({
       success: true,
       data: expense,
-      message: 'Expense approved successfully'
+      message: "Expense approved successfully",
     });
   } catch (error) {
     next(error);
@@ -720,27 +879,37 @@ exports.rejectExpense = async (req, res, next) => {
     const expenseId = req.params.id;
     const { reason } = req.body;
 
-    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+    const expense = await Expense.findOne({
+      _id: expenseId,
+      company: companyId,
+    });
 
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
 
-    if (expense.status !== 'pending') {
-      return res.status(400).json({ success: false, message: `Expense is already ${expense.status}` });
+    if (expense.status !== "pending") {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Expense is already ${expense.status}`,
+        });
     }
 
-    expense.status = 'rejected';
+    expense.status = "rejected";
     expense.rejectedBy = req.user._id;
     expense.rejectedAt = new Date();
-    expense.rejectionReason = reason || 'No reason provided';
+    expense.rejectionReason = reason || "No reason provided";
 
     await expense.save();
 
     res.json({
       success: true,
       data: expense,
-      message: 'Expense rejected successfully'
+      message: "Expense rejected successfully",
     });
   } catch (error) {
     next(error);
@@ -756,18 +925,28 @@ exports.postExpense = async (req, res, next) => {
     const expenseId = req.params.id;
     const { bankAccountId } = req.body;
 
-    const expense = await Expense.findOne({ _id: expenseId, company: companyId });
+    const expense = await Expense.findOne({
+      _id: expenseId,
+      company: companyId,
+    });
 
     if (!expense) {
-      return res.status(404).json({ success: false, message: 'Expense not found' });
+      return res
+        .status(404)
+        .json({ success: false, message: "Expense not found" });
     }
 
-    if (expense.status !== 'approved' && expense.status !== 'pending') {
-      return res.status(400).json({ success: false, message: `Cannot post expense with status: ${expense.status}` });
+    if (expense.status !== "approved" && expense.status !== "pending") {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: `Cannot post expense with status: ${expense.status}`,
+        });
     }
 
     // Create Journal Entry
-    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+    const bankPaymentMethods = ["bank_transfer", "cheque", "mobile_money", "bank", "cash", "petty_cash", "credit_card", "payable"];
     let bankAccountCode = null;
     let bankAccount = null;
 
@@ -776,14 +955,25 @@ exports.postExpense = async (req, res, next) => {
         bankAccount = await BankAccount.findOne({
           _id: bankAccountId,
           company: companyId,
-          isActive: true
+          isActive: true,
         });
         if (bankAccount) {
           bankAccountCode = bankAccount.accountCode;
         }
       } catch (err) {
-        console.error('Error fetching bank account for posting:', err);
+        console.error("Error fetching bank account for posting:", err);
       }
+    }
+
+    // Get expense account code for proper journal posting
+    let expenseAccountCode = null;
+    try {
+      const expenseAccount = await ChartOfAccount.findById(expense.expense_account_id);
+      if (expenseAccount) {
+        expenseAccountCode = expenseAccount.code;
+      }
+    } catch (err) {
+      console.error("Error fetching expense account:", err);
     }
 
     try {
@@ -791,59 +981,83 @@ exports.postExpense = async (req, res, next) => {
         _id: expense._id,
         description: expense.description || expense.type,
         date: expense.expenseDate || new Date(),
-        amount: expense.amount,
+        amount: expense.total_amount || (expense.amount + (expense.tax_amount || 0)),
         vatAmount: expense.tax_amount || 0,
         category: expense.type,
         paymentMethod: expense.payment_method,
-        bankAccountCode: bankAccountCode
+        bankAccountCode: bankAccountCode,
+        expenseAccountCode: expenseAccountCode,
       });
     } catch (journalError) {
-      console.error('Error creating journal entry for expense:', journalError);
-      return res.status(500).json({ success: false, message: 'Failed to create journal entry' });
+      console.error("Error creating journal entry for expense:", journalError);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to create journal entry" });
     }
 
     // Create Bank Transaction
     if (bankAccount && bankPaymentMethods.includes(expense.payment_method)) {
       try {
-        const currentBalance = bankAccount.currentBalance;
-        
-        const transaction = new BankTransaction({
-          company: companyId,
-          account: bankAccount._id,
-          type: 'withdrawal',
-          amount: expense.amount,
-          balanceAfter: currentBalance - expense.amount,
+        const totalAmount = expense.total_amount || (expense.amount + (expense.tax_amount || 0));
+        // Use addTransaction which properly handles cachedBalance
+        await bankAccount.addTransaction({
+          type: "withdrawal",
+          amount: totalAmount,
           description: `Expense paid: ${expense.description || expense.type}`,
           date: new Date(),
-          referenceNumber: expense.reference || '',
+          referenceNumber: expense.reference || "",
           paymentMethod: expense.payment_method,
-          status: 'completed',
+          status: "completed",
           reference: expense._id,
-          referenceType: 'Expense',
+          referenceType: "Expense",
           createdBy: req.user._id,
-          notes: `Payment for expense: ${expense.description || expense.type}`
+          notes: `Payment for expense: ${expense.description || expense.type}`,
         });
-        
-        await transaction.save();
-        
-        // Update bank account balance
-        bankAccount.currentBalance = currentBalance - expense.amount;
-        await bankAccount.save();
       } catch (bankError) {
-        console.error('Error creating bank transaction for expense:', bankError);
+        console.error(
+          "Error creating bank transaction for expense:",
+          bankError,
+        );
         // We might want to rollback journal entry here, but for now just log
       }
     }
 
-    expense.status = 'posted';
+    expense.status = "posted";
     await expense.save();
+
+    // Liquidate encumbrance using BudgetService
+    if (expense.budget_id && expense.encumbrance_id) {
+      try {
+        const BudgetService = require('../services/budgetService');
+        await BudgetService.liquidateEncumbranceFromExpense(expense, req.user._id, {
+          document_type: 'payment',
+          document_id: expense._id.toString(),
+          document_number: expense.reference_no,
+          notes: 'Expense posted and paid'
+        });
+      } catch (encErr) {
+        console.error('Error liquidating encumbrance:', encErr);
+      }
+    }
+
+    // Check if budget is fully spent and auto-lock if necessary
+    if (expense.budget_id) {
+      try {
+        const BudgetService = require('../services/budgetService');
+        const lockResult = await BudgetService.checkAndAutoLockIfSpent(companyId, expense.budget_id);
+        if (lockResult && lockResult.locked) {
+          console.log('[postExpense] Budget auto-locked:', lockResult.message);
+        }
+      } catch (lockErr) {
+        console.error('Error checking auto-lock:', lockErr);
+      }
+    }
 
     res.json({
       success: true,
       data: expense,
-      message: 'Expense posted successfully'
+      message: "Expense posted successfully",
     });
-
   } catch (error) {
     next(error);
   }

@@ -570,12 +570,13 @@ exports.confirmDelivery = async (req, res, next) => {
       });
     }
 
-    // Validate invoice is confirmed
-    if (invoice.status !== "confirmed") {
+    // Validate invoice is in a deliverable state (confirmed, partially_paid, or fully_paid)
+    const deliverableStatuses = ["confirmed", "partially_paid", "fully_paid"];
+    if (!deliverableStatuses.includes(invoice.status)) {
       return res.status(400).json({
         success: false,
         code: ERR_INVOICE_NOT_CONFIRMED,
-        message: "Invoice must be confirmed before confirming delivery",
+        message: "Invoice must be confirmed or paid before confirming delivery",
       });
     }
 
@@ -1119,6 +1120,63 @@ async function createCOGSAdjustmentEntry(
     session: options.session,
   });
 }
+
+// @desc    Dispatch delivery note (set delivery tracking info)
+// @route   PUT /api/delivery-notes/:id/dispatch
+// @access  Private
+exports.dispatchDeliveryNote = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const deliveryNoteId = req.params.id;
+    const { deliveredBy, vehicle, carrier, trackingNumber, deliveryAddress, deliveryDate } = req.body;
+
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: deliveryNoteId,
+      company: companyId,
+    });
+
+    if (!deliveryNote) {
+      return res.status(404).json({
+        success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
+        message: "Delivery note not found",
+      });
+    }
+
+    // Can only dispatch if status is draft or confirmed
+    const dispatchableStatuses = ['draft', 'confirmed'];
+    if (!dispatchableStatuses.includes(deliveryNote.status)) {
+      return res.status(400).json({
+        success: false,
+        code: ERR_DELIVERY_CONFIRMED,
+        message: `Cannot dispatch delivery note with status: ${deliveryNote.status}`,
+      });
+    }
+
+    // Update delivery tracking information
+    deliveryNote.deliveredBy = deliveredBy || deliveryNote.deliveredBy;
+    deliveryNote.vehicle = vehicle || deliveryNote.vehicle;
+    deliveryNote.carrier = carrier || deliveryNote.carrier;
+    deliveryNote.trackingNumber = trackingNumber || deliveryNote.trackingNumber;
+    deliveryNote.deliveryAddress = deliveryAddress || deliveryNote.deliveryAddress;
+    if (deliveryDate) {
+      deliveryNote.deliveryDate = new Date(deliveryDate);
+    }
+
+    // Change status to dispatched when dispatch button is clicked
+    deliveryNote.status = 'dispatched';
+
+    await deliveryNote.save();
+
+    res.status(200).json({
+      success: true,
+      data: deliveryNote,
+      message: "Delivery note dispatched successfully",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // @desc    Cancel confirmed delivery note (Module 7 - reverse stock)
 // @route   POST /api/delivery-notes/:id/cancel

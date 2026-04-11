@@ -7,6 +7,7 @@ const {
   updateDeliveryNote,
   deleteDeliveryNote,
   confirmDelivery,
+  dispatchDeliveryNote,
   cancelDeliveryNote,
   createInvoiceFromDeliveryNote,
   getInvoiceDeliveryNotes,
@@ -37,6 +38,17 @@ router.route('/:id')
   .get(getDeliveryNote)
   .put(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), updateDeliveryNote)
   .delete(authorize('admin', 'sales'), logAction('delivery_note'), deleteDeliveryNote);
+
+router.route('/:id/confirm')
+  .post(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), confirmDelivery)
+  .put(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), confirmDelivery);
+
+router.route('/:id/dispatch')
+  .put(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), dispatchDeliveryNote);
+
+router.route('/:id/cancel')
+  .post(authorize('admin'), logAction('delivery_note'), cancelDeliveryNote)
+  .put(authorize('admin'), logAction('delivery_note'), cancelDeliveryNote);
 
 // Update line delivery qty (Module 7)
 router.put('/:id/lines/:lineId', authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), updateLineDeliveryQty);

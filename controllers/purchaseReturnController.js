@@ -167,28 +167,11 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       journalLines.push(JournalService.createCreditLine(vatAcct, totalReturnTax, `VAT reversal ${pr.referenceNo || pr.referenceNo}`));
     }
 
-    // CR inventory lines per product
-    const productSums = new Map();
-    for (const l of pr.lines) {
-      const prev = productSums.get(String(l.product)) || 0;
-      productSums.set(String(l.product), prev + (Number(l.unitCost) * l.qtyReturned));
-    }
-    for (const [prodId, amt] of productSums.entries()) {
-      const product = await Product.findById(prodId).lean();
-      let invAcct = DEFAULT_ACCOUNTS.inventory;
-      if (product && product.inventoryAccount) {
-        if (typeof product.inventoryAccount === 'string' && product.inventoryAccount.length === 24 && /^[0-9a-fA-F]{24}$/.test(product.inventoryAccount)) {
-          const ChartOfAccounts = require('../models/ChartOfAccount');
-          const acctDoc = await ChartOfAccounts.findById(product.inventoryAccount).lean();
-          invAcct = acctDoc ? acctDoc.code : DEFAULT_ACCOUNTS.inventory;
-        } else {
-          invAcct = product.inventoryAccount;
-        }
-      } else {
-        invAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, { productId: prodId, warehouseId: pr.warehouse });
-      }
-      journalLines.push(JournalService.createCreditLine(invAcct || DEFAULT_ACCOUNTS.inventory, amt, `Inventory reversal ${pr.referenceNo || pr.referenceNo}`));
-    }
+    // CR Purchase Returns (contra-expense in COGS section of P&L)
+    // This reduces COGS rather than reversing inventory, reflecting that
+    // returned goods were already sold/expensed
+    const prAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'purchaseReturns', DEFAULT_ACCOUNTS.purchaseReturns);
+    journalLines.push(JournalService.createCreditLine(prAcct, totalReturnNet, `Purchase Returns ${pr.referenceNo || pr.referenceNo}`));
 
     // Post journal
     const supplier = await (require('../models/Supplier')).findById(pr.supplier).lean();
@@ -292,7 +275,8 @@ exports.getPurchaseReturn = async (req, res, next) => {
       .populate('warehouse', 'name code')
       .populate('lines.product', 'name sku')
       .populate('confirmedBy', 'name email')
-      .populate('createdBy', 'name email');
+      .populate('createdBy', 'name email')
+      .populate('bankAccountId', 'name');
     if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
     res.json({ success: true, data: pr });
   } catch (err) { next(err); }
@@ -326,5 +310,98 @@ exports.getPurchaseReturnSummary = async (req, res, next) => {
     };
     
     res.json({ success: true, data: result });
+  } catch (err) { next(err); }
+};
+
+// Process refund for purchase return
+exports.processRefund = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { refundMethod, bankAccountId, reference } = req.body;
+
+    const pr = await PurchaseReturn.findOne({ _id: id, company: companyId });
+    if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
+    if (pr.status !== 'confirmed') return res.status(400).json({ success: false, message: 'Can only refund confirmed returns' });
+    if (pr.refundMethod && pr.refundMethod !== 'none') return res.status(400).json({ success: false, message: 'Refund already processed' });
+
+    const refundAmt = pr.totalAmount || 0;
+    if (refundAmt <= 0) return res.status(400).json({ success: false, message: 'No amount to refund' });
+
+    const validMethods = ['credit', 'bank_transfer', 'cash'];
+    if (!validMethods.includes(refundMethod)) return res.status(400).json({ success: false, message: 'Invalid refund method' });
+
+    // If bank transfer, validate bank account
+    if (refundMethod === 'bank_transfer' && !bankAccountId) {
+      return res.status(400).json({ success: false, message: 'Bank account required for bank transfer' });
+    }
+
+    pr.refundMethod = refundMethod;
+    pr.bankRefundReference = reference || null;
+
+    // If bank transfer or cash, create bank transaction and journal
+    if (refundMethod === 'bank_transfer' || refundMethod === 'cash') {
+      const { BankAccount } = require('../models/BankAccount');
+      const JournalService = require('../services/journalService');
+      const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
+
+      let debitAccount;
+      let bankTransaction = null;
+
+      if (refundMethod === 'bank_transfer' && bankAccountId) {
+        const bankAccount = await BankAccount.findOne({ _id: bankAccountId, company: companyId, isActive: true });
+        if (!bankAccount) return res.status(400).json({ success: false, message: 'Invalid or inactive bank account' });
+
+        // Create bank transaction (deposit adds to balance)
+        bankTransaction = await bankAccount.addTransaction({
+          type: 'deposit',
+          amount: refundAmt,
+          description: `Purchase Return Refund - PRN#${pr.referenceNo}`,
+          date: new Date(),
+          referenceNumber: reference || pr.referenceNo,
+          paymentMethod: 'bank_transfer',
+          status: 'completed',
+          reference: pr._id,
+          referenceType: 'PurchaseReturn',
+          createdBy: req.user.id,
+          notes: `Refund for purchase return ${pr.referenceNo}`,
+        });
+
+        pr.refundBankTransaction = bankTransaction._id;
+
+        // Use bank account's ledger account for journal
+        if (bankAccount.ledgerAccountId) {
+          debitAccount = bankAccount.ledgerAccountId;
+        } else {
+          debitAccount = await JournalService.getMappedAccountCode(companyId, 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank || '1100');
+        }
+      } else {
+        // Cash refund - use cash account
+        debitAccount = await JournalService.getMappedAccountCode(companyId, 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.cashOnHand || '1000');
+      }
+
+      // Create journal entry: Dr AP, Cr Cash/Bank
+      const journalLines = [];
+      const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
+      journalLines.push(JournalService.createDebitLine(apAcct, refundAmt, `Purchase Return Refund - PRN#${pr.referenceNo}`));
+      journalLines.push(JournalService.createCreditLine(debitAccount, refundAmt, `Refund payment - PRN#${pr.referenceNo}`));
+
+      const je = await JournalService.createEntry(companyId, req.user.id, {
+        date: new Date(),
+        description: `Purchase Return Refund - PRN#${pr.referenceNo}`,
+        sourceType: 'purchase_return',
+        sourceId: pr._id,
+        sourceReference: pr.referenceNo,
+        lines: journalLines,
+        isAutoGenerated: true,
+      });
+
+      pr.refundJournalEntry = je._id;
+    }
+
+    pr.refundedAt = new Date();
+    await pr.save();
+
+    res.json({ success: true, message: 'Refund processed successfully', data: pr });
   } catch (err) { next(err); }
 };

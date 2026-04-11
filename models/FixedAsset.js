@@ -142,11 +142,48 @@ const fixedAssetSchema = new mongoose.Schema({
     ref: 'Supplier',
     default: null
   },
-  purchaseJournalEntryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
+
+  // Physical tracking
+  serialNumber: {
+    type: String,
     default: null
   },
+  location: {
+    type: String,
+    default: null
+  },
+  departmentId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Department',
+    default: null
+  },
+
+  // Warranty information
+  warrantyStartDate: {
+    type: Date,
+    default: null
+  },
+  warrantyEndDate: {
+    type: Date,
+    default: null
+  },
+
+  // Insurance details
+  insuredValue: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null
+  },
+
+  // Attachments (file references)
+  attachments: [{
+    fileName: String,
+    fileUrl: String,
+    fileType: String,
+    uploadedAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
 
   // Depreciation calculated flag
   lastDepreciationDate: {
@@ -324,8 +361,20 @@ fixedAssetSchema.statics.generateReferenceNo = async function(companyId) {
   return `AST-${year}-${seq}`;
 };
 
-// Ensure virtuals are serialized
-fixedAssetSchema.set('toJSON', { virtuals: true });
+// Ensure virtuals are serialized and Decimal128 values are converted to numbers
+fixedAssetSchema.set('toJSON', { 
+  virtuals: true,
+  transform: function(doc, ret) {
+    // Convert Decimal128 values to numbers
+    const decimalFields = ['purchaseCost', 'salvageValue', 'insuredValue', 'accumulatedDepreciation', 'netBookValue', 'decliningRate'];
+    decimalFields.forEach(field => {
+      if (ret[field] && typeof ret[field] === 'object' && ret[field].$numberDecimal) {
+        ret[field] = parseFloat(ret[field].$numberDecimal);
+      }
+    });
+    return ret;
+  }
+});
 fixedAssetSchema.set('toObject', { virtuals: true });
 
 const FixedAsset = mongoose.model('FixedAsset', fixedAssetSchema);

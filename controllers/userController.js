@@ -177,6 +177,73 @@ exports.updateUser = async (req, res, next) => {
   }
 };
 
+// @desc    Update current user profile
+// @route   PUT /api/users/profile
+// @access  Private
+exports.updateProfile = async (req, res, next) => {
+  try {
+    const userId = req.user._id;
+    
+    // Only allow specific fields for profile update
+    const allowedFields = ['name', 'email', 'phone', 'jobTitle', 'bio', 'avatar'];
+    const updateData = {};
+    
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field];
+      }
+    });
+
+    // If a file was uploaded via multipart/form-data (avatar), set avatar URL
+    if (req.file) {
+      updateData.avatar = `/uploads/users/${req.file.filename}`;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      updateData,
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: user
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get current user profile
+// @route   GET /api/users/profile
+// @access  Private
+exports.getProfile = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: user
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Delete user
 // @route   DELETE /api/users/:id
 // @access  Private (admin)

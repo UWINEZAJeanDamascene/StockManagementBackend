@@ -37,6 +37,9 @@ router.post('/:id/dispose', fixedAssetController.disposeAsset);
 // DELETE /api/fixed-assets/:id - Soft delete asset (with strict guards)
 router.delete('/:id', fixedAssetController.deleteAsset);
 
+// GET /api/fixed-assets/:id/depreciation-entries - Get posted depreciation entries for an asset
+router.get('/:id/depreciation-entries', fixedAssetController.getDepreciationEntries);
+
 // POST /api/fixed-assets/:id/depreciation/:entryId/reverse - Reverse depreciation (LIFO only)
 router.post('/:id/depreciation/:entryId/reverse', fixedAssetController.reverseDepreciation);
 

@@ -8,7 +8,11 @@ const poLineSchema = new mongoose.Schema({
   unitCost: { type: Number, default: 0, min: 0 },
   taxRate: { type: Number, default: 0, min: 0 },
   taxAmount: { type: Number, default: 0, min: 0 },
-  lineTotal: { type: Number, default: 0, min: 0 }
+  lineTotal: { type: Number, default: 0, min: 0 },
+  budgetId: { type: mongoose.Schema.Types.ObjectId, ref: 'Budget' },
+  budget_line_id: { type: mongoose.Schema.Types.ObjectId, ref: 'BudgetLine' },
+  accountId: { type: mongoose.Schema.Types.ObjectId, ref: 'ChartOfAccount' },
+  encumbrance_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Encumbrance' }
 }, { _id: true });
 
 const purchaseOrderPaymentSchema = new mongoose.Schema({

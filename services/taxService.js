@@ -1,15 +1,14 @@
-const mongoose = require('mongoose');
-const TaxRate = require('../models/TaxRate');
-const JournalEntry = require('../models/JournalEntry');
-const JournalService = require('./journalService');
-const TaxAutomationService = require('./taxAutomationService');
-const SequenceService = require('./sequenceService');
-const PeriodService = require('./periodService');
-const { BankAccount } = require('../models/BankAccount');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const mongoose = require("mongoose");
+const TaxRate = require("../models/TaxRate");
+const JournalEntry = require("../models/JournalEntry");
+const JournalService = require("./journalService");
+const TaxAutomationService = require("./taxAutomationService");
+const SequenceService = require("./sequenceService");
+const PeriodService = require("./periodService");
+const { BankAccount } = require("../models/BankAccount");
+const { aggregateWithTimeout } = require("../utils/mongoAggregation");
 
 class TaxService {
-
   // ── TAX RATE MANAGEMENT ─────────────────────────────────────────────
 
   /**
@@ -28,7 +27,7 @@ class TaxService {
       output_account_code: data.output_account_code,
       is_active: data.is_active !== undefined ? data.is_active : true,
       effective_from: data.effective_from,
-      effective_to: data.effective_to || null
+      effective_to: data.effective_to || null,
     });
 
     return taxRate.save();
@@ -39,7 +38,7 @@ class TaxService {
    */
   static async getTaxRates(companyId, filters = {}) {
     const query = { company: companyId };
-    
+
     if (filters.is_active !== undefined) {
       query.is_active = filters.is_active;
     }
@@ -72,22 +71,27 @@ class TaxService {
    */
   static async updateTaxRate(companyId, taxRateId, data) {
     const updateData = {};
-    
+
     if (data.name) updateData.name = data.name;
     if (data.rate_pct !== undefined) updateData.rate_pct = data.rate_pct;
     if (data.type) updateData.type = data.type;
-    if (data.input_account_id) updateData.input_account_id = data.input_account_id;
-    if (data.output_account_id) updateData.output_account_id = data.output_account_id;
-    if (data.input_account_code) updateData.input_account_code = data.input_account_code;
-    if (data.output_account_code) updateData.output_account_code = data.output_account_code;
+    if (data.input_account_id)
+      updateData.input_account_id = data.input_account_id;
+    if (data.output_account_id)
+      updateData.output_account_id = data.output_account_id;
+    if (data.input_account_code)
+      updateData.input_account_code = data.input_account_code;
+    if (data.output_account_code)
+      updateData.output_account_code = data.output_account_code;
     if (data.is_active !== undefined) updateData.is_active = data.is_active;
     if (data.effective_from) updateData.effective_from = data.effective_from;
-    if (data.effective_to !== undefined) updateData.effective_to = data.effective_to;
+    if (data.effective_to !== undefined)
+      updateData.effective_to = data.effective_to;
 
     return TaxRate.findOneAndUpdate(
       { _id: taxRateId, company: companyId },
       updateData,
-      { new: true }
+      { new: true },
     );
   }
 
@@ -98,7 +102,7 @@ class TaxService {
     return TaxRate.findOneAndUpdate(
       { _id: taxRateId, company: companyId },
       { is_active: false },
-      { new: true }
+      { new: true },
     );
   }
 
@@ -110,109 +114,178 @@ class TaxService {
    * Every figure is computed live from journal entry lines filtered by company_id and date range.
    * Accounts queried are explicitly reported so an auditor can verify independently.
    */
-  static async getLiabilityReport(companyId, { periodStart, periodEnd, taxCode }) {
+  static async getLiabilityReport(
+    companyId,
+    { periodStart, periodEnd, taxCode },
+  ) {
     const dateFilter = {
       $gte: new Date(periodStart),
-      $lte: new Date(periodEnd)
+      $lte: new Date(periodEnd),
     };
 
     const matchBase = {
       company: new mongoose.Types.ObjectId(companyId),
-      status: 'posted',
+      status: "posted",
       reversed: { $ne: true },
-      date: dateFilter
+      date: dateFilter,
     };
 
     // ── VAT SECTION ────────────────────────────────────────────────
     // Query both legacy and new VAT account codes
-    const vatOutputCodes = ['2100', '2220'];
-    const vatInputCodes = ['1500', '2210'];
+    const vatOutputCodes = ["2100", "2220"];
+    const vatInputCodes = ["1500", "2210"];
 
     // Output VAT — sum of credit lines on VAT Output accounts
     const outputVatResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: vatOutputCodes }, 'lines.credit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: vatOutputCodes },
+          "lines.credit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
     ]);
 
     // Output VAT reversed — sum of debit lines on VAT Output accounts (credit notes)
     const outputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: vatOutputCodes }, 'lines.debit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: vatOutputCodes },
+          "lines.debit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
     ]);
 
     // Input VAT — sum of debit lines on VAT Input accounts
     const inputVatResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: vatInputCodes }, 'lines.debit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: vatInputCodes },
+          "lines.debit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
     ]);
 
     // Input VAT reversed — sum of credit lines on VAT Input accounts (purchase returns)
     const inputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: vatInputCodes }, 'lines.credit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: vatInputCodes },
+          "lines.credit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
     ]);
 
-    const outputVat = outputVatResult[0]?.total ? Number(outputVatResult[0].total.toString()) : 0;
-    const outputVatReversed = outputVatReversedResult[0]?.total ? Number(outputVatReversedResult[0].total.toString()) : 0;
-    const inputVat = inputVatResult[0]?.total ? Number(inputVatResult[0].total.toString()) : 0;
-    const inputVatReversed = inputVatReversedResult[0]?.total ? Number(inputVatReversedResult[0].total.toString()) : 0;
+    const outputVat = outputVatResult[0]?.total
+      ? Number(outputVatResult[0].total.toString())
+      : 0;
+    const outputVatReversed = outputVatReversedResult[0]?.total
+      ? Number(outputVatReversedResult[0].total.toString())
+      : 0;
+    const inputVat = inputVatResult[0]?.total
+      ? Number(inputVatResult[0].total.toString())
+      : 0;
+    const inputVatReversed = inputVatReversedResult[0]?.total
+      ? Number(inputVatReversedResult[0].total.toString())
+      : 0;
 
     const netOutputVat = outputVat - outputVatReversed;
     const netInputVat = inputVat - inputVatReversed;
     const netVatPayable = netOutputVat - netInputVat;
 
     // ── PAYE SECTION ───────────────────────────────────────────────
-    const payePayableCodes = ['2200', '2230'];
+    const payePayableCodes = ["2200", "2230"];
 
     // PAYE withheld — sum of credit lines on PAYE accounts
     const payeWithheldResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: payePayableCodes }, 'lines.credit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: payePayableCodes },
+          "lines.credit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
     ]);
 
     // PAYE remitted — sum of debit lines on PAYE accounts (settlements)
     const payeRemittedResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: { ...matchBase, sourceType: { $in: ['paye_settlement', 'payroll_tax'] } } },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: payePayableCodes }, 'lines.debit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+      {
+        $match: {
+          ...matchBase,
+          sourceType: { $in: ["paye_settlement", "payroll_tax"] },
+        },
+      },
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: payePayableCodes },
+          "lines.debit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
     ]);
 
-    const payeWithheld = payeWithheldResult[0]?.total ? Number(payeWithheldResult[0].total.toString()) : 0;
-    const payeRemitted = payeRemittedResult[0]?.total ? Number(payeRemittedResult[0].total.toString()) : 0;
+    const payeWithheld = payeWithheldResult[0]?.total
+      ? Number(payeWithheldResult[0].total.toString())
+      : 0;
+    const payeRemitted = payeRemittedResult[0]?.total
+      ? Number(payeRemittedResult[0].total.toString())
+      : 0;
     const payeOutstanding = payeWithheld - payeRemitted;
 
     // ── RSSB SECTION ───────────────────────────────────────────────
-    const rssbPayableCodes = ['2300', '2240'];
+    const rssbPayableCodes = ["2300", "2240"];
 
     // RSSB contributions — sum of credit lines on RSSB accounts
     const rssbContributedResult = await aggregateWithTimeout(JournalEntry, [
       { $match: matchBase },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: rssbPayableCodes }, 'lines.credit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.credit' } } }
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: rssbPayableCodes },
+          "lines.credit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
     ]);
 
     // RSSB remitted — sum of debit lines on RSSB accounts (settlements)
     const rssbRemittedResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: { ...matchBase, sourceType: { $in: ['rssb_settlement', 'payroll_tax'] } } },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: rssbPayableCodes }, 'lines.debit': { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$lines.debit' } } }
+      {
+        $match: {
+          ...matchBase,
+          sourceType: { $in: ["rssb_settlement", "payroll_tax"] },
+        },
+      },
+      { $unwind: "$lines" },
+      {
+        $match: {
+          "lines.accountCode": { $in: rssbPayableCodes },
+          "lines.debit": { $gt: 0 },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
     ]);
 
-    const rssbContributed = rssbContributedResult[0]?.total ? Number(rssbContributedResult[0].total.toString()) : 0;
-    const rssbRemitted = rssbRemittedResult[0]?.total ? Number(rssbRemittedResult[0].total.toString()) : 0;
+    const rssbContributed = rssbContributedResult[0]?.total
+      ? Number(rssbContributedResult[0].total.toString())
+      : 0;
+    const rssbRemitted = rssbRemittedResult[0]?.total
+      ? Number(rssbRemittedResult[0].total.toString())
+      : 0;
     const rssbOutstanding = rssbContributed - rssbRemitted;
 
     return {
@@ -234,8 +307,8 @@ class TaxService {
         refund_due: netVatPayable < 0 ? Math.abs(netVatPayable) : 0,
         accounts_queried: {
           output: vatOutputCodes,
-          input: vatInputCodes
-        }
+          input: vatInputCodes,
+        },
       },
 
       // PAYE Section
@@ -243,7 +316,7 @@ class TaxService {
         total_withheld: payeWithheld,
         total_remitted: payeRemitted,
         outstanding: payeOutstanding,
-        accounts_queried: payePayableCodes
+        accounts_queried: payePayableCodes,
       },
 
       // RSSB Section
@@ -251,14 +324,15 @@ class TaxService {
         total_contributions: rssbContributed,
         total_remitted: rssbRemitted,
         outstanding: rssbOutstanding,
-        accounts_queried: rssbPayableCodes
+        accounts_queried: rssbPayableCodes,
       },
 
       // Grand totals
       totals: {
-        total_tax_liability: Math.max(0, netVatPayable) + payeOutstanding + rssbOutstanding,
-        total_remitted: payeRemitted + rssbRemitted
-      }
+        total_tax_liability:
+          Math.max(0, netVatPayable) + payeOutstanding + rssbOutstanding,
+        total_remitted: payeRemitted + rssbRemitted,
+      },
     };
   }
 
@@ -273,53 +347,71 @@ class TaxService {
     // Get bank account
     let bankAccount;
     if (data.bank_account_id) {
-      bankAccount = await BankAccount.findOne({ 
-        _id: data.bank_account_id, 
-        company: companyId 
+      bankAccount = await BankAccount.findOne({
+        _id: data.bank_account_id,
+        company: companyId,
       });
       if (!bankAccount) {
-        throw new Error('BANK_ACCOUNT_NOT_FOUND');
+        throw new Error("BANK_ACCOUNT_NOT_FOUND");
       }
     }
 
-    const refNo = await SequenceService.nextSequence(companyId, 'TXST');
+    const refNo = await SequenceService.nextSequence(companyId, "TXST");
 
     // Determine cash account code
     let cashAccountCode;
     if (bankAccount && bankAccount.ledgerAccountId) {
       cashAccountCode = bankAccount.ledgerAccountId;
-    } else if (data.payment_method === 'bank' || data.bank_account_id) {
-      cashAccountCode = '1100';
+    } else if (data.payment_method === "bank" || data.bank_account_id) {
+      cashAccountCode = "1100";
     } else {
-      cashAccountCode = '1000';
+      cashAccountCode = "1000";
     }
 
     // Determine settlement type and compute journal lines via TaxAutomationService
-    const settlementType = (data.settlement_type || 'vat').toLowerCase();
+    const settlementType = (data.settlement_type || "vat").toLowerCase();
     let settlement;
-    let sourceType = 'tax_settlement';
+    let sourceType = "tax_settlement";
 
     switch (settlementType) {
-      case 'paye':
-        settlement = TaxAutomationService.computePayeSettlement(companyId, data.amount, cashAccountCode);
-        sourceType = 'paye_settlement';
+      case "paye":
+        settlement = TaxAutomationService.computePayeSettlement(
+          companyId,
+          data.amount,
+          cashAccountCode,
+        );
+        sourceType = "paye_settlement";
         break;
-      case 'rssb':
-        settlement = TaxAutomationService.computeRssbSettlement(companyId, data.amount, cashAccountCode);
-        sourceType = 'rssb_settlement';
+      case "rssb":
+        settlement = TaxAutomationService.computeRssbSettlement(
+          companyId,
+          data.amount,
+          cashAccountCode,
+        );
+        sourceType = "rssb_settlement";
         break;
-      case 'vat':
+      case "vat":
       default:
-        settlement = TaxAutomationService.computeVatSettlement(companyId, data.amount, cashAccountCode);
-        sourceType = 'vat_settlement';
+        settlement = TaxAutomationService.computeVatSettlement(
+          companyId,
+          data.amount,
+          cashAccountCode,
+        );
+        sourceType = "vat_settlement";
         break;
     }
 
     // Validate journal lines are balanced
-    TaxAutomationService.assertBalanced(settlement.journalLines, `${settlementType} settlement`);
+    TaxAutomationService.assertBalanced(
+      settlement.journalLines,
+      `${settlementType} settlement`,
+    );
 
-    const periodId = await PeriodService.getOpenPeriodId(companyId, data.settlement_date);
-    const narration = `${settlementType.toUpperCase()} Settlement - ${data.period_description || 'Tax Period'} - TXST#${refNo}`;
+    const periodId = await PeriodService.getOpenPeriodId(
+      companyId,
+      data.settlement_date,
+    );
+    const narration = `${settlementType.toUpperCase()} Settlement - ${data.period_description || "Tax Period"} - TXST#${refNo}`;
 
     const journalEntry = await JournalService.createEntry(companyId, userId, {
       date: data.settlement_date,
@@ -329,8 +421,36 @@ class TaxService {
       sourceReference: `TXST#${refNo}`,
       lines: settlement.journalLines,
       isAutoGenerated: true,
-      periodId
+      periodId,
     });
+
+    // Create BankTransaction so the bank account balance decreases immediately.
+    // Without this, the journal entry correctly credits the bank GL account but the
+    // per-account BankTransaction history and cachedBalance are never updated.
+    if (bankAccount && data.amount > 0) {
+      try {
+        await bankAccount.addTransaction({
+          type: "withdrawal",
+          amount: data.amount,
+          description: narration,
+          date: data.settlement_date
+            ? new Date(data.settlement_date)
+            : new Date(),
+          referenceNumber: `TXST#${refNo}`,
+          referenceType: "Payment",
+          reference: journalEntry._id,
+          createdBy: userId,
+          notes: `${settlementType.toUpperCase()} tax settlement — TXST#${refNo}`,
+          journalEntryId: journalEntry._id,
+        });
+      } catch (btErr) {
+        console.error(
+          "BankTransaction creation failed for tax settlement:",
+          btErr.message,
+        );
+        // Non-fatal — journal entry already posted; balance recalculates on next fetch
+      }
+    }
 
     return {
       settlement_reference: refNo,
@@ -339,7 +459,7 @@ class TaxService {
       amount: data.amount,
       tax_code: data.tax_code || settlementType.toUpperCase(),
       settlement_date: data.settlement_date,
-      journal_entry: journalEntry
+      journal_entry: journalEntry,
     };
   }
 
@@ -349,7 +469,7 @@ class TaxService {
    * Calculate VAT amount from a base amount
    */
   static calculateVat(baseAmount, taxCodeOrRate) {
-    if (typeof taxCodeOrRate === 'number') {
+    if (typeof taxCodeOrRate === "number") {
       return baseAmount * (taxCodeOrRate / 100);
     }
     // If it's a string code, we'd need to look up the rate
@@ -368,7 +488,7 @@ class TaxService {
       gross: grossAmount,
       net: netAmount,
       vat: vatAmount,
-      rate_pct: taxRatePct
+      rate_pct: taxRatePct,
     };
   }
 }

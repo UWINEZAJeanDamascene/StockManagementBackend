@@ -42,7 +42,7 @@ const journalEntrySchema = new mongoose.Schema({
   // Reference to source document (optional)
   sourceType: {
     type: String,
-    enum: ['manual', 'invoice', 'purchase', 'purchase_order', 'credit_note', 'credit_note_cogs', 'expense', 'asset', 'asset_purchase', 'asset_disposal', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_topup', 'petty_cash_expense', 'petty_cash_replenishment', 'petty_cash_opening', 'purchase_return', 'stock_adjustment', 'payroll', 'payroll_run', 'payroll_salary', 'payroll_reversal', 'tax_payment', 'tax_settlement', 'vat_settlement', 'paye_settlement', 'rssb_settlement', 'bank_transfer', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', 'ar_receipt', 'ar_receipt_reversal', 'bad_debt_writeoff', 'ap_payment', 'ap_payment_reversal', 'liability_drawdown', 'liability_repayment', 'liability_interest', 'other_income', 'tax_accrual', 'loan_interest', 'bank_charge', 'interest_accrual', 'distribution_cost', 'admin_expense', 'other_expense', 'oci', 'dividend', null],
+    enum: ['manual', 'invoice', 'invoice_cogs', 'purchase', 'purchase_order', 'credit_note', 'credit_note_cogs', 'expense', 'asset', 'asset_purchase', 'asset_disposal', 'depreciation', 'loan', 'payment', 'adjustment', 'petty_cash', 'petty_cash_topup', 'petty_cash_expense', 'petty_cash_replenishment', 'petty_cash_opening', 'purchase_return', 'stock_adjustment', 'payroll', 'payroll_run', 'payroll_salary', 'payroll_reversal', 'tax_payment', 'tax_settlement', 'vat_settlement', 'paye_settlement', 'rssb_settlement', 'bank_transfer', 'bank_deposit', 'bank_withdrawal', 'bank_account_opening', 'opening_balance', 'reversal', 'cogs', 'stock_transfer', 'stock_audit', 'cogs_adjustment', 'cogs_adjustment_reversal', 'ar_receipt', 'ar_receipt_reversal', 'bad_debt_writeoff', 'ap_payment', 'ap_payment_reversal', 'liability_drawdown', 'liability_repayment', 'liability_interest', 'other_income', 'tax_accrual', 'loan_interest', 'bank_charge', 'interest_accrual', 'distribution_cost', 'admin_expense', 'other_expense', 'oci', 'dividend', null],
     default: 'manual'
   },
   sourceId: {
@@ -214,9 +214,10 @@ journalEntrySchema.index({ company: 1, entryNumber: 1 }, { unique: true });
 journalEntrySchema.index({ company: 1, 'lines.accountCode': 1 });
 journalEntrySchema.index({ company: 1, date: 1, 'lines.accountCode': 1 });
 // Ensure we don't create duplicate journal entries for the same source event
-// Enforce only when sourceId is present (manual entries without sourceId are excluded)
+// For depreciation, we allow multiple entries per asset by including the year-month in the unique key
+// This allows monthly depreciation entries while preventing duplicate postings for the same period
 journalEntrySchema.index(
-  { company: 1, sourceType: 1, sourceId: 1 },
+  { company: 1, sourceType: 1, sourceId: 1, date: 1 },
   {
     unique: true,
     // Use $type (not $ne: null) so partial indexes work on MongoDB versions used by mongodb-memory-server

@@ -24,7 +24,14 @@ const purchaseReturnSchema = new mongoose.Schema({
   confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   confirmedAt: Date,
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lines: [prLineSchema]
+  lines: [prLineSchema],
+  // Refund fields
+  refundMethod: { type: String, enum: ['none', 'credit', 'bank_transfer', 'cash'], default: 'none' },
+  bankAccountId: { type: mongoose.Schema.Types.ObjectId, ref: 'BankAccount', default: null },
+  bankRefundReference: { type: String, default: null },
+  refundedAt: { type: Date, default: null },
+  refundJournalEntry: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', default: null },
+  refundBankTransaction: { type: mongoose.Schema.Types.ObjectId, ref: 'BankTransaction', default: null }
 }, { timestamps: true });
 
 purchaseReturnSchema.index({ company: 1, referenceNo: 1 }, { unique: true });

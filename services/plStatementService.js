@@ -1,7 +1,7 @@
-const mongoose = require('mongoose');
-const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const mongoose = require("mongoose");
+const ChartOfAccount = require("../models/ChartOfAccount");
+const JournalEntry = require("../models/JournalEntry");
+const { aggregateWithTimeout } = require("../utils/mongoAggregation");
 
 /**
  * P&L Statement Service — IAS 1 Compliant Income Statement Format
@@ -36,21 +36,27 @@ const { aggregateWithTimeout } = require('../utils/mongoAggregation');
  * All amounts computed from posted journal entries for the given period.
  */
 class PLStatementService {
-
   /**
    * Generate P&L Statement report
    * @param {string} companyId
    * @param {object} options — { dateFrom, dateTo, comparativeDateFrom, comparativeDateTo }
    */
-  static async generate(companyId, { dateFrom, dateTo, comparativeDateFrom, comparativeDateTo }) {
-    if (!companyId) throw new Error('COMPANY_ID_REQUIRED');
-    if (!dateFrom || !dateTo) throw new Error('DATE_RANGE_REQUIRED');
+  static async generate(
+    companyId,
+    { dateFrom, dateTo, comparativeDateFrom, comparativeDateTo },
+  ) {
+    if (!companyId) throw new Error("COMPANY_ID_REQUIRED");
+    if (!dateFrom || !dateTo) throw new Error("DATE_RANGE_REQUIRED");
 
     const [currentPeriod, comparativePeriod] = await Promise.all([
       PLStatementService._buildPeriodData(companyId, dateFrom, dateTo),
       comparativeDateFrom && comparativeDateTo
-        ? PLStatementService._buildPeriodData(companyId, comparativeDateFrom, comparativeDateTo)
-        : null
+        ? PLStatementService._buildPeriodData(
+            companyId,
+            comparativeDateFrom,
+            comparativeDateTo,
+          )
+        : null,
     ]);
 
     return {
@@ -59,7 +65,7 @@ class PLStatementService {
       date_to: dateTo,
       current: currentPeriod,
       comparative: comparativePeriod,
-      generated_at: new Date()
+      generated_at: new Date(),
     };
   }
 
@@ -69,26 +75,30 @@ class PLStatementService {
    */
   static async _buildPeriodData(companyId, dateFrom, dateTo) {
     // ── Step 1: Aggregate all journal entry lines by account code ────
+    // Interpret dateTo as inclusive end-of-day so entries on the 'dateTo' are included
+    const dateToInclusive = new Date(dateTo);
+    dateToInclusive.setHours(23, 59, 59, 999);
+
     const accountBalances = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
+          status: "posted",
           reversed: { $ne: true },
           date: {
             $gte: new Date(dateFrom),
-            $lte: new Date(dateTo)
-          }
-        }
+            $lte: dateToInclusive,
+          },
+        },
       },
-      { $unwind: '$lines' },
+      { $unwind: "$lines" },
       {
         $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      }
+          _id: "$lines.accountCode",
+          total_dr: { $sum: "$lines.debit" },
+          total_cr: { $sum: "$lines.credit" },
+        },
+      },
     ]);
 
     if (accountBalances.length === 0) {
@@ -96,11 +106,11 @@ class PLStatementService {
     }
 
     // ── Step 2: Load account details for classification ──────────────
-    const accountCodes = accountBalances.map(b => b._id);
+    const accountCodes = accountBalances.map((b) => b._id);
     const accounts = await ChartOfAccount.find({
       code: { $in: accountCodes },
       company: new mongoose.Types.ObjectId(companyId),
-      type: { $in: ['revenue', 'expense', 'cogs'] }
+      type: { $in: ["revenue", "expense", "cogs"] },
     }).lean();
 
     const accountMap = {};
@@ -109,79 +119,103 @@ class PLStatementService {
     }
 
     // ── Step 3: Classify each account into IAS 1 P&L sections ───────
-    const revenueLines = [];             // Sales Revenue (4000), Sales Returns (4100)
-    const cogsLines = [];                // COGS (5000), Purchases (5100), Freight In (5110), etc.
-    const distributionCostLines = [];    // Transport & Delivery (5700), Marketing (5850)
-    const adminExpenseLines = [];        // Salaries (5400), Rent (5500), Utilities (5600), etc.
-    const otherExpenseLines = [];        // Bad Debt (5250), Other Expenses (6100)
-    const otherIncomeLines = [];         // Other Income (4200), Interest Income (4300), Gain on Disposal (4250)
-    const financeCostLines = [];         // Interest Expense (6000), Bank Charges (6200)
-    const depreciationLines = [];        // Depreciation (5800) — tracked separately for EBITDA
-    const taxLines = [];                 // Corporate Tax (6400)
-    const nonOperatingExpenseLines = []; // Loss on Asset Disposal (6050)
+    const revenueLines = []; // Sales Revenue (4000), Sales Returns (4100 — contra, negated)
+    const cogsLines = []; // COGS (5000), Purchases (5100), Purchase Returns (5200 — contra, negated)
+    const distributionCostLines = []; // Transport & Delivery (5700), Marketing (5850)
+    const adminExpenseLines = []; // Salaries (5400), Rent (5500), Utilities (5600), etc.
+    const otherExpenseLines = []; // Bad Debt (5250), Other Expenses (6100), Loss on Disposal (6050)
+    const otherIncomeLines = []; // Other Income (4200), Gain on Disposal (4250)
+    const financeIncomeLines = []; // Interest Income (4300) — shown below EBIT per IAS 1
+    const financeCostLines = []; // Interest Expense (6000), Bank Charges (6200)
+    const depreciationLines = []; // Depreciation (5800+) — tracked separately for EBITDA
+    const taxLines = []; // Corporate Tax (6400)
 
     for (const bal of accountBalances) {
       const account = accountMap[bal._id];
       if (!account) continue;
 
-      const dr = bal.total_dr || 0;
-      const cr = bal.total_cr || 0;
+      const dr = parseFloat(bal.total_dr?.toString() || "0");
+      const cr = parseFloat(bal.total_cr?.toString() || "0");
 
       // Amount based on normal balance direction
-      const amount = account.normal_balance === 'credit'
-        ? cr - dr   // credit-normal: CR - DR (negative for contra accounts like Sales Returns)
-        : dr - cr;  // debit-normal: DR - CR
+      let amount =
+        account.normal_balance === "credit"
+          ? cr - dr // credit-normal: revenue, liabilities, equity
+          : dr - cr; // debit-normal: assets, expenses, cogs
+
+      // ── Contra accounts: negate so they REDUCE their parent section ──
+      // e.g. Sales Returns (4100) reduces Revenue; Purchase Returns (5200) reduces COGS
+      if (account.subtype === "contra") {
+        amount = -Math.abs(amount);
+      }
 
       const line = {
         account_id: account._id,
         account_code: account.code,
         account_name: account.name,
-        amount: Math.round(amount * 100) / 100
+        amount: Math.round(amount * 100) / 100,
       };
 
-      const subtype = account.subtype || '';
+      const subtype = account.subtype || "";
       const type = account.type;
       const code = account.code;
 
       // ── Classification Logic (IAS 1) ──────────────────────────────
-      if (type === 'revenue') {
-        if (subtype === 'non_operating') {
-          // Other Income: 4200, 4300, 4250, 4400
-          otherIncomeLines.push(line);
+      if (type === "revenue") {
+        if (subtype === "contra") {
+          // Sales Returns (4100) — already negated above; reduces gross revenue
+          revenueLines.push(line);
+        } else if (subtype === "non_operating") {
+          if (code === "4300") {
+            // Interest Income → Finance Income (below EBIT per IAS 1 §82)
+            financeIncomeLines.push(line);
+          } else {
+            // Other non-operating income: Other Income (4200), Gain on Disposal (4250)
+            otherIncomeLines.push(line);
+          }
         } else {
-          // Operating Revenue: 4000, 4100 (contra — will be negative)
+          // Operating Revenue: 4000 Sales Revenue
           revenueLines.push(line);
         }
-      } else if (type === 'cogs') {
-        // COGS: 5000, 5100, 5110, 5150, 5200 (contra), 5300
+      } else if (type === "cogs") {
+        // COGS: 5000, 5100, 5110, 5150, 5300
+        // Purchase Returns (5200, contra) — already negated, reduces COGS
         cogsLines.push(line);
-      } else if (type === 'expense') {
-        if (subtype === 'financial') {
+      } else if (type === "expense") {
+        if (subtype === "financial") {
           // Finance Costs: 6000 (Interest Expense), 6200 (Bank Charges)
           financeCostLines.push(line);
-        } else if (subtype === 'tax') {
+        } else if (subtype === "tax") {
           // Tax Expense: 6400 (Corporate Tax)
           taxLines.push(line);
-        } else if (subtype === 'non_operating') {
-          // Non-operating expense (Loss on Disposal) → Other Comprehensive Income negative
-          nonOperatingExpenseLines.push(line);
-        } else if (code === '5800') {
-          // Depreciation — tracked separately for EBITDA calculation
+        } else if (subtype === "non_operating") {
+          // Non-operating expense: 6050 Loss on Disposal → Other Expenses (P&L item, NOT OCI)
+          otherExpenseLines.push(line);
+        } else if (subtype === "depreciation" || code === "5800") {
+          // Depreciation — tracked separately for EBITDA; also in admin expenses for EBIT calc
           depreciationLines.push(line);
           adminExpenseLines.push(line);
-        } else if (subtype === 'operating') {
-          // Classify operating expenses into distribution vs admin
-          if (code === '5700' || code === '5850') {
+        } else if (subtype === "distribution") {
+          // Distribution Costs: Transport & Delivery (5700), Marketing & Advertising (5850)
+          distributionCostLines.push(line);
+        } else if (subtype === "other_expense") {
+          // Other Expenses: Bad Debt (5250), Other Expenses (6100)
+          otherExpenseLines.push(line);
+        } else if (subtype === "operating") {
+          // Classify remaining operating expenses by code (backward-compat fallback)
+          if (code === "5700" || code === "5850") {
             // Distribution Costs: Transport & Delivery, Marketing & Advertising
+            // (fallback for ChartOfAccount records created before subtype update)
             distributionCostLines.push(line);
-          } else if (code === '5250' || code === '6100') {
+          } else if (code === "5250" || code === "6100") {
             // Other Expenses: Bad Debt Expense, Other Expenses
+            // (fallback for ChartOfAccount records created before subtype update)
             otherExpenseLines.push(line);
           } else {
             // Administrative Expenses: Salaries, Rent, Utilities, Payroll, etc.
             adminExpenseLines.push(line);
           }
-        } else if (subtype === 'rssb_employer_cost') {
+        } else if (subtype === "rssb_employer_cost") {
           // RSSB Employer Cost → Administrative Expenses
           adminExpenseLines.push(line);
         } else {
@@ -192,45 +226,65 @@ class PLStatementService {
     }
 
     // ── Step 4: Sort each section by account code ───────────────────
-    const sortFn = (a, b) => a.account_code.localeCompare(b.account_code, undefined, { numeric: true });
+    const sortFn = (a, b) =>
+      a.account_code.localeCompare(b.account_code, undefined, {
+        numeric: true,
+      });
     revenueLines.sort(sortFn);
     cogsLines.sort(sortFn);
     distributionCostLines.sort(sortFn);
     adminExpenseLines.sort(sortFn);
     otherExpenseLines.sort(sortFn);
     otherIncomeLines.sort(sortFn);
+    financeIncomeLines.sort(sortFn);
     financeCostLines.sort(sortFn);
     depreciationLines.sort(sortFn);
     taxLines.sort(sortFn);
-    nonOperatingExpenseLines.sort(sortFn);
 
     // ── Step 5: Compute section totals ──────────────────────────────
     const round = (n) => Math.round(n * 100) / 100;
     const sumLines = (lines) => round(lines.reduce((s, l) => s + l.amount, 0));
 
-    const totalRevenue = sumLines(revenueLines);
-    const totalCOGS = sumLines(cogsLines);
+    const totalRevenue = sumLines(revenueLines); // Net revenue after contra (Sales Returns)
+    const totalCOGS = sumLines(cogsLines); // Net COGS after contra (Purchase Returns)
     const grossProfit = round(totalRevenue - totalCOGS);
 
-    const totalOtherIncome = sumLines(otherIncomeLines);
+    const totalOtherIncome = sumLines(otherIncomeLines); // Other Income (4200, 4250)
     const totalDistributionCosts = sumLines(distributionCostLines);
-    const totalAdminExpenses = sumLines(adminExpenseLines);
-    const totalOtherExpenses = sumLines(otherExpenseLines);
+    const totalAdminExpenses = sumLines(adminExpenseLines); // Includes depreciation
+    const totalOtherExpenses = sumLines(otherExpenseLines); // Bad Debt, Loss on Disposal, etc.
 
+    // ── Operating Profit (EBIT) per IAS 1 ────────────────────────────────
+    // = Gross Profit + Other Operating Income − Distribution − Admin − Other Operating Expenses
+    // Finance Income (Interest) is excluded from EBIT (shown separately below)
     const operatingProfit = round(
-      grossProfit + totalOtherIncome - totalDistributionCosts - totalAdminExpenses - totalOtherExpenses
+      grossProfit +
+        totalOtherIncome -
+        totalDistributionCosts -
+        totalAdminExpenses -
+        totalOtherExpenses,
     );
 
+    // ── EBITDA ────────────────────────────────────────────────────────────
+    // = EBIT + Depreciation & Amortisation (add back non-cash charge)
     const totalFinanceCosts = sumLines(financeCostLines);
+    const totalFinanceIncome = sumLines(financeIncomeLines); // Interest Income (below EBIT)
     const totalDepreciation = sumLines(depreciationLines);
     const ebitda = round(operatingProfit + totalDepreciation);
 
     const shareOfAssociates = 0; // placeholder for equity method investments
 
-    const profitBeforeTax = round(operatingProfit - totalFinanceCosts + shareOfAssociates);
+    // ── Profit Before Tax (PBT) per IAS 1 §82 ────────────────────────────
+    // = EBIT + Finance Income − Finance Costs + Share of Associates
+    const profitBeforeTax = round(
+      operatingProfit +
+        totalFinanceIncome -
+        totalFinanceCosts +
+        shareOfAssociates,
+    );
 
     // Corporate income tax: use journal entries if present, otherwise auto-compute at 30% of PBT
-    const CORPORATE_TAX_RATE = 0.30;
+    const CORPORATE_TAX_RATE = 0.3;
     let totalTax = sumLines(taxLines);
     let computedTax = false;
     if (totalTax === 0 && profitBeforeTax > 0) {
@@ -239,20 +293,23 @@ class PLStatementService {
     }
 
     const profitAfterTax = round(profitBeforeTax - totalTax);
-    const effectiveTaxRate = profitBeforeTax > 0
-      ? round((totalTax / profitBeforeTax) * 100 * 100) / 100
-      : 0;
+    const effectiveTaxRate =
+      profitBeforeTax > 0
+        ? round((totalTax / profitBeforeTax) * 100 * 100) / 100
+        : 0;
 
     // Discontinued operations (placeholder — no data unless journal entries exist)
     const totalDiscontinuedOps = 0;
 
     const profitForPeriod = round(profitAfterTax + totalDiscontinuedOps);
 
-    // Other Comprehensive Income (OCI)
-    // Items that bypass P&L: revaluation surplus, foreign currency translation, etc.
-    // These come from journal entries with specific OCI account codes (if configured)
-    // For now, compute from non-operating items that represent OCI
-    const totalOCI = sumLines(nonOperatingExpenseLines);
+    // ── Other Comprehensive Income (OCI) ─────────────────────────────────
+    // IAS 1 §82A: OCI includes revaluation surplus, FX translation differences,
+    // actuarial gains/losses on defined benefit plans, etc.
+    // These require dedicated OCI account codes not yet in this chart of accounts.
+    // Loss on Disposal (6050) is a P&L item (now in otherExpenses), NOT OCI.
+    const ociLines = []; // Reserved: add OCI account codes when needed
+    const totalOCI = 0; // Zero until OCI accounts (e.g. revaluation reserve) are configured
 
     const totalComprehensiveIncome = round(profitForPeriod + totalOCI);
 
@@ -263,7 +320,10 @@ class PLStatementService {
 
     // Earnings Per Share (placeholder — requires share count from company settings)
     const weightedAvgShares = 0; // Would come from company settings
-    const basicEPS = weightedAvgShares > 0 ? round(profitAttributableToOwners / weightedAvgShares) : null;
+    const basicEPS =
+      weightedAvgShares > 0
+        ? round(profitAttributableToOwners / weightedAvgShares)
+        : null;
     const dilutedEPS = basicEPS; // Same unless dilutive instruments exist
 
     // ── Step 6: Compute margin percentages ──────────────────────────
@@ -276,107 +336,116 @@ class PLStatementService {
     const ebitdaMarginPct = pct(ebitda, totalRevenue);
 
     return {
-      // Section 1: Revenue
+      // Section 1: Revenue (net of Sales Returns — contra already negated)
       revenue: {
         lines: revenueLines,
-        total: totalRevenue
+        total: totalRevenue,
       },
 
-      // Section 2: Cost of Sales (COGS)
+      // Section 2: Cost of Sales (net of Purchase Returns — contra already negated)
       cogs: {
         lines: cogsLines,
-        total: totalCOGS
+        total: totalCOGS,
       },
 
       // Section 3: Gross Profit
       gross_profit: grossProfit,
       gross_margin_pct: grossMarginPct,
 
-      // Section 4: Other Income
+      // Section 4: Other Income (non-finance: 4200 Other Income, 4250 Gain on Disposal)
       other_income: {
         lines: otherIncomeLines,
-        total: totalOtherIncome
+        total: totalOtherIncome,
       },
 
       // Section 5: Distribution Costs
       distribution_costs: {
         lines: distributionCostLines,
-        total: totalDistributionCosts
+        total: totalDistributionCosts,
       },
 
-      // Section 6: Administrative Expenses
+      // Section 6: Administrative Expenses (includes Depreciation)
       administrative_expenses: {
         lines: adminExpenseLines,
-        total: totalAdminExpenses
+        total: totalAdminExpenses,
       },
 
-      // Section 7: Other Expenses
+      // Section 7: Other Expenses (Bad Debt, Loss on Disposal, misc)
       other_expenses: {
         lines: otherExpenseLines,
-        total: totalOtherExpenses
+        total: totalOtherExpenses,
       },
 
       // Section 8: Operating Profit (EBIT)
+      // = Gross Profit + Other Income − Distribution − Admin − Other Expenses
       operating_profit: operatingProfit,
       operating_margin_pct: operatingMarginPct,
 
-      // EBITDA
+      // EBITDA = EBIT + Depreciation & Amortisation
       ebitda: ebitda,
       ebitda_margin_pct: ebitdaMarginPct,
       depreciation_and_amortisation: totalDepreciation,
 
-      // Section 9: Finance Costs
-      finance_costs: {
-        lines: financeCostLines,
-        total: totalFinanceCosts
+      // Section 9: Finance Income (Interest Income 4300 — below EBIT per IAS 1)
+      finance_income: {
+        lines: financeIncomeLines,
+        total: totalFinanceIncome,
       },
 
-      // Section 10: Share of Profit of Associates/JV
+      // Section 10: Finance Costs (Interest Expense 6000, Bank Charges 6200)
+      finance_costs: {
+        lines: financeCostLines,
+        total: totalFinanceCosts,
+      },
+
+      // Section 11: Share of Profit of Associates/JV
       share_of_associates: shareOfAssociates,
 
-      // Section 11: Profit Before Tax
+      // Section 12: Profit Before Tax
+      // = EBIT + Finance Income − Finance Costs + Share of Associates
       profit_before_tax: profitBeforeTax,
 
-      // Section 12: Tax Expense
+      // Section 13: Tax Expense
       tax: {
         lines: taxLines,
-        total: totalTax
+        total: totalTax,
       },
       corporate_tax_rate: CORPORATE_TAX_RATE,
       effective_tax_rate: effectiveTaxRate,
       computed_tax: computedTax,
 
-      // Section 13: Profit After Tax (from continuing operations)
+      // Section 14: Profit After Tax (from continuing operations)
       profit_after_tax: profitAfterTax,
 
-      // Section 14: Discontinued Operations
+      // Section 15: Discontinued Operations
       discontinued_operations: {
-        total: totalDiscontinuedOps
+        total: totalDiscontinuedOps,
       },
 
-      // Section 15: Profit for the Period
+      // Section 16: Profit for the Period
       profit_for_period: profitForPeriod,
 
-      // Section 16: Other Comprehensive Income
+      // Section 17: Other Comprehensive Income
+      // (currently zero — no OCI accounts configured; Loss on Disposal is a P&L item)
       other_comprehensive_income: {
-        lines: nonOperatingExpenseLines,
-        total: totalOCI
+        lines: ociLines,
+        total: totalOCI,
       },
 
-      // Section 17: Total Comprehensive Income
+      // Section 18: Total Comprehensive Income
       total_comprehensive_income: totalComprehensiveIncome,
 
-      // Section 18: Profit Attributable To
+      // Section 19: Profit Attributable To
       profit_attributable_to_owners: profitAttributableToOwners,
       profit_attributable_to_nci: nciShare,
       comprehensive_income_attributable_to_owners: ownersShare,
       comprehensive_income_attributable_to_nci: nciShare,
 
-      // Section 19: Earnings Per Share
+      // Section 20: Earnings Per Share
       earnings_per_share: {
         weighted_avg_shares: weightedAvgShares,
         basic_eps: basicEPS,
-        diluted_eps: dilutedEPS
+        diluted_eps: dilutedEPS,
       },
 
       // Convenience aliases
@@ -386,13 +455,31 @@ class PLStatementService {
 
       // Legacy fields for backward compatibility
       operating_expenses: {
-        lines: [...distributionCostLines, ...adminExpenseLines, ...otherExpenseLines],
-        total: round(totalDistributionCosts + totalAdminExpenses + totalOtherExpenses)
+        lines: [
+          ...distributionCostLines,
+          ...adminExpenseLines,
+          ...otherExpenseLines,
+        ],
+        total: round(
+          totalDistributionCosts + totalAdminExpenses + totalOtherExpenses,
+        ),
       },
       expenses: {
-        lines: [...distributionCostLines, ...adminExpenseLines, ...otherExpenseLines, ...financeCostLines, ...taxLines],
-        total: round(totalDistributionCosts + totalAdminExpenses + totalOtherExpenses + totalFinanceCosts + totalTax)
-      }
+        lines: [
+          ...distributionCostLines,
+          ...adminExpenseLines,
+          ...otherExpenseLines,
+          ...financeCostLines,
+          ...taxLines,
+        ],
+        total: round(
+          totalDistributionCosts +
+            totalAdminExpenses +
+            totalOtherExpenses +
+            totalFinanceCosts +
+            totalTax,
+        ),
+      },
     };
   }
 
@@ -415,11 +502,12 @@ class PLStatementService {
       ebitda: 0,
       ebitda_margin_pct: 0,
       depreciation_and_amortisation: 0,
+      finance_income: { lines: [], total: 0 },
       finance_costs: { lines: [], total: 0 },
       share_of_associates: 0,
       profit_before_tax: 0,
       tax: { lines: [], total: 0 },
-      corporate_tax_rate: 0.30,
+      corporate_tax_rate: 0.3,
       effective_tax_rate: 0,
       computed_tax: false,
       profit_after_tax: 0,
@@ -434,13 +522,13 @@ class PLStatementService {
       earnings_per_share: {
         weighted_avg_shares: 0,
         basic_eps: null,
-        diluted_eps: null
+        diluted_eps: null,
       },
       net_profit: 0,
       net_margin_pct: 0,
       is_profit: true,
       operating_expenses: { lines: [], total: 0 },
-      expenses: { lines: [], total: 0 }
+      expenses: { lines: [], total: 0 },
     };
   }
 }

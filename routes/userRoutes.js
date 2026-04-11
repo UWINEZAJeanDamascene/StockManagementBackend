@@ -8,14 +8,22 @@ const {
   deleteUser,
   getUserActionLogs,
   resetPassword,
-  toggleUserStatus
+  toggleUserStatus,
+  getProfile,
+  updateProfile
 } = require('../controllers/userController');
 const { inviteUser } = require('../controllers/userAuthController');
 const { protect, authorize } = require('../middleware/auth');
+const { uploadFor } = require('../middleware/upload');
 const logAction = require('../middleware/logAction');
 
 // All routes require authentication
 router.use(protect);
+
+// Current user profile routes (accessible to all authenticated users)
+router.get('/profile', getProfile);
+router.put('/profile', updateProfile);
+router.post('/profile/avatar', uploadFor('users').single('avatar'), updateProfile); // Will handle avatar upload
 
 // Admin only routes
 router.use(authorize('admin'));

@@ -48,6 +48,47 @@ const purchaseItemSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Decimal128,
     required: true,
     default: decimalDefault('0.00')
+  },
+
+  // Warehouse for this line item (if different from header warehouse)
+  warehouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Warehouse',
+    default: null
+  },
+
+  // Stock tracking fields
+  trackingType: {
+    type: String,
+    enum: ['none', 'batch', 'serial'],
+    default: 'none'
+  },
+  batchNo: String,
+  serialNumber: String,
+  manufactureDate: Date,
+  expiryDate: Date,
+  serialNumbers: [String], // For multiple serial numbers when quantity > 1
+
+  // Budget tracking
+  budgetId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Budget',
+    default: null
+  },
+  budget_line_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BudgetLine',
+    default: null
+  },
+  accountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccount',
+    default: null
+  },
+  encumbrance_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Encumbrance',
+    default: null
   }
 });
 
@@ -98,6 +139,13 @@ const purchaseSchema = new mongoose.Schema({
   // Invoice from supplier
   supplierInvoiceNumber: String,
   supplierInvoiceDate: Date,
+
+  // Warehouse for the purchase (default warehouse for all items)
+  warehouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Warehouse',
+    default: null
+  },
 
   // Status
   status: {
@@ -152,6 +200,23 @@ const purchaseSchema = new mongoose.Schema({
   // Stock tracking
   stockAdded: { type: Boolean, default: false },
 
+  // Budget tracking (for encumbrance)
+  budgetId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Budget',
+    default: null
+  },
+  budget_line_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BudgetLine',
+    default: null
+  },
+  accountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChartOfAccount',
+    default: null
+  },
+
   // User tracking
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   paidDate: Date,
@@ -159,7 +224,7 @@ const purchaseSchema = new mongoose.Schema({
   confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   cancelledDate: Date,
   cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  cancellationReason: String
+  cancellationReason: String,
 }, {
   timestamps: true
 });

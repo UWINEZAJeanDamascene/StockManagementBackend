@@ -7,6 +7,8 @@ const grnLineSchema = new mongoose.Schema({
   unitCost: { type: Number, default: 0, min: 0 },
   taxRate: { type: Number, default: 0, min: 0 },
   batchNo: { type: String },
+  manufactureDate: { type: Date, default: null },
+  expiryDate: { type: Date, default: null },
   serialNumbers: [{ type: String }]
 }, { _id: true });
 

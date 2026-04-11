@@ -171,10 +171,10 @@ const deliveryNoteSchema = new mongoose.Schema({
   lines: [deliveryNoteLineSchema],
   items: [deliveryNoteItemSchema], // Legacy alias
   
-  // Module 7: Status enum - draft, confirmed, cancelled
+  // Module 7: Status enum - draft, confirmed, dispatched, cancelled
   status: {
     type: String,
-    enum: ['draft', 'confirmed', 'cancelled'], // Module 7 spec
+    enum: ['draft', 'confirmed', 'dispatched', 'cancelled'], // Module 7 spec + dispatched for tracking
     default: 'draft'
   },
   

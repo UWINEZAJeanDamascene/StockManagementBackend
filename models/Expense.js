@@ -96,7 +96,28 @@ const expenseSchema = new mongoose.Schema({
   // Petty cash fund (required when payment_method = 'petty_cash')
   petty_cash_fund_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'PettyCashFund',
+    ref: 'PettyCashFloat',
+    default: null
+  },
+
+  // Budget reference (for budget tracking and encumbrances)
+  budget_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Budget',
+    default: null
+  },
+
+  // Budget line reference (specific budget line this expense encumbers)
+  budget_line_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BudgetLine',
+    default: null
+  },
+
+  // Linked encumbrance reference
+  encumbrance_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Encumbrance',
     default: null
   },
 

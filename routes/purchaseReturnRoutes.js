@@ -6,7 +6,8 @@ const {
   createPurchaseReturn, 
   updatePurchaseReturn,
   confirmPurchaseReturn,
-  getPurchaseReturnSummary
+  getPurchaseReturnSummary,
+  processRefund
 } = require('../controllers/purchaseReturnController');
 const { protect } = require('../middleware/auth');
 
@@ -25,5 +26,8 @@ router.route('/:id')
 
 router.route('/:id/confirm')
   .put(confirmPurchaseReturn);
+
+router.route('/:id/refund')
+  .post(processRefund);
 
 module.exports = router;

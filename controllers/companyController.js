@@ -100,7 +100,7 @@ exports.updateMyCompany = async (req, res) => {
       });
     }
 
-    const company = await CompanyService.update(companyId, req.body, req.user._id);
+    const company = await CompanyService.update(companyId, req.body, req.user._id);;
 
     res.json({
       success: true,
@@ -160,8 +160,14 @@ exports.uploadLogo = async (req, res) => {
       });
     }
 
-    // Expect logo URL in body (in production, this would handle file upload)
-    const { logo_url } = req.body;
+    // Accept either a provided `logo_url` or an uploaded file (multipart/form-data)
+    let logo_url = req.body.logo_url;
+    if (!logo_url && req.file) {
+      // Build a relative URL to the uploaded file
+      const urlPath = `/uploads/companies/${req.file.filename}`;
+      logo_url = urlPath;
+    }
+
     if (!logo_url) {
       return res.status(400).json({
         success: false,

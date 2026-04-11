@@ -1,9 +1,9 @@
-const mongoose = require('mongoose');
-const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
-const Company = require('../models/Company');
-const PLStatementService = require('./plStatementService');
+const mongoose = require("mongoose");
+const ChartOfAccount = require("../models/ChartOfAccount");
+const JournalEntry = require("../models/JournalEntry");
+const { aggregateWithTimeout } = require("../utils/mongoAggregation");
+const Company = require("../models/Company");
+const PLStatementService = require("./plStatementService");
 
 /**
  * Balance Sheet Service — IAS 1 Compliant Statement of Financial Position
@@ -37,33 +37,36 @@ const PLStatementService = require('./plStatementService');
  * Assets = Liabilities + Equity (must balance)
  */
 class BalanceSheetService {
-
   /**
    * Generate Balance Sheet report
    * @param {string} companyId - Company ID
    * @param {object} options - { asOfDate, comparativeDate }
    */
   static async generate(companyId, { asOfDate, comparativeDate }) {
-    if (!companyId) throw new Error('COMPANY_ID_REQUIRED');
-    if (!asOfDate) throw new Error('AS_OF_DATE_REQUIRED');
+    if (!companyId) throw new Error("COMPANY_ID_REQUIRED");
+    if (!asOfDate) throw new Error("AS_OF_DATE_REQUIRED");
 
     const company = await Company.findById(companyId).lean();
 
     const [currentPeriod, comparativePeriod] = await Promise.all([
       BalanceSheetService._buildPeriodData(companyId, asOfDate, company),
       comparativeDate
-        ? BalanceSheetService._buildPeriodData(companyId, comparativeDate, company)
-        : null
+        ? BalanceSheetService._buildPeriodData(
+            companyId,
+            comparativeDate,
+            company,
+          )
+        : null,
     ]);
 
     return {
       company_id: companyId,
-      company_name: company?.name || '',
+      company_name: company?.name || "",
       as_of_date: asOfDate,
       comparative_date: comparativeDate || null,
       current: currentPeriod,
       comparative: comparativePeriod,
-      generated_at: new Date()
+      generated_at: new Date(),
     };
   }
 
@@ -72,26 +75,28 @@ class BalanceSheetService {
    * @private
    */
   static async _buildPeriodData(companyId, asOfDate, company) {
+    // Interpret asOfDate as inclusive (end of day) so entries on that date are included
     const dateTo = new Date(asOfDate);
+    dateTo.setHours(23, 59, 59, 999);
 
     // Get all account balances up to asOfDate
     const accountBalances = await aggregateWithTimeout(JournalEntry, [
       {
         $match: {
           company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
+          status: "posted",
           reversed: { $ne: true },
-          date: { $lte: dateTo }
-        }
+          date: { $lte: dateTo },
+        },
       },
-      { $unwind: '$lines' },
+      { $unwind: "$lines" },
       {
         $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      }
+          _id: "$lines.accountCode",
+          total_dr: { $sum: "$lines.debit" },
+          total_cr: { $sum: "$lines.credit" },
+        },
+      },
     ]);
 
     if (accountBalances.length === 0) {
@@ -99,11 +104,11 @@ class BalanceSheetService {
     }
 
     // Get all balance sheet accounts
-    const accountCodes = accountBalances.map(b => b._id);
+    const accountCodes = accountBalances.map((b) => b._id);
     const accounts = await ChartOfAccount.find({
       code: { $in: accountCodes },
       company: new mongoose.Types.ObjectId(companyId),
-      type: { $in: ['asset', 'liability', 'equity'] }
+      type: { $in: ["asset", "liability", "equity"] },
     }).lean();
 
     const accountMap = {};
@@ -119,17 +124,71 @@ class BalanceSheetService {
     const currentLiabilityLines = [];
 
     for (const bal of accountBalances) {
-      const account = accountMap[bal._id];
-      if (!account) continue;
+      let account = accountMap[bal._id];
 
-      const dr = parseFloat(bal.total_dr?.toString() || '0');
-      const cr = parseFloat(bal.total_cr?.toString() || '0');
+      // If the Chart of Accounts entry is missing for this code, attempt a
+      // conservative fallback: infer account type from numeric code ranges.
+      // This helps when the COA hasn't been seeded for the company yet but
+      // journal entries exist (trial balance will still show amounts).
+      if (!account) {
+        const codeNum = Number(bal._id);
+        if (!Number.isNaN(codeNum)) {
+          // Infer common account classes by numeric ranges.
+          // Important: only include asset/liability/equity in the balance sheet.
+          let inferredType = null;
+          let inferredNormal = 'debit';
+
+          if (codeNum >= 1000 && codeNum < 2000) {
+            inferredType = 'asset';
+            inferredNormal = 'debit';
+          } else if (codeNum >= 2000 && codeNum < 3000) {
+            inferredType = 'liability';
+            inferredNormal = 'credit';
+          } else if (codeNum >= 3000 && codeNum < 4000) {
+            inferredType = 'equity';
+            inferredNormal = 'credit';
+          } else if (codeNum >= 4000 && codeNum < 5000) {
+            inferredType = 'revenue';
+            inferredNormal = 'credit';
+          } else if (codeNum >= 5000 && codeNum < 6000) {
+            inferredType = 'cogs';
+            inferredNormal = 'debit';
+          } else if (codeNum >= 6000 && codeNum < 7000) {
+            inferredType = 'expense';
+            inferredNormal = 'debit';
+          } else {
+            // Default to asset for unknown ranges
+            inferredType = 'asset';
+            inferredNormal = 'debit';
+          }
+
+          // Only include asset, liability or equity in the balance sheet.
+          if (!['asset', 'liability', 'equity'].includes(inferredType)) {
+            continue;
+          }
+
+          account = {
+            _id: null,
+            code: String(bal._id),
+            name: String(bal._id),
+            subtype: null,
+            type: inferredType,
+            normal_balance: inferredNormal,
+          };
+        } else {
+          // Can't infer a sensible account code; skip it
+          continue;
+        }
+      }
+
+      const dr = parseFloat(bal.total_dr?.toString() || "0");
+      const cr = parseFloat(bal.total_cr?.toString() || "0");
 
       // Apply normal balance direction
-      let amount = account.normal_balance === 'debit' ? dr - cr : cr - dr;
+      let amount = account.normal_balance === "debit" ? dr - cr : cr - dr;
 
       // Dividends Paid is debit-normal equity — negate for balance sheet (reduces equity)
-      if (account.subtype === 'dividends') {
+      if (account.subtype === "dividends") {
         amount = -Math.abs(amount);
       }
 
@@ -138,14 +197,14 @@ class BalanceSheetService {
         account_code: account.code,
         account_name: account.name,
         sub_type: account.subtype,
-        amount: Math.round(amount * 100) / 100
+        amount: Math.round(amount * 100) / 100,
       };
 
-      const subtype = account.subtype || '';
+      const subtype = account.subtype || "";
       const type = account.type;
 
       // ── Classification Logic (IAS 1) ──────────────────────────────
-      if (type === 'asset') {
+      if (type === "asset") {
         if (BalanceSheetService._isNonCurrentAsset(subtype)) {
           // Non-Current Assets: fixed, land
           nonCurrentAssetLines.push(line);
@@ -157,24 +216,31 @@ class BalanceSheetService {
           // Current Assets: cash, current, inventory, prepaid, ar, vat_input
           currentAssetLines.push(line);
         }
-      } else if (type === 'liability') {
+      } else if (type === "liability") {
         // VAT Input (2210) is liability type but debit-normal — it's a receivable, classify as current asset
-        if (subtype === 'vat_input' && account.normal_balance === 'debit') {
+        if (subtype === "vat_input" && account.normal_balance === "debit") {
           currentAssetLines.push(line);
-        } else if (subtype === 'non_current') {
+        } else if (subtype === "non_current") {
           // Non-Current Liabilities: long-term loans
           nonCurrentLiabilityLines.push(line);
         } else {
           // Current Liabilities: everything else (current, ap, tax payables, accruals)
           currentLiabilityLines.push(line);
         }
-      } else if (type === 'equity') {
-        equityLines.push(line);
+      } else if (type === "equity") {
+        // Exclude 3200 (Current Period Profit) — it is already injected into Retained
+        // Earnings below via PLStatementService, so including it here would double-count.
+        if (account.code !== "3200") {
+          equityLines.push(line);
+        }
       }
     }
 
     // Sort each section by account code
-    const sortFn = (a, b) => a.account_code.localeCompare(b.account_code, undefined, { numeric: true });
+    const sortFn = (a, b) =>
+      a.account_code.localeCompare(b.account_code, undefined, {
+        numeric: true,
+      });
     nonCurrentAssetLines.sort(sortFn);
     currentAssetLines.sort(sortFn);
     equityLines.sort(sortFn);
@@ -184,36 +250,43 @@ class BalanceSheetService {
     // Compute current period net profit from P&L
     const fiscalYearStart = BalanceSheetService._getFiscalYearStart(
       asOfDate,
-      company?.fiscal_year_start_month || 1
+      company?.fiscal_year_start_month || 1,
     );
 
     const plData = await PLStatementService._buildPeriodData(
       companyId,
-      fiscalYearStart.toISOString().split('T')[0],
-      asOfDate
+      fiscalYearStart.toISOString().split("T")[0],
+      asOfDate,
     );
     const currentPeriodNetProfit = plData.net_profit;
 
     // Add current period net profit to retained earnings display
-    const retainedEarningsLine = equityLines.find(l => l.sub_type === 'retained');
+    const retainedEarningsLine = equityLines.find(
+      (l) => l.sub_type === "retained",
+    );
     if (retainedEarningsLine) {
-      retainedEarningsLine.amount = Math.round(
-        (retainedEarningsLine.amount + currentPeriodNetProfit) * 100
-      ) / 100;
+      retainedEarningsLine.amount =
+        Math.round(
+          (retainedEarningsLine.amount + currentPeriodNetProfit) * 100,
+        ) / 100;
       retainedEarningsLine.includes_current_period_profit = true;
       retainedEarningsLine.current_period_net_profit = currentPeriodNetProfit;
     } else {
       // No retained earnings journal entries exist — create a synthetic line with P&L net profit
       equityLines.push({
         account_id: null,
-        account_code: '3100',
-        account_name: 'Retained Earnings',
-        sub_type: 'retained',
+        account_code: "3100",
+        account_name: "Retained Earnings",
+        sub_type: "retained",
         amount: Math.round(currentPeriodNetProfit * 100) / 100,
         includes_current_period_profit: true,
-        current_period_net_profit: currentPeriodNetProfit
+        current_period_net_profit: currentPeriodNetProfit,
       });
-      equityLines.sort((a, b) => a.account_code.localeCompare(b.account_code, undefined, { numeric: true }));
+      equityLines.sort((a, b) =>
+        a.account_code.localeCompare(b.account_code, undefined, {
+          numeric: true,
+        }),
+      );
     }
 
     // Compute section totals
@@ -227,7 +300,9 @@ class BalanceSheetService {
     const totalEquity = sumLines(equityLines);
     const totalNonCurrentLiabilities = sumLines(nonCurrentLiabilityLines);
     const totalCurrentLiabilities = sumLines(currentLiabilityLines);
-    const totalLiabilities = round(totalNonCurrentLiabilities + totalCurrentLiabilities);
+    const totalLiabilities = round(
+      totalNonCurrentLiabilities + totalCurrentLiabilities,
+    );
     const totalEquityAndLiabilities = round(totalEquity + totalLiabilities);
 
     const difference = Math.abs(totalAssets - totalEquityAndLiabilities);
@@ -237,13 +312,13 @@ class BalanceSheetService {
       // Non-Current Assets
       non_current_assets: {
         lines: nonCurrentAssetLines,
-        total: totalNonCurrentAssets
+        total: totalNonCurrentAssets,
       },
 
       // Current Assets
       current_assets: {
         lines: currentAssetLines,
-        total: totalCurrentAssets
+        total: totalCurrentAssets,
       },
 
       // Total Assets
@@ -252,19 +327,19 @@ class BalanceSheetService {
       // Equity
       equity: {
         lines: equityLines,
-        total: totalEquity
+        total: totalEquity,
       },
 
       // Non-Current Liabilities
       non_current_liabilities: {
         lines: nonCurrentLiabilityLines,
-        total: totalNonCurrentLiabilities
+        total: totalNonCurrentLiabilities,
       },
 
       // Current Liabilities
       current_liabilities: {
         lines: currentLiabilityLines,
-        total: totalCurrentLiabilities
+        total: totalCurrentLiabilities,
       },
 
       // Total Liabilities
@@ -278,7 +353,7 @@ class BalanceSheetService {
       difference: round(difference),
 
       // P&L integration
-      current_period_net_profit: round(currentPeriodNetProfit)
+      current_period_net_profit: round(currentPeriodNetProfit),
     };
   }
 
@@ -286,14 +361,14 @@ class BalanceSheetService {
    * Check if asset subtype is non-current
    */
   static _isNonCurrentAsset(subtype) {
-    return ['fixed', 'fixed_asset', 'non_current', 'land'].includes(subtype);
+    return ["fixed", "fixed_asset", "non_current", "land"].includes(subtype);
   }
 
   /**
    * Check if asset subtype is contra (accumulated depreciation)
    */
   static _isContraAsset(subtype) {
-    return ['contra', 'contra_asset'].includes(subtype);
+    return ["contra", "contra_asset"].includes(subtype);
   }
 
   /**
@@ -301,10 +376,13 @@ class BalanceSheetService {
    */
   static _getFiscalYearStart(asOfDate, fiscalYearStartMonth) {
     const date = new Date(asOfDate);
-    const year = date.getMonth() + 1 >= fiscalYearStartMonth
-      ? date.getFullYear()
-      : date.getFullYear() - 1;
-    return new Date(`${year}-${String(fiscalYearStartMonth).padStart(2, '0')}-01`);
+    const year =
+      date.getMonth() + 1 >= fiscalYearStartMonth
+        ? date.getFullYear()
+        : date.getFullYear() - 1;
+    return new Date(
+      `${year}-${String(fiscalYearStartMonth).padStart(2, "0")}-01`,
+    );
   }
 
   /**
@@ -323,7 +401,7 @@ class BalanceSheetService {
       total_equity_and_liabilities: 0,
       is_balanced: true,
       difference: 0,
-      current_period_net_profit: 0
+      current_period_net_profit: 0,
     };
   }
 }

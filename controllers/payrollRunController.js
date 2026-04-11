@@ -1,7 +1,23 @@
-const PayrollRunService = require('../services/payrollRunService');
-const PayrollRun = require('../models/PayrollRun');
-const Payroll = require('../models/Payroll');
-const { parsePagination, paginationMeta } = require('../utils/pagination');
+const PayrollRunService = require("../services/payrollRunService");
+const PayrollRun = require("../models/PayrollRun");
+const Payroll = require("../models/Payroll");
+const { parsePagination, paginationMeta } = require("../utils/pagination");
+
+// @desc    Get available periods (months with finalised, unprocessed payroll records)
+// @route   GET /api/payroll-runs/available-periods
+// @access  Private
+const getAvailablePeriods = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const periods = await PayrollRunService.getAvailablePeriods(companyId);
+    res.status(200).json({
+      success: true,
+      data: periods,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // @desc    Get all payroll runs for company
 // @route   GET /api/payroll-runs
@@ -22,10 +38,10 @@ const getPayrollRuns = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query);
     const total = await PayrollRun.countDocuments(filter);
     const payrollRuns = await PayrollRun.find(filter)
-      .populate('bank_account_id', 'name accountCode')
-      .populate('salary_account_id', 'name code')
-      .populate('tax_payable_account_id', 'name code')
-      .populate('posted_by', 'name')
+      .populate("bank_account_id", "name accountCode")
+      .populate("salary_account_id", "name code")
+      .populate("tax_payable_account_id", "name code")
+      .populate("posted_by", "name")
       .sort({ payment_date: -1 })
       .skip(skip)
       .limit(limit);
@@ -51,24 +67,24 @@ const getPayrollRunById = async (req, res, next) => {
 
     const payrollRun = await PayrollRun.findOne({
       _id: id,
-      company: companyId
+      company: companyId,
     })
-      .populate('bank_account_id', 'name accountCode')
-      .populate('salary_account_id', 'name code')
-      .populate('tax_payable_account_id', 'name code')
-      .populate('other_deductions_account_id', 'name code')
-      .populate('posted_by', 'name');
+      .populate("bank_account_id", "name accountCode")
+      .populate("salary_account_id", "name code")
+      .populate("tax_payable_account_id", "name code")
+      .populate("other_deductions_account_id", "name code")
+      .populate("posted_by", "name");
 
     if (!payrollRun) {
       return res.status(404).json({
         success: false,
-        message: 'Payroll run not found'
+        message: "Payroll run not found",
       });
     }
 
     res.status(200).json({
       success: true,
-      data: payrollRun
+      data: payrollRun,
     });
   } catch (error) {
     next(error);
@@ -83,11 +99,15 @@ const createPayrollRun = async (req, res, next) => {
     const companyId = req.user.company._id;
     const userId = req.user._id;
 
-    const payrollRun = await PayrollRunService.create(companyId, req.body, userId);
+    const payrollRun = await PayrollRunService.create(
+      companyId,
+      req.body,
+      userId,
+    );
 
     res.status(201).json({
       success: true,
-      data: payrollRun
+      data: payrollRun,
     });
   } catch (error) {
     next(error);
@@ -108,7 +128,7 @@ const postPayrollRun = async (req, res, next) => {
     res.status(200).json({
       success: true,
       data: payrollRun,
-      message: 'Payroll run posted successfully'
+      message: "Payroll run posted successfully",
     });
   } catch (error) {
     next(error);
@@ -129,13 +149,13 @@ const reversePayrollRun = async (req, res, next) => {
       companyId,
       id,
       { reason, reversal_date },
-      userId
+      userId,
     );
 
     res.status(200).json({
       success: true,
       data: payrollRun,
-      message: 'Payroll run reversed successfully'
+      message: "Payroll run reversed successfully",
     });
   } catch (error) {
     next(error);
@@ -152,20 +172,20 @@ const deletePayrollRun = async (req, res, next) => {
 
     const payrollRun = await PayrollRun.findOne({
       _id: id,
-      company: companyId
+      company: companyId,
     });
 
     if (!payrollRun) {
       return res.status(404).json({
         success: false,
-        message: 'Payroll run not found'
+        message: "Payroll run not found",
       });
     }
 
-    if (payrollRun.status !== 'draft') {
+    if (payrollRun.status !== "draft") {
       return res.status(400).json({
         success: false,
-        message: 'Can only delete draft payroll runs'
+        message: "Can only delete draft payroll runs",
       });
     }
 
@@ -173,7 +193,7 @@ const deletePayrollRun = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      message: 'Payroll run deleted'
+      message: "Payroll run deleted",
     });
   } catch (error) {
     next(error);
@@ -192,14 +212,14 @@ const previewPayrollRun = async (req, res, next) => {
       salary_account_id: req.query.salary_account_id,
       tax_payable_account_id: req.query.tax_payable_account_id,
       bank_account_id: req.query.bank_account_id,
-      other_deductions_account_id: req.query.other_deductions_account_id
+      other_deductions_account_id: req.query.other_deductions_account_id,
     };
 
     const preview = await PayrollRunService.preview(companyId, data);
 
     res.status(200).json({
       success: true,
-      data: preview
+      data: preview,
     });
   } catch (error) {
     next(error);
@@ -215,21 +235,37 @@ const createFromRecords = async (req, res, next) => {
     const userId = req.user._id;
 
     const data = {
-      pay_period_start: new Date(req.body.pay_period_start),
-      pay_period_end: new Date(req.body.pay_period_end),
+      pay_period_start: req.body.pay_period_start
+        ? new Date(req.body.pay_period_start)
+        : null,
+      pay_period_end: req.body.pay_period_end
+        ? new Date(req.body.pay_period_end)
+        : null,
       payment_date: new Date(req.body.payment_date),
+      // Pass explicit period selectors so the service does not have to derive
+      // period.month/year from the pay_period_start date (which is timezone-fragile).
+      period_month: req.body.period_month
+        ? parseInt(req.body.period_month, 10)
+        : undefined,
+      period_year: req.body.period_year
+        ? parseInt(req.body.period_year, 10)
+        : undefined,
       salary_account_id: req.body.salary_account_id,
       tax_payable_account_id: req.body.tax_payable_account_id,
       bank_account_id: req.body.bank_account_id,
       other_deductions_account_id: req.body.other_deductions_account_id,
-      notes: req.body.notes
+      notes: req.body.notes,
     };
 
-    const payrollRun = await PayrollRunService.createFromRecords(companyId, data, userId);
+    const payrollRun = await PayrollRunService.createFromRecords(
+      companyId,
+      data,
+      userId,
+    );
 
     res.status(201).json({
       success: true,
-      data: payrollRun
+      data: payrollRun,
     });
   } catch (error) {
     next(error);
@@ -244,5 +280,6 @@ module.exports = {
   reversePayrollRun,
   deletePayrollRun,
   previewPayrollRun,
-  createFromRecords
+  createFromRecords,
+  getAvailablePeriods,
 };

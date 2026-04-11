@@ -502,6 +502,7 @@ class TaxTransactionService {
       'invoice': 'invoice',
       'credit_note': 'credit_note',
       'purchase': 'purchase',
+      'purchase_order': 'purchase_order',
       'purchase_return': 'purchase_return',
       'expense': 'expense',
       'petty_cash_expense': 'petty_cash_expense',

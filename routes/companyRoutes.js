@@ -2,6 +2,7 @@ const express = require('express');
 const { body, param } = require('express-validator');
 const router = express.Router();
 const companyController = require('../controllers/companyController');
+const { uploadFor } = require('../middleware/upload');
 const { protect, authorize } = require('../middleware/auth');
 const { attachCompanyId } = require('../middleware/companyContext');
 const validateRequest = require('../middleware/validateRequest');
@@ -72,7 +73,7 @@ router.put(
   companyController.rejectCompany
 );
 
-router.post('/:id/logo', companyController.uploadLogo);
+router.post('/:id/logo', uploadFor('companies').single('logo'), companyController.uploadLogo);
 router.get('/:id/setup-status', companyController.getSetupStatus);
 router.post('/:id/setup/:step', companyController.markSetupStepComplete);
 

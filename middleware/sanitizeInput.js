@@ -23,7 +23,14 @@ function sanitize(obj) {
     const out = {};
     for (const [k, v] of Object.entries(obj)) {
       const newKey = sanitizeKey(k);
-      out[newKey] = sanitize(v);
+      // Skip sanitization for avatar/logo fields and data URLs to avoid
+      // corrupting base64 data URIs (e.g., "data:image/png;base64,...").
+      const lowerKey = String(newKey).toLowerCase();
+      if ((lowerKey === 'avatar' || lowerKey === 'logo' || lowerKey === 'logo_url' || lowerKey === 'avatar_url') && typeof v === 'string') {
+        out[newKey] = v; // store raw value
+      } else {
+        out[newKey] = sanitize(v);
+      }
     }
     return out;
   }
