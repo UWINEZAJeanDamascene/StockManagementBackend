@@ -3,12 +3,33 @@ const Client = require('../models/Client');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
+const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const mongoose = require('mongoose');
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
+const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+
+const sendDirectSaleEmail = async (invoice, companyId) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      return;
+    }
+
+    const company = await Company.findById(companyId);
+    const client = await Client.findById(invoice.client);
+    
+    const clientEmail = client?.contact?.email || client?.email;
+    if (clientEmail) {
+      await emailService.sendInvoiceEmail(invoice, company, client);
+    }
+  } catch (err) {
+    console.error('[Direct Sale Email] Failed:', err.message);
+  }
+};
 
 /**
  * @desc    Create a direct sales invoice (Legacy/Direct POS workflow)
@@ -494,6 +515,12 @@ exports.createDirectSale = async (req, res, next) => {
 
     // Populate response
     await invoice.populate('client lines.product createdBy');
+
+    // Send email notification
+    const sendEmailOnCreate = req.body.sendEmail || false;
+    if (sendEmailOnCreate) {
+      await sendDirectSaleEmail(invoice, companyId);
+    }
 
     res.status(201).json({
       success: true,

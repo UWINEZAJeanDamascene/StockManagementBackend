@@ -2,7 +2,28 @@ const SalesOrder = require('../models/SalesOrder');
 const Client = require('../models/Client');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
+const Company = require('../models/Company');
 const mongoose = require('mongoose');
+const emailService = require('../services/emailService');
+
+const sendSOEmail = async (so, action, companyId) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      console.log('[SO Email] Email notifications disabled');
+      return;
+    }
+
+    const company = await Company.findById(companyId);
+    const client = await Client.findById(so.client);
+    
+    if (client?.contact?.email || client?.email) {
+      await emailService.sendSalesOrderEmail(so, company, client, action);
+    }
+  } catch (err) {
+    console.error('[SO Email] Failed to send email:', err.message);
+  }
+};
 
 // Error codes
 const ERR_SALES_ORDER_NOT_FOUND = 'ERR_SALES_ORDER_NOT_FOUND';
@@ -170,6 +191,12 @@ exports.createSalesOrder = async (req, res, next) => {
     });
     
     await salesOrder.populate('client lines.product createdBy');
+    
+    // Send email notification if requested (creates as confirmed)
+    const sendEmailOnCreate = req.body.sendEmail || false;
+    if (sendEmailOnCreate) {
+      await sendSOEmail(salesOrder, 'created', companyId);
+    }
     
     res.status(201).json({
       success: true,
@@ -428,6 +455,12 @@ exports.confirmSalesOrder = async (req, res, next) => {
     // Fetch the updated document
     const finalSO = await SalesOrder.findById(salesOrder._id);
     
+    // Send email notification
+    const sendEmailOnConfirm = req.body.sendEmail || false;
+    if (sendEmailOnConfirm) {
+      await sendSOEmail(finalSO, 'confirmed', companyId);
+    }
+    
     res.status(200).json({
       success: true,
       message: 'Sales order confirmed successfully',
@@ -495,6 +528,12 @@ exports.cancelSalesOrder = async (req, res, next) => {
     salesOrder.cancellationReason = reason || 'Cancelled by user';
     
     await salesOrder.save();
+    
+    // Send email notification
+    const sendEmailOnCancel = req.body.sendEmail || false;
+    if (sendEmailOnCancel) {
+      await sendSOEmail(salesOrder, 'cancelled', companyId);
+    }
     
     res.status(200).json({
       success: true,

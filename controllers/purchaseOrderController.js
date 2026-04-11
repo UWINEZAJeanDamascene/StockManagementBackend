@@ -2,6 +2,28 @@ const PurchaseOrder = require('../models/PurchaseOrder');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const BudgetService = require('../services/budgetService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const emailService = require('../services/emailService');
+const Company = require('../models/Company');
+const Supplier = require('../models/Supplier');
+
+const sendPOEmail = async (po, action, companyId) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      console.log('[PO Email] Email notifications disabled');
+      return;
+    }
+
+    const company = await Company.findById(companyId);
+    const supplier = await Supplier.findById(po.supplier);
+    
+    if (supplier?.contact?.email || supplier?.email) {
+      await emailService.sendPurchaseOrderEmail(po, company, supplier, action);
+    }
+  } catch (err) {
+    console.error('[PO Email] Failed to send email:', err.message);
+  }
+};
 
 exports.createPurchaseOrder = async (req, res, next) => {
   try {
@@ -12,6 +34,12 @@ exports.createPurchaseOrder = async (req, res, next) => {
     payload.status = payload.status || 'draft';
 
     const po = await PurchaseOrder.create(payload);
+    
+    const sendEmailOnCreate = req.body.sendEmail || false;
+    if (sendEmailOnCreate && po.status !== 'draft') {
+      sendPOEmail(po, 'created', companyId);
+    }
+    
     res.status(201).json({ success: true, data: po });
   } catch (err) { next(err); }
 };
@@ -49,6 +77,12 @@ exports.approvePurchaseOrder = async (req, res, next) => {
     po.approvedBy = userId;
     po.approvedAt = new Date();
     await po.save();
+
+    // Send email notification for approved PO
+    const sendEmailOnApprove = req.body.sendEmail || false;
+    if (sendEmailOnApprove) {
+      sendPOEmail(po, 'approved', companyId);
+    }
 
     // Auto-create encumbrances for budget tracking
     const encumbranceIds = [];
@@ -141,6 +175,13 @@ exports.cancelPurchaseOrder = async (req, res, next) => {
 
     po.status = 'cancelled';
     await po.save();
+
+    // Send email notification for cancelled PO
+    const sendEmailOnCancel = req.body.sendEmail || false;
+    if (sendEmailOnCancel) {
+      sendPOEmail(po, 'cancelled', companyId);
+    }
+
     res.json({ success: true, data: po });
   } catch (err) { next(err); }
 };

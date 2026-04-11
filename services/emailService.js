@@ -425,6 +425,307 @@ const sendApprovalEmail = async (companyEmail, companyName, adminName) => {
   return sendEmail(companyEmail, subject, html);
 };
 
+// ============================================
+// PURCHASE ORDER NOTIFICATIONS
+// ============================================
+
+const sendPurchaseOrderEmail = async (po, company, supplier, action) => {
+  const supplierEmail = supplier?.contact?.email || supplier?.email;
+  if (!supplierEmail) {
+    console.warn('No supplier email found for PO:', po.referenceNo);
+    return false;
+  }
+
+  const actionText = {
+    created: 'Created',
+    approved: 'Approved',
+    cancelled: 'Cancelled'
+  }[action] || 'Updated';
+
+  const subject = `Purchase Order ${po.referenceNo} - ${actionText}`;
+
+  let itemsHtml = '';
+  if (po.lines && po.lines.length > 0) {
+    itemsHtml = po.lines.map(line => `
+      <tr>
+        <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(line.product?.name || 'Item')}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.qtyOrdered || 0}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${po.currencyCode || 'RF'} ${(line.unitCost || 0).toFixed(2)}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${po.currencyCode || 'RF'} ${((line.lineTotal) || 0).toFixed(2)}</td>
+      </tr>
+    `).join('');
+  }
+
+  const totalAmount = po.totalAmount || 0;
+  const currency = po.currencyCode || 'RF';
+
+  const statusColor = {
+    created: '#7c3aed',
+    approved: '#10b981',
+    cancelled: '#ef4444'
+  }[action] || '#7c3aed';
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">📦 Purchase Order ${actionText}</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <h2 style="color:#7c3aed; margin:0 0 5px;">${esc(po.referenceNo || '')}</h2>
+        <p style="color:#666; margin:5px 0;">Date: ${new Date(po.orderDate).toLocaleDateString()}</p>
+        <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+        <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+          <strong>Supplier:</strong><br/>${esc(supplier?.name || 'Supplier')}<br/>${esc(supplier?.contact?.address || '')}
+        </div>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+          <thead>
+            <tr style="background:#7c3aed; color:white;">
+              <th style="padding:12px; text-align:left;">Product</th>
+              <th style="padding:12px; text-align:center;">Qty</th>
+              <th style="padding:12px; text-align:right;">Unit Price</th>
+              <th style="padding:12px; text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        <div style="text-align:right; margin:20px 0;">
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
+        </div>
+        ${po.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(po.notes)}</div>` : ''}
+        <div style="text-align:center; margin-top:30px;">
+          <a href="${FRONTEND_URL}/purchase-orders/${po._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Purchase Order</a>
+        </div>
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(supplierEmail, subject, html);
+};
+
+const sendGRNReceivedEmail = async (grn, po, company, supplier) => {
+  const supplierEmail = supplier?.contact?.email || supplier?.email;
+  if (!supplierEmail) {
+    console.warn('No supplier email found for GRN:', grn.referenceNo);
+    return false;
+  }
+
+  const subject = `Goods Received Note ${grn.referenceNo} - Items Received`;
+
+  let itemsHtml = '';
+  if (grn.lines && grn.lines.length > 0) {
+    itemsHtml = grn.lines.map(line => `
+      <tr>
+        <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(line.product?.name || 'Item')}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.qtyReceived || 0}</td>
+      </tr>
+    `).join('');
+  }
+
+  const totalAmount = grn.totalAmount || 0;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:#10b981; padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">✅ Goods Received</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <h2 style="color:#10b981; margin:0 0 5px;">GRN: ${esc(grn.referenceNo || '')}</h2>
+        <p style="color:#666; margin:5px 0;">Received Date: ${new Date(grn.receivedDate).toLocaleDateString()}</p>
+        <p style="color:#666; margin:5px 0;">PO Reference: ${esc(po?.referenceNo || '')}</p>
+        <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+          <strong>Supplier:</strong><br/>${esc(supplier?.name || 'Supplier')}
+        </div>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+          <thead>
+            <tr style="background:#10b981; color:white;">
+              <th style="padding:12px; text-align:left;">Product</th>
+              <th style="padding:12px; text-align:center;">Qty Received</th>
+            </tr>
+          </thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        <div style="text-align:right; margin:20px 0;">
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#10b981;">Total Value: ${po?.currencyCode || 'RF'} ${totalAmount.toFixed(2)}</p>
+        </div>
+        <div style="text-align:center; margin-top:30px;">
+          <a href="${FRONTEND_URL}/goods-received-notes/${grn._id}" style="background:#10b981; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View GRN Details</a>
+        </div>
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(supplierEmail, subject, html);
+};
+
+// ============================================
+// SALES ORDER NOTIFICATIONS
+// ============================================
+
+const sendSalesOrderEmail = async (so, company, client, action) => {
+  const clientEmail = client?.contact?.email || client?.email;
+  if (!clientEmail) {
+    console.warn('No client email found for SO:', so.referenceNo);
+    return false;
+  }
+
+  const actionText = {
+    created: 'Created',
+    confirmed: 'Confirmed',
+    cancelled: 'Cancelled',
+    fulfilled: 'Fulfilled'
+  }[action] || 'Updated';
+
+  const subject = `Sales Order ${so.referenceNo} - ${actionText}`;
+
+  let itemsHtml = '';
+  if (so.lines && so.lines.length > 0) {
+    itemsHtml = so.lines.map(line => `
+      <tr>
+        <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(line.product?.name || line.description || 'Item')}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.qty || 0}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${so.currencyCode || 'USD'} ${(line.unitPrice || 0).toFixed(2)}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${so.currencyCode || 'USD'} ${((line.qty || 0) * (line.unitPrice || 0)).toFixed(2)}</td>
+      </tr>
+    `).join('');
+  }
+
+  const subtotal = so.subtotal || 0;
+  const taxAmount = so.taxAmount || 0;
+  const totalAmount = so.totalAmount || so.grandTotal || 0;
+  const currency = so.currencyCode || 'USD';
+
+  const statusColor = {
+    created: '#7c3aed',
+    confirmed: '#10b981',
+    cancelled: '#ef4444',
+    fulfilled: '#059669'
+  }[action] || '#7c3aed';
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">📋 Sales Order ${actionText}</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <h2 style="color:#7c3aed; margin:0 0 5px;">${esc(so.referenceNo || '')}</h2>
+        <p style="color:#666; margin:5px 0;">Date: ${new Date(so.orderDate).toLocaleDateString()}</p>
+        <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+        ${so.expectedDate ? `<p style="color:#666; margin:5px 0;">Expected Date: ${new Date(so.expectedDate).toLocaleDateString()}</p>` : ''}
+        <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+          <strong>Customer:</strong><br/>${esc(client?.name || 'Customer')}<br/>${esc(client?.address || '')}
+        </div>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+          <thead>
+            <tr style="background:#7c3aed; color:white;">
+              <th style="padding:12px; text-align:left;">Product</th>
+              <th style="padding:12px; text-align:center;">Qty</th>
+              <th style="padding:12px; text-align:right;">Unit Price</th>
+              <th style="padding:12px; text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        <div style="text-align:right; margin:20px 0;">
+          <p style="margin:5px 0;">Subtotal: ${currency} ${subtotal.toFixed(2)}</p>
+          <p style="margin:5px 0;">Tax: ${currency} ${taxAmount.toFixed(2)}</p>
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
+        </div>
+        ${so.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(so.notes)}</div>` : ''}
+        <div style="text-align:center; margin-top:30px;">
+          <a href="${FRONTEND_URL}/sales-orders/${so._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Sales Order</a>
+        </div>
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(clientEmail, subject, html);
+};
+
+// ============================================
+// PURCHASE (DIRECT/LEGACY) NOTIFICATIONS
+// ============================================
+
+const sendPurchaseEmail = async (purchase, company, supplier, action) => {
+  const supplierEmail = supplier?.contact?.email || supplier?.email;
+  if (!supplierEmail) {
+    console.warn('No supplier email found for Purchase:', purchase.purchaseNumber);
+    return false;
+  }
+
+  const actionText = {
+    created: 'Created',
+    received: 'Items Received',
+    paid: 'Payment Recorded',
+    cancelled: 'Cancelled'
+  }[action] || 'Updated';
+
+  const subject = `Purchase ${purchase.purchaseNumber} - ${actionText}`;
+
+  let itemsHtml = '';
+  if (purchase.items && purchase.items.length > 0) {
+    itemsHtml = purchase.items.map(item => `
+      <tr>
+        <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(item.product?.name || item.itemCode || 'Item')}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${item.quantity || 0}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${(item.unitCost || 0).toFixed(2)}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${(item.totalWithTax || 0).toFixed(2)}</td>
+      </tr>
+    `).join('');
+  }
+
+  const totalAmount = purchase.roundedAmount || purchase.totalAmount || 0;
+  const currency = purchase.currency || 'USD';
+
+  const statusColor = {
+    created: '#7c3aed',
+    received: '#10b981',
+    paid: '#059669',
+    cancelled: '#ef4444'
+  }[action] || '#7c3aed';
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">🛒 Purchase ${actionText}</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <h2 style="color:#7c3aed; margin:0 0 5px;">${esc(purchase.purchaseNumber || '')}</h2>
+        <p style="color:#666; margin:5px 0;">Date: ${new Date(purchase.purchaseDate).toLocaleDateString()}</p>
+        <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+        <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+          <strong>Supplier:</strong><br/>${esc(supplier?.name || 'Supplier')}<br/>${esc(supplier?.contact?.address || '')}
+        </div>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+          <thead>
+            <tr style="background:#7c3aed; color:white;">
+              <th style="padding:12px; text-align:left;">Product</th>
+              <th style="padding:12px; text-align:center;">Qty</th>
+              <th style="padding:12px; text-align:right;">Unit Cost</th>
+              <th style="padding:12px; text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        <div style="text-align:right; margin:20px 0;">
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
+          ${purchase.amountPaid ? `<p style="margin:5px 0; color:#10b981;">Paid: ${currency} ${purchase.amountPaid.toFixed(2)}</p>` : ''}
+          ${purchase.balance ? `<p style="margin:5px 0; color:#ef4444;">Balance: ${currency} ${purchase.balance.toFixed(2)}</p>` : ''}
+        </div>
+        ${purchase.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(purchase.notes)}</div>` : ''}
+        <div style="text-align:center; margin-top:30px;">
+          <a href="${FRONTEND_URL}/purchases/${purchase._id}" style="background:#7c3aed; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Purchase</a>
+        </div>
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(supplierEmail, subject, html);
+};
+
 const sendRejectionEmail = async (companyEmail, companyName, adminName, reason) => {
   const subject = 'Your Company Registration - StockManager';
 
@@ -560,5 +861,12 @@ module.exports = {
   sendWeeklySummaryEmail,
   // Company notifications
   sendApprovalEmail,
-  sendRejectionEmail
+  sendRejectionEmail,
+  // Purchase Order notifications
+  sendPurchaseOrderEmail,
+  sendGRNReceivedEmail,
+  // Sales Order notifications
+  sendSalesOrderEmail,
+  // Purchase (Direct/Legacy) notifications
+  sendPurchaseEmail
 };

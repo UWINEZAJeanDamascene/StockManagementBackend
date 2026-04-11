@@ -2,6 +2,7 @@ const Purchase = require("../models/Purchase");
 const Product = require("../models/Product");
 const Supplier = require("../models/Supplier");
 const StockMovement = require("../models/StockMovement");
+const Company = require("../models/Company");
 const PDFDocument = require("pdfkit");
 const {
   notifyStockReceived,
@@ -12,8 +13,28 @@ const cacheService = require("../services/cacheService");
 const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const JournalService = require("../services/journalService");
 const inventoryService = require("../services/inventoryService");
+const emailService = require("../services/emailService");
 const mongoose = require("mongoose");
 const { runInTransaction } = require("../services/transactionService");
+
+const sendPurchaseEmail = async (purchase, action, companyId) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      console.log('[Purchase Email] Email notifications disabled');
+      return;
+    }
+
+    const company = await Company.findById(companyId);
+    const supplier = await Supplier.findById(purchase.supplier);
+    
+    if (supplier?.contact?.email || supplier?.email) {
+      await emailService.sendPurchaseEmail(purchase, company, supplier, action);
+    }
+  } catch (err) {
+    console.error('[Purchase Email] Failed to send email:', err.message);
+  }
+};
 
 // @desc    Get all purchases
 // @route   GET /api/purchases
@@ -249,6 +270,12 @@ exports.createPurchase = async (req, res, next) => {
     } catch (journalError) {
       console.error("Error creating journal entry for purchase:", journalError);
       // Don't fail the purchase creation if journal entry fails
+    }
+
+    // Send email notification
+    const sendEmailOnCreate = req.body.sendEmail || false;
+    if (sendEmailOnCreate) {
+      await sendPurchaseEmail(purchase, 'created', companyId);
     }
 
     res.status(201).json({
@@ -562,6 +589,12 @@ exports.receivePurchase = async (req, res, next) => {
       console.error("Cache invalidation failed:", e);
     }
 
+    // Send email notification
+    const sendEmailOnReceive = req.body.sendEmail || false;
+    if (sendEmailOnReceive) {
+      await sendPurchaseEmail(purchase, 'received', companyId);
+    }
+
     res.json({
       success: true,
       message: "Purchase received and stock added",
@@ -872,6 +905,12 @@ exports.recordPayment = async (req, res, next) => {
       console.error("Cache invalidation failed:", e);
     }
 
+    // Send email notification
+    const sendEmailOnPayment = req.body.sendEmail || false;
+    if (sendEmailOnPayment) {
+      await sendPurchaseEmail(purchase, 'paid', companyId);
+    }
+
     res.json({
       success: true,
       message: "Payment recorded successfully",
@@ -972,6 +1011,12 @@ exports.cancelPurchase = async (req, res, next) => {
       await cacheService.invalidateByCompany(companyId, "report");
     } catch (e) {
       console.error("Cache invalidation failed:", e);
+    }
+
+    // Send email notification
+    const sendEmailOnCancel = req.body.sendEmail || false;
+    if (sendEmailOnCancel) {
+      await sendPurchaseEmail(purchase, 'cancelled', companyId);
     }
 
     res.json({

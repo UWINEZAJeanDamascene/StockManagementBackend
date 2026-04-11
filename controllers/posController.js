@@ -7,6 +7,24 @@ const mongoose = require('mongoose');
 const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const JournalService = require('../services/journalService');
+const emailService = require('../services/emailService');
+
+const sendPOSEmail = async (invoice, company, client, action = 'created') => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      console.log('[POS Email] Email notifications disabled');
+      return;
+    }
+
+    const clientEmail = client?.contact?.email || client?.email;
+    if (clientEmail) {
+      await emailService.sendInvoiceEmail(invoice, company, client);
+    }
+  } catch (err) {
+    console.error('[POS Email] Failed to send email:', err.message);
+  }
+};
 
 // Create a sale (POS) - supports split payments
 exports.createSale = async (req, res, next) => {
@@ -249,6 +267,12 @@ exports.createSale = async (req, res, next) => {
       }
     } catch (e) {
       console.warn('Failed to update client totals for POS sale', e.message);
+    }
+
+    // Send email notification
+    const sendEmailOnCreate = req.body.sendEmail || false;
+    if (sendEmailOnCreate) {
+      await sendPOSEmail(invoice, company, client, 'created');
     }
 
     res.status(201).json({ success: true, data: invoice });

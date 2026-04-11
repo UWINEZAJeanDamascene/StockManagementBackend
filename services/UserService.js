@@ -383,7 +383,10 @@ class UserService {
    * Request password reset (generate token)
    */
   static async requestPasswordReset(email) {
+    console.log('[PasswordReset] Request received for:', email);
+    
     const user = await User.findByEmail(email);
+    console.log('[PasswordReset] User found:', user ? user.email : 'not found');
     
     if (!user) {
       // Don't reveal if email exists
@@ -397,13 +400,33 @@ class UserService {
     user.passwordResetToken = resetToken;
     user.passwordResetExpires = resetExpires;
     await user.save();
+    console.log('[PasswordReset] Token saved for user:', user.email);
 
-    // In production, send email with reset link
-    // For now, return the token (for testing)
+    // Send password reset email
+    let emailSent = false;
+    try {
+      const config = require('../src/config/environment').getConfig();
+      console.log('[PasswordReset] Config check:', { emailNotif: config.features?.emailNotifications, gmailUser: !!config.email?.gmailUser });
+      
+      if (config.features?.emailNotifications && config.email?.gmailUser) {
+        const emailService = require('./emailService');
+        await emailService.sendPasswordResetEmail({
+          to: user.email,
+          name: user.name,
+          resetToken
+        });
+        emailSent = true;
+        console.log('[PasswordReset] Email sent successfully to:', user.email);
+      } else {
+        console.log('[PasswordReset] Email NOT sent - config check failed');
+      }
+    } catch (emailErr) {
+      console.error('[PasswordReset] Failed to send password reset email:', emailErr.message);
+    }
+
     return {
       success: true,
-      message: 'Password reset link sent',
-      resetToken // Remove in production
+      message: emailSent ? 'Password reset link sent to your email' : 'Password reset link sent (email delivery may be delayed)'
     };
   }
 

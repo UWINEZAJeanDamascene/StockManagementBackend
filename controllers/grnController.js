@@ -7,13 +7,34 @@ const StockSerialNumber = require("../models/StockSerialNumber");
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
 const Supplier = require("../models/Supplier");
+const Company = require("../models/Company");
 const JournalService = require("../services/journalService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const transactionService = require("../services/transactionService");
 const cacheService = require("../services/cacheService");
+const emailService = require("../services/emailService");
 const DEFAULT_ACCOUNTS =
   require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
 const StockLevel = require("../models/StockLevel");
+
+const sendGRNEmail = async (grn, po, companyId) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications) {
+      console.log('[GRN Email] Email notifications disabled');
+      return;
+    }
+
+    const company = await Company.findById(companyId);
+    const supplier = await Supplier.findById(grn.supplier);
+    
+    if (supplier?.contact?.email || supplier?.email) {
+      await emailService.sendGRNReceivedEmail(grn, po, company, supplier);
+    }
+  } catch (err) {
+    console.error('[GRN Email] Failed to send email:', err.message);
+  }
+};
 
 // Create GRN (simple create against approved PO)
 exports.createGRN = async (req, res, next) => {
@@ -664,6 +685,15 @@ exports.confirmGRN = async (req, res, next) => {
     } catch (e) {
       console.error("Cache bump after GRN confirm failed:", e);
     }
+
+    // Send email notification for confirmed GRN
+    const sendEmailOnConfirm = req.body.sendEmail || false;
+    if (sendEmailOnConfirm) {
+      const grnData = await GoodsReceivedNote.findById(result._id).populate('purchaseOrder');
+      const poData = await PurchaseOrder.findById(grnData.purchaseOrder);
+      sendGRNEmail(grnData, poData, companyId);
+    }
+
     res.json({
       success: true,
       message: "GRN confirmed",
