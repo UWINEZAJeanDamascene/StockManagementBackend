@@ -6,6 +6,7 @@ const {
   testEmail,
   testSMS,
   sendManualSummary,
+  sendManualPaymentReminder,
   getNotifications,
   getUnreadCount,
   markAsRead,
@@ -27,6 +28,9 @@ router.post('/test-sms', authorize('admin'), testSMS);
 
 // Manual summary
 router.post('/send-summary', authorize('admin'), sendManualSummary);
+
+// Manual payment reminder
+router.post('/send-payment-reminder', authorize('admin'), sendManualPaymentReminder);
 
 // Unread count
 router.get('/unread-count', getUnreadCount);

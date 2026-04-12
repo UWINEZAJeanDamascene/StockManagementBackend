@@ -56,7 +56,7 @@ const userSchema = new mongoose.Schema({
   role: {
     // Legacy single-role kept for backward compatibility. Prefer `roles` array of Role refs.
     type: String,
-    enum: ['platform_admin', 'admin', 'stock_manager', 'sales', 'viewer', 'accountant', 'manager', 'purchaser', 'warehouse_manager'],
+    enum: ['platform_admin', 'admin', 'editor', 'stock_manager', 'sales', 'viewer', 'accountant', 'manager', 'purchaser', 'warehouse_manager'],
     default: 'viewer'
   },
   roles: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Role' }],

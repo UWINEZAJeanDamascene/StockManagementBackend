@@ -2,7 +2,9 @@ const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const Client = require('../models/Client');
+const Company = require('../models/Company');
 const PDFDocument = require('pdfkit');
+const emailService = require('../services/emailService');
 const {
   notifyQuotationCreated,
   notifyQuotationApproved,
@@ -16,6 +18,81 @@ const ERR_QUOTATION_REJECTED = 'QUOTATION_REJECTED';
 const ERR_QUOTATION_ALREADY_CONVERTED = 'QUOTATION_ALREADY_CONVERTED';
 const ERR_INVALID_STATUS_TRANSITION = 'INVALID_STATUS_TRANSITION';
 const ERR_INACTIVE_PRODUCT = 'INACTIVE_PRODUCT';
+
+const sendQuotationEmail = async (quotation, company, action) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
+      return;
+    }
+
+    const client = await Client.findById(quotation.client);
+    const clientEmail = client?.contact?.email || client?.email;
+    if (!clientEmail) {
+      console.warn('[Quotation] No client email found');
+      return;
+    }
+
+    const qWithProducts = await Quotation.findById(quotation._id).populate('lines.product', 'name');
+
+    const actionText = { sent: 'Sent', accepted: 'Accepted', rejected: 'Rejected', expired: 'Expired' }[action] || 'Updated';
+    const subject = `Quotation ${qWithProducts.quotationNumber || qWithProducts.referenceNo} - ${actionText}`;
+
+    const lines = qWithProducts.lines || [];
+    let itemsHtml = '';
+    if (lines.length > 0) {
+      itemsHtml = lines.map(line => `
+        <tr>
+          <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.productName || 'Item'}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.quantity || 0}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${quotation.currencyCode || 'USD'} ${(line.unitPrice || 0).toFixed(2)}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${quotation.currencyCode || 'USD'} ${(line.lineTotal || 0).toFixed(2)}</td>
+        </tr>
+      `).join('');
+    }
+
+    const statusColor = action === 'accepted' ? '#10b981' : action === 'rejected' ? '#ef4444' : action === 'expired' ? '#f59e0b' : '#7c3aed';
+
+    const html = `
+      <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+        <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
+          <h1 style="color:white; margin:0; text-align:center;">📄 Quotation ${actionText}</h1>
+        </div>
+        <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+          <h2 style="color:${statusColor}; margin:0 0 5px;">${qWithProducts.quotationNumber || qWithProducts.referenceNo || ''}</h2>
+          <p style="color:#666; margin:5px 0;">Date: ${new Date(qWithProducts.quotationDate || qWithProducts.createdAt).toLocaleDateString()}</p>
+          <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+            <strong>Customer:</strong><br/>${client?.name || 'Customer'}
+          </div>
+          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+            <thead>
+              <tr style="background:${statusColor}; color:white;">
+                <th style="padding:12px; text-align:left;">Product</th>
+                <th style="padding:12px; text-align:center;">Qty</th>
+                <th style="padding:12px; text-align:right;">Unit Price</th>
+                <th style="padding:12px; text-align:right;">Total</th>
+              </tr>
+            </thead>
+            <tbody>${itemsHtml}</tbody>
+          </table>
+          <div style="text-align:right; margin:20px 0;">
+            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:${statusColor};">Total: ${quotation.currencyCode || 'USD'} ${(qWithProducts.totalAmount || qWithProducts.grandTotal || 0).toFixed(2)}</p>
+          </div>
+          ${qWithProducts.validUntil ? `<p style="color:#666;">Valid until: ${new Date(qWithProducts.validUntil).toLocaleDateString()}</p>` : ''}
+          <div style="text-align:center; margin-top:30px;">
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/quotations/${quotation._id}" style="background:${statusColor}; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Quotation</a>
+          </div>
+          <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+          <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+        </div>
+      </div>`;
+
+    await emailService.sendEmail(clientEmail, subject, html);
+  } catch (err) {
+    console.error('[Quotation] Email failed:', err.message);
+  }
+};
 
 // @desc    Validate products on quotation (check is_active)
 // @access  Private
@@ -364,6 +441,12 @@ exports.sendQuotation = async (req, res, next) => {
     quotation.status = 'sent';
     await quotation.save();
 
+    // Send email notification
+    if (req.body.sendEmail) {
+      const company = await Company.findById(companyId);
+      await sendQuotationEmail(quotation, company, 'sent');
+    }
+
     res.json({
       success: true,
       message: 'Quotation sent successfully',
@@ -416,6 +499,12 @@ exports.acceptQuotation = async (req, res, next) => {
 
     await quotation.save();
 
+    // Send email notification
+    if (req.body.sendEmail) {
+      const company = await Company.findById(companyId);
+      await sendQuotationEmail(quotation, company, 'accepted');
+    }
+
     res.json({
       success: true,
       message: 'Quotation accepted successfully',
@@ -459,6 +548,12 @@ exports.rejectQuotation = async (req, res, next) => {
 
     quotation.status = 'rejected';
     await quotation.save();
+
+    // Send email notification
+    if (req.body.sendEmail) {
+      const company = await Company.findById(companyId);
+      await sendQuotationEmail(quotation, company, 'rejected');
+    }
 
     res.json({
       success: true,

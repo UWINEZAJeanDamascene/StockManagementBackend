@@ -3,9 +3,82 @@ const Invoice = require("../models/Invoice");
 const Product = require("../models/Product");
 const StockMovement = require("../models/StockMovement");
 const Client = require("../models/Client");
+const Company = require("../models/Company");
 const SerialNumber = require("../models/SerialNumber");
 const JournalService = require("../services/journalService");
 const TaxAutomationService = require("../services/taxAutomationService");
+const emailService = require("../services/emailService");
+
+const sendCreditNoteEmail = async (note, company, client, action) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
+      return;
+    }
+
+    const clientEmail = client?.contact?.email || client?.email;
+    if (!clientEmail) {
+      console.warn('[CreditNote] No client email found');
+      return;
+    }
+
+    const noteWithProducts = await CreditNote.findById(note._id).populate('lines.product', 'name').populate('items.product', 'name');
+
+    const actionText = { created: 'Created', confirmed: 'Confirmed', approved: 'Approved', refunded: 'Refunded' }[action] || 'Updated';
+    const subject = `Credit Note ${note.creditNoteNumber || note.referenceNo} - ${actionText}`;
+
+    const lines = noteWithProducts.lines || noteWithProducts.items || [];
+    let itemsHtml = '';
+    if (lines.length > 0) {
+      itemsHtml = lines.map(line => `
+        <tr>
+          <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.productName || line.description || 'Item'}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.quantity || 0}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${note.currencyCode || 'USD'} ${(line.unitPrice || 0).toFixed(2)}</td>
+        </tr>
+      `).join('');
+    }
+
+    const html = `
+      <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+        <div style="background:#f59e0b; padding:30px; border-radius:10px 10px 0 0;">
+          <h1 style="color:white; margin:0; text-align:center;">📝 Credit Note ${actionText}</h1>
+        </div>
+        <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+          <h2 style="color:#f59e0b; margin:0 0 5px;">${note.creditNoteNumber || note.referenceNo || ''}</h2>
+          <p style="color:#666; margin:5px 0;">Date: ${new Date(note.creditDate || note.createdAt).toLocaleDateString()}</p>
+          <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+          <p style="color:#666; margin:5px 0;">Type: <strong>${note.type === 'goods_return' ? 'Goods Return' : note.type || 'Credit Note'}</strong></p>
+          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+            <strong>Customer:</strong><br/>${client?.name || 'Customer'}
+          </div>
+          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+            <thead>
+              <tr style="background:#f59e0b; color:white;">
+                <th style="padding:12px; text-align:left;">Product</th>
+                <th style="padding:12px; text-align:center;">Qty</th>
+                <th style="padding:12px; text-align:right;">Unit Price</th>
+              </tr>
+            </thead>
+            <tbody>${itemsHtml}</tbody>
+          </table>
+          <div style="text-align:right; margin:20px 0;">
+            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#f59e0b;">Total: ${note.currencyCode || 'USD'} ${(note.totalAmount || note.grandTotal || 0).toFixed(2)}</p>
+          </div>
+          ${note.reason ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Reason:</strong><br/>${note.reason}</div>` : ''}
+          <div style="text-align:center; margin-top:30px;">
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/credit-notes/${note._id}" style="background:#f59e0b; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Credit Note</a>
+          </div>
+          <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+          <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+        </div>
+      </div>`;
+
+    await emailService.sendEmail(clientEmail, subject, html);
+  } catch (err) {
+    console.error('[CreditNote] Email failed:', err.message);
+  }
+};
 
 // List credit notes
 exports.getCreditNotes = async (req, res, next) => {
@@ -285,6 +358,13 @@ exports.createCreditNote = async (req, res, next) => {
       }
     } catch (e) {
       console.error("Error ensuring credit note totals persisted:", e);
+    }
+
+    // Send email notification for create
+    if (req.body.sendEmail && note.status !== 'draft') {
+      const company = await Company.findById(companyId);
+      const client = await Client.findById(note.client);
+      await sendCreditNoteEmail(note, company, client, 'created');
     }
 
     res.status(201).json({ success: true, data: note });
@@ -1346,6 +1426,13 @@ exports.confirmCreditNote = async (req, res, next) => {
     await creditNote.populate(
       "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",
     );
+
+    // Send email notification for confirm
+    if (req.body.sendEmail) {
+      const company = await Company.findById(companyId);
+      const client = await Client.findById(creditNote.client);
+      await sendCreditNoteEmail(creditNote, company, client, 'confirmed');
+    }
 
     console.log("DEBUG: Sending response with status:", creditNote.status);
     res.json({

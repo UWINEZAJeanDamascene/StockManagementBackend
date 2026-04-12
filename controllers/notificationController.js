@@ -1,6 +1,9 @@
 const NotificationSettings = require('../models/NotificationSettings');
 const Notification = require('../models/Notification');
 const smsService = require('../services/smsService');
+const emailService = require('../services/emailService');
+const Invoice = require('../models/Invoice');
+const Company = require('../models/Company');
 
 // @desc    Get all notifications for user
 // @route   GET /api/notifications
@@ -421,6 +424,60 @@ exports.sendManualSummary = async (req, res, next) => {
         message: 'Failed to send summary report'
       });
     }
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Send manual payment reminder for an invoice
+// @route   POST /api/notifications/send-payment-reminder
+// @access  Private (admin)
+exports.sendManualPaymentReminder = async (req, res, next) => {
+  try {
+    const { invoiceId } = req.body;
+    const companyId = req.user.company._id;
+
+    if (!invoiceId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invoice ID is required'
+      });
+    }
+
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      company: companyId
+    }).populate('client company');
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
+      });
+    }
+
+    const clientEmail = invoice.client?.contact?.email || invoice.client?.email;
+    if (!clientEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'Client email not found'
+      });
+    }
+
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
+      return res.status(500).json({
+        success: false,
+        message: 'Email notifications not configured'
+      });
+    }
+
+    await emailService.sendPaymentReminderEmail(invoice, invoice.company, invoice.client);
+
+    res.json({
+      success: true,
+      message: `Payment reminder sent to ${clientEmail}`
+    });
   } catch (error) {
     next(error);
   }

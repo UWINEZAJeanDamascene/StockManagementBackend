@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Company = require('../models/Company');
 const Role = require('../models/Role');
+const User = require('../models/User');
 const AuditLogService = require('./AuditLogService');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
@@ -182,6 +183,27 @@ class CompanyService {
       changes: { approvalStatus: 'approved' }
     });
 
+    // Send approval email
+    try {
+      const config = require('../src/config/environment').getConfig();
+      console.log('[CompanyApproval] Checking config:', { emailNotif: config.features?.emailNotifications, gmailUser: !!config.email?.gmailUser });
+      if (config.features?.emailNotifications && config.email?.gmailUser) {
+        const emailService = require('./emailService');
+        const adminUser = await User.findOne({ company: companyId, role: 'admin' });
+        console.log('[CompanyApproval] Sending to:', company.email, 'Admin:', adminUser?.name);
+        await emailService.sendApprovalEmail(
+          company.email,
+          company.name,
+          adminUser?.name || 'Administrator'
+        );
+        console.log('[CompanyApproval] Approval email sent to:', company.email);
+      } else {
+        console.log('[CompanyApproval] Email NOT sent - config check failed');
+      }
+    } catch (emailErr) {
+      console.error('[CompanyApproval] Failed to send approval email:', emailErr.message);
+    }
+
     return company;
   }
 
@@ -204,6 +226,24 @@ class CompanyService {
       entityId: company._id,
       changes: { approvalStatus: 'rejected', reason: company.registration_rejection_reason }
     });
+
+    // Send rejection email
+    try {
+      const config = require('../src/config/environment').getConfig();
+      if (config.features?.emailNotifications && config.email?.gmailUser) {
+        const emailService = require('./emailService');
+        const adminUser = await User.findOne({ company: companyId, role: 'admin' });
+        await emailService.sendRejectionEmail(
+          company.email,
+          company.name,
+          adminUser?.name || 'Administrator',
+          reason
+        );
+        console.log('[CompanyRejection] Rejection email sent to:', company.email);
+      }
+    } catch (emailErr) {
+      console.error('[CompanyRejection] Failed to send rejection email:', emailErr.message);
+    }
 
     return company;
   }

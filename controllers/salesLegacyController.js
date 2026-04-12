@@ -24,7 +24,9 @@ const sendDirectSaleEmail = async (invoice, companyId) => {
     
     const clientEmail = client?.contact?.email || client?.email;
     if (clientEmail) {
-      await emailService.sendInvoiceEmail(invoice, company, client);
+      // Populate product data for email
+      const invoiceWithProducts = await Invoice.findById(invoice._id).populate('items.product', 'name');
+      await emailService.sendInvoiceEmail(invoiceWithProducts, company, client);
     }
   } catch (err) {
     console.error('[Direct Sale Email] Failed:', err.message);

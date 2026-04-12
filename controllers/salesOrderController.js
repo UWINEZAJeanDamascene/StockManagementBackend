@@ -17,8 +17,11 @@ const sendSOEmail = async (so, action, companyId) => {
     const company = await Company.findById(companyId);
     const client = await Client.findById(so.client);
     
+    // Populate product data for email
+    const soWithProducts = await SalesOrder.findById(so._id).populate('lines.product', 'name');
+    
     if (client?.contact?.email || client?.email) {
-      await emailService.sendSalesOrderEmail(so, company, client, action);
+      await emailService.sendSalesOrderEmail(soWithProducts, company, client, action);
     }
   } catch (err) {
     console.error('[SO Email] Failed to send email:', err.message);

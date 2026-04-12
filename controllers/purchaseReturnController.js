@@ -4,11 +4,94 @@ const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const InventoryBatch = require('../models/InventoryBatch');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
+const Supplier = require('../models/Supplier');
+const Company = require('../models/Company');
 const JournalService = require('../services/journalService');
 const transactionService = require('../services/transactionService');
 const PurchaseOrder = require('../models/PurchaseOrder');
+const emailService = require('../services/emailService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+
+const sendPurchaseReturnEmail = async (pr, company, supplier, action) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
+      return;
+    }
+
+    const supplierEmail = supplier?.contact?.email || supplier?.email;
+    if (!supplierEmail) {
+      console.warn('[PurchaseReturn] No supplier email found');
+      return;
+    }
+
+    // Populate product data for email
+    const Product = require('../models/Product');
+    let populatedLines = pr.lines || [];
+    if (populatedLines.length > 0 && !populatedLines[0].product?.name) {
+      populatedLines = await Promise.all(populatedLines.map(async (line) => {
+        if (line.product && typeof line.product === 'string') {
+          const product = await Product.findById(line.product);
+          return { ...line, product };
+        }
+        return line;
+      }));
+    }
+
+    const actionText = { created: 'Created', confirmed: 'Confirmed', refunded: 'Refunded', cancelled: 'Cancelled' }[action] || 'Updated';
+    const subject = `Purchase Return ${pr.referenceNo || pr.returnNumber} - ${actionText}`;
+
+    let itemsHtml = '';
+    if (populatedLines.length > 0) {
+      itemsHtml = populatedLines.map(line => `
+        <tr>
+          <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.description || line.product || 'Item'}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.qtyReturned || 0}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${pr.currencyCode || 'USD'} ${(line.unitCost || 0).toFixed(2)}</td>
+        </tr>
+      `).join('');
+    }
+
+    const html = `
+      <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+        <div style="background:#ef4444; padding:30px; border-radius:10px 10px 0 0;">
+          <h1 style="color:white; margin:0; text-align:center;">↩️ Purchase Return ${actionText}</h1>
+        </div>
+        <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+          <h2 style="color:#ef4444; margin:0 0 5px;">${pr.referenceNo || pr.returnNumber || ''}</h2>
+          <p style="color:#666; margin:5px 0;">Date: ${new Date(pr.returnDate || pr.createdAt).toLocaleDateString()}</p>
+          <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+            <strong>Supplier:</strong><br/>${supplier?.name || 'Supplier'}
+          </div>
+          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+            <thead>
+              <tr style="background:#ef4444; color:white;">
+                <th style="padding:12px; text-align:left;">Product</th>
+                <th style="padding:12px; text-align:center;">Qty</th>
+                <th style="padding:12px; text-align:right;">Unit Cost</th>
+              </tr>
+            </thead>
+            <tbody>${itemsHtml}</tbody>
+          </table>
+          <div style="text-align:right; margin:20px 0;">
+            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#ef4444;">Total: ${pr.currencyCode || 'USD'} ${(pr.totalAmount || 0).toFixed(2)}</p>
+          </div>
+          ${pr.reason ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Reason:</strong><br/>${pr.reason}</div>` : ''}
+          <div style="text-align:center; margin-top:30px;">
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/purchase-returns/${pr._id}" style="background:#ef4444; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Return</a>
+          </div>
+          <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+          <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+        </div>
+      </div>`;
+
+    await emailService.sendEmail(supplierEmail, subject, html);
+  } catch (err) {
+    console.error('[PurchaseReturn] Email failed:', err.message);
+  }
+};
 
 exports.createPurchaseReturn = async (req, res, next) => {
   try {
@@ -34,6 +117,14 @@ exports.createPurchaseReturn = async (req, res, next) => {
       pr.subtotal = subtotal;
       pr.totalAmount = subtotal;
       await pr.save();
+    }
+
+    // Send email notification
+    if (req.body.sendEmail && pr.status !== 'draft') {
+      const company = await Company.findById(companyId);
+      const grn = await GoodsReceivedNote.findById(pr.grn);
+      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      await sendPurchaseReturnEmail(pr, company, supplier, 'created');
     }
 
     res.status(201).json({ success: true, data: pr });
@@ -229,6 +320,16 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
 
   try {
     const result = await transactionService.runInTransaction(async (trx) => await doConfirm(trx));
+    
+    // Send email notification
+    if (req.body.sendEmail) {
+      const confirmedPR = await PurchaseReturn.findById(result._id).populate('grn');
+      const company = await Company.findById(companyId);
+      const grn = await GoodsReceivedNote.findById(confirmedPR.grn);
+      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      await sendPurchaseReturnEmail(confirmedPR, company, supplier, 'confirmed');
+    }
+    
     res.json({ success: true, message: 'Purchase return confirmed', data: await PurchaseReturn.findById(result._id) });
   } catch (err) {
     if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });
@@ -401,6 +502,14 @@ exports.processRefund = async (req, res, next) => {
 
     pr.refundedAt = new Date();
     await pr.save();
+
+    // Send email notification for refund
+    if (req.body.sendEmail) {
+      const company = await Company.findById(companyId);
+      const grn = await GoodsReceivedNote.findById(pr.grn);
+      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      await sendPurchaseReturnEmail(pr, company, supplier, 'refunded');
+    }
 
     res.json({ success: true, message: 'Refund processed successfully', data: pr });
   } catch (err) { next(err); }

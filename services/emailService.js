@@ -839,6 +839,37 @@ const sendWeeklySummaryEmail = async (company, stats) => {
 };
 
 // ============================================
+// USER INVITATION
+// ============================================
+
+const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, role }) => {
+  const subject = `You've been invited to join ${companyName} on StockManager`;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6); padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">👋 You're Invited!</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <p>Hi <strong>${esc(name)}</strong>,</p>
+        <p><strong>${inviterName}</strong> has invited you to join <strong>${esc(companyName)}</strong> on StockManager.</p>
+        <div style="background:white; padding:20px; border-radius:8px; margin:20px 0;">
+          <p style="margin:8px 0;"><strong>Your Role:</strong> ${role || 'Viewer'}</p>
+        </div>
+        <p>StockManager helps businesses manage their inventory, sales, purchases, and accounting all in one place.</p>
+        <div style="text-align:center; margin:30px 0;">
+          <a href="${FRONTEND_URL}/login" style="background:#6366f1; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Login to StockManager</a>
+        </div>
+        <p style="color:#888; font-size:12px;">If you already have an account, you can access the company from your dashboard after logging in.</p>
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(to, subject, html);
+};
+
+// ============================================
 // EXPORTS
 // ============================================
 
@@ -868,5 +899,7 @@ module.exports = {
   // Sales Order notifications
   sendSalesOrderEmail,
   // Purchase (Direct/Legacy) notifications
-  sendPurchaseEmail
+  sendPurchaseEmail,
+  // User Invitation
+  sendUserInvitationEmail
 };

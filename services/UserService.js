@@ -286,6 +286,25 @@ class UserService {
       console.error('Failed to send notification:', e);
     }
 
+    // Send invitation email
+    try {
+      const config = require('../src/config/environment').getConfig();
+      if (config.features?.emailNotifications && config.email?.gmailUser) {
+        const emailService = require('./emailService');
+        const company = await Company.findById(companyId);
+        await emailService.sendUserInvitationEmail({
+          to: user.email,
+          name: user.name,
+          companyName: company?.name || 'the company',
+          inviterName: inviter?.name || 'Admin',
+          role
+        });
+        console.log('[UserInvite] Invitation email sent to:', user.email);
+      }
+    } catch (emailErr) {
+      console.error('[UserInvite] Failed to send invitation email:', emailErr.message);
+    }
+
     return {
       user: user.toJSON(),
       isNewUser,

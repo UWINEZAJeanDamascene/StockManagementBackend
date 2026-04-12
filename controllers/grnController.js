@@ -28,8 +28,11 @@ const sendGRNEmail = async (grn, po, companyId) => {
     const company = await Company.findById(companyId);
     const supplier = await Supplier.findById(grn.supplier);
     
+    // Populate product data for email
+    const grnWithProducts = await GoodsReceivedNote.findById(grn._id).populate('lines.product', 'name');
+    
     if (supplier?.contact?.email || supplier?.email) {
-      await emailService.sendGRNReceivedEmail(grn, po, company, supplier);
+      await emailService.sendGRNReceivedEmail(grnWithProducts, po, company, supplier);
     }
   } catch (err) {
     console.error('[GRN Email] Failed to send email:', err.message);

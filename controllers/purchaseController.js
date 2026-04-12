@@ -28,8 +28,11 @@ const sendPurchaseEmail = async (purchase, action, companyId) => {
     const company = await Company.findById(companyId);
     const supplier = await Supplier.findById(purchase.supplier);
     
+    // Populate product data for email
+    const purchaseWithProducts = await Purchase.findById(purchase._id).populate('items.product', 'name');
+    
     if (supplier?.contact?.email || supplier?.email) {
-      await emailService.sendPurchaseEmail(purchase, company, supplier, action);
+      await emailService.sendPurchaseEmail(purchaseWithProducts, company, supplier, action);
     }
   } catch (err) {
     console.error('[Purchase Email] Failed to send email:', err.message);
@@ -669,11 +672,10 @@ exports.recordPayment = async (req, res, next) => {
       });
 
       if (bankAccount) {
-        const availableBalance =
-          await BankAccount.computeBalanceFromTransactions(
-            bankAccount._id,
-            bankAccount.openingBalance,
-          );
+        // Use getBalance method which computes from journal entries per spec 3.3
+        const JournalEntry = require('../models/JournalEntry');
+        const balanceResult = await bankAccount.getBalance(JournalEntry);
+        const availableBalance = balanceResult.balance;
         if (availableBalance < amount) {
           return res.status(400).json({
             success: false,

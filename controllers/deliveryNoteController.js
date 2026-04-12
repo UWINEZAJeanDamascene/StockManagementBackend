@@ -13,6 +13,8 @@ const PDFDocument = require("pdfkit");
 const JournalService = require("../services/journalService");
 const { runInTransaction } = require("../services/transactionService");
 const StockLevel = require("../models/StockLevel");
+const emailService = require("../services/emailService");
+const Client = require("../models/Client");
 
 const ERR_DELIVERY_NOT_FOUND = "ERR_DELIVERY_NOT_FOUND";
 const ERR_DELIVERY_CONFIRMED = "ERR_DELIVERY_CONFIRMED";
@@ -30,6 +32,79 @@ const ERR_COGS_ADJUSTMENT_FAILED = "ERR_COGS_ADJUSTMENT_FAILED";
 
 // COGS adjustment tolerance (0.01 = 1 cent)
 const COGS_TOLERANCE = 0.01;
+
+const sendDeliveryNoteEmail = async (deliveryNote, companyId, action) => {
+  try {
+    const config = require('../src/config/environment').getConfig();
+    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
+      return;
+    }
+
+    const invoice = await Invoice.findById(deliveryNote.invoice).populate('client');
+    const client = invoice?.client;
+    const clientEmail = client?.contact?.email || client?.email;
+    if (!clientEmail) {
+      console.warn('[DeliveryNote] No client email found');
+      return;
+    }
+
+    const noteWithProducts = await DeliveryNote.findById(deliveryNote._id)
+      .populate('lines.product', 'name')
+      .populate('warehouse', 'name');
+
+    const actionText = { confirmed: 'Completed', cancelled: 'Cancelled' }[action] || 'Updated';
+    const subject = `Delivery Note ${deliveryNote.referenceNo} - ${actionText}`;
+
+    const lines = noteWithProducts.lines || [];
+    let itemsHtml = '';
+    if (lines.length > 0) {
+      itemsHtml = lines.map(line => `
+        <tr>
+          <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.productName || 'Item'}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.qtyDelivered || line.quantity || 0}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.product?.unit || 'pcs'}</td>
+        </tr>
+      `).join('');
+    }
+
+    const html = `
+      <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+        <div style="background:#10b981; padding:30px; border-radius:10px 10px 0 0;">
+          <h1 style="color:white; margin:0; text-align:center;">📦 Delivery ${actionText}</h1>
+        </div>
+        <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+          <h2 style="color:#10b981; margin:0 0 5px;">${deliveryNote.referenceNo || ''}</h2>
+          <p style="color:#666; margin:5px 0;">Date: ${new Date(deliveryNote.deliveryDate || deliveryNote.createdAt).toLocaleDateString()}</p>
+          <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
+          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+            <strong>Customer:</strong><br/>${client?.name || 'Customer'}
+          </div>
+          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+            <strong>Warehouse:</strong><br/>${noteWithProducts.warehouse?.name || 'N/A'}
+          </div>
+          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+            <thead>
+              <tr style="background:#10b981; color:white;">
+                <th style="padding:12px; text-align:left;">Product</th>
+                <th style="padding:12px; text-align:center;">Qty</th>
+                <th style="padding:12px; text-align:center;">Unit</th>
+              </tr>
+            </thead>
+            <tbody>${itemsHtml}</tbody>
+          </table>
+          <div style="text-align:center; margin-top:30px;">
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/delivery-notes/${deliveryNote._id}" style="background:#10b981; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View Delivery Note</a>
+          </div>
+          <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+          <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+        </div>
+      </div>`;
+
+    await emailService.sendEmail(clientEmail, subject, html);
+  } catch (err) {
+    console.error('[DeliveryNote] Email failed:', err.message);
+  }
+};
 
 /**
  * Enhance delivery note objects with computed fields expected by frontend
@@ -1048,6 +1123,11 @@ exports.confirmDelivery = async (req, res, next) => {
       await cacheService.bumpCompanyFinancialCaches(companyId);
     } catch (e) {
       console.error("Cache bump after delivery confirm failed:", e);
+    }
+
+    // Send email notification for delivery completed
+    if (req.body.sendEmail) {
+      await sendDeliveryNoteEmail(deliveryNote, companyId, 'confirmed');
     }
 
     res.json({
