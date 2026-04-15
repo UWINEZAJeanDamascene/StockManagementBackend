@@ -18,6 +18,12 @@ const budgetSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    category: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true,
+    },
     type: {
       type: String,
       enum: ["revenue", "expense", "profit"],

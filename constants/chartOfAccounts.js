@@ -202,6 +202,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "credit",
     allowDirectPosting: true,
   },
+  2210: {
+    name: "VAT Input",
+    type: "asset",
+    subtype: "vat_input",
+    normalBalance: "debit",
+    allowDirectPosting: true,
+  },
 
   // ── LIABILITIES (2000-2999) ───
   // Current Liabilities
@@ -226,13 +233,7 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "credit",
     allowDirectPosting: true,
   },
-  2210: {
-    name: "VAT Input",
-    type: "liability",
-    subtype: "vat_input",
-    normalBalance: "debit",
-    allowDirectPosting: true,
-  },
+  
   2220: {
     name: "VAT Output",
     type: "liability",
