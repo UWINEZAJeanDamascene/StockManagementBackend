@@ -1646,12 +1646,31 @@ class MonthlyReportsService {
 
         // Get latest bank statement balance
         const BankStatementLine = mongoose.model('BankStatementLine');
-        
+
         // Check for statement lines in the period first, then fall back to any prior statement
         let latestStatementLine = await BankStatementLine.findOne({
           bankAccount: account._id,
           transactionDate: { $gte: start, $lte: end }
         }).sort({ transactionDate: -1, _id: -1 });
+
+        // If no statement in period, get the most recent prior statement
+        if (!latestStatementLine) {
+          latestStatementLine = await BankStatementLine.findOne({
+            bankAccount: account._id,
+            transactionDate: { $lte: end }
+          }).sort({ transactionDate: -1, _id: -1 });
+        }
+
+        // Get the bank statement balance (running balance from the statement)
+        const bankStatementBalance = latestStatementLine?.runningBalance
+          ? (typeof latestStatementLine.runningBalance === 'object' && latestStatementLine.runningBalance?.$numberDecimal
+              ? parseFloat(latestStatementLine.runningBalance.$numberDecimal)
+              : Number(latestStatementLine.runningBalance))
+          : 0;
+
+        // Calculate adjusted bank balance: statement balance + outstanding deposits - outstanding checks
+        const adjustedBankBalance = bankStatementBalance + outstandingDeposits - outstandingChecks;
+
         const reconciliationDifference = bookBalance - adjustedBankBalance;
         
         const isReconciled = Math.abs(reconciliationDifference) < 0.01;

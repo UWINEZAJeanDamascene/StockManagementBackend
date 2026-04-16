@@ -1,0 +1,22 @@
+services:
+  - name: stock-management-backend
+    env: node
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRE
+        value: 30d
+      - key: REDIS_URL
+        sync: false
+      - key: FRONTEND_URL
+        value: https://stock-management-frontend-ten.vercel.app
+    autoDeploy: true
