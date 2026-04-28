@@ -1619,4 +1619,143 @@ router.get('/general-ledger/excel', authorize('reports', 'read'), validateParams
   }
 });
 
+// ============================================
+// SEMI-ANNUAL REPORTS
+// ============================================
+
+// Validation middleware for semi-annual params
+const validateSemiAnnualParams = (req, res, next) => {
+  const { startYear, startMonth, endYear, endMonth } = req.query;
+  if (!startYear || !startMonth || !endYear || !endMonth) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required parameters: startYear, startMonth, endYear, endMonth'
+    });
+  }
+  req.startYear = parseInt(startYear);
+  req.startMonth = parseInt(startMonth);
+  req.endYear = parseInt(endYear);
+  req.endMonth = parseInt(endMonth);
+  next();
+};
+
+// 1. Semi-Annual P&L
+router.get('/semi-annual/profit-loss', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualProfitAndLoss(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual P&L error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2. Semi-Annual Balance Sheet Trend
+router.get('/semi-annual/balance-sheet-trend', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualBalanceSheetTrend(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Balance Sheet error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 3. Semi-Annual Cash Flow Summary
+router.get('/semi-annual/cash-flow', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualCashFlowSummary(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Cash Flow error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4. Semi-Annual Stock Turnover
+router.get('/semi-annual/stock-turnover', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualStockTurnover(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Stock Turnover error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 5. Semi-Annual Receivables Collection
+router.get('/semi-annual/receivables-collection', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualReceivablesCollection(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Receivables error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 6. Semi-Annual Payroll & HR Cost
+router.get('/semi-annual/payroll-hr', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualPayrollHRCost(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Payroll HR error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 7. Semi-Annual Tax Obligations
+router.get('/semi-annual/tax-obligations', authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+  try {
+    const data = await MonthlyReportsService.getSemiAnnualTaxObligations(
+      req.companyId,
+      req.startYear,
+      req.startMonth,
+      req.endYear,
+      req.endMonth
+    );
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Semi-Annual Tax error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 module.exports = router;

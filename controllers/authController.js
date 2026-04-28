@@ -52,6 +52,15 @@ exports.login = async (req, res, next) => {
 
     // Check if user is platform admin - they don't have a company
     if (user.role === 'platform_admin') {
+      // Check if password matches for platform admin
+      const isMatch = await user.comparePassword(password);
+      if (!isMatch) {
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid credentials'
+        });
+      }
+
       // Generate token without companyId for platform admin
       const token = generateToken(user._id, null, user.role);
       

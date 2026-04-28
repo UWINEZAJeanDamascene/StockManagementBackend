@@ -14,8 +14,8 @@ const User = require('../models/User');
 async function run() {
   await connectDB();
 
-  const email = (process.env.PLATFORM_ADMIN_EMAIL || 'platform.admin@stockmanager.local').toLowerCase().trim();
-  const password = process.env.PLATFORM_ADMIN_PASSWORD;
+  const email = (process.env.PLATFORM_ADMIN_EMAIL || 'uwinezajd2@gmail.com').toLowerCase().trim();
+  const password = process.env.PLATFORM_ADMIN_PASSWORD || 'kigali123';
   const name = (process.env.PLATFORM_ADMIN_NAME || 'Platform Administrator').trim();
 
   if (!password || password.length < 8) {

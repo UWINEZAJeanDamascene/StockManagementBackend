@@ -49,6 +49,8 @@ module.exports = {
       "ap_payment", // supplier payments (AP module)
       "purchase", // direct purchase payment
       "expense", // operating expense payment
+      "accrued_expense", // accrued expenses paid
+      "accrual", // accrual payments
       "petty_cash_expense", // petty cash expenses paid
       "bank_charge", // bank service charges (finance cost, operating per policy)
       "payroll", // legacy payroll journal entry
@@ -93,6 +95,8 @@ module.exports = {
 
     financing_outflows: [
       "liability_repayment", // principal repayment of borrowings
+      "loan_repayment", // loan repayment alias
+      "loan_payment", // loan payment alias
       "liability_interest", // interest paid on borrowings (IAS 7 §33 — Financing)
       "dividend", // dividends paid to shareholders (IAS 7 §34 — Financing)
       "owner_drawing", // owner drawings
