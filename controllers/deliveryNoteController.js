@@ -1258,6 +1258,55 @@ exports.dispatchDeliveryNote = async (req, res, next) => {
   }
 };
 
+// @desc    Mark delivery note as delivered
+// @route   PUT /api/delivery-notes/:id/deliver
+// @access  Private
+exports.markDelivered = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const deliveryNoteId = req.params.id;
+    const { receivedBy, receivedDate, clientSignature, clientStamp, notes } = req.body;
+
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: deliveryNoteId,
+      company: companyId,
+    });
+
+    if (!deliveryNote) {
+      return res.status(404).json({
+        success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
+        message: "Delivery note not found",
+      });
+    }
+
+    if (deliveryNote.status !== 'dispatched') {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot mark as delivered with status: ${deliveryNote.status}. Delivery note must be dispatched first.`,
+      });
+    }
+
+    deliveryNote.status = 'delivered';
+    deliveryNote.legacyStatus = 'delivered';
+    if (receivedBy) deliveryNote.receivedBy = receivedBy;
+    if (receivedDate) deliveryNote.receivedDate = new Date(receivedDate);
+    if (clientSignature) deliveryNote.clientSignature = clientSignature;
+    if (clientStamp !== undefined) deliveryNote.clientStamp = clientStamp;
+    if (notes) deliveryNote.notes = notes;
+
+    await deliveryNote.save();
+
+    res.status(200).json({
+      success: true,
+      data: deliveryNote,
+      message: "Delivery note marked as delivered",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Cancel confirmed delivery note (Module 7 - reverse stock)
 // @route   POST /api/delivery-notes/:id/cancel
 // @access  Private
