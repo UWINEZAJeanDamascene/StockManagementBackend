@@ -174,7 +174,7 @@ const deliveryNoteSchema = new mongoose.Schema({
   // Module 7: Status enum - draft, confirmed, dispatched, cancelled
   status: {
     type: String,
-    enum: ['draft', 'confirmed', 'dispatched', 'cancelled'], // Module 7 spec + dispatched for tracking
+    enum: ['draft', 'confirmed', 'dispatched', 'delivered', 'cancelled'], // Module 7 spec + dispatched/delivered for tracking
     default: 'draft'
   },
   
