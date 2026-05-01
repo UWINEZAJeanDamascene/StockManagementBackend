@@ -1,4 +1,5 @@
 const AuditLog = require('../models/AuditLog');
+const ActionLog = require('../models/ActionLog');
 
 /**
  * AuditLogService - Records all CRUD operations with user + timestamp
@@ -39,19 +40,96 @@ class AuditLogService {
     durationMs = null
   }) {
     try {
-      await AuditLog.create({
+      // Ensure `changes` is a plain JSON-serializable object. Convert Mongoose documents,
+      // Decimal128, ObjectId and Dates to safe representations to avoid save errors.
+      const sanitize = (obj) => {
+        if (obj == null) return obj;
+        // Primitive types
+        if (typeof obj !== 'object') return obj;
+        // Handle Mongoose documents with toObject
+        if (typeof obj.toObject === 'function') {
+          obj = obj.toObject({ depopulate: true });
+        }
+
+        // Arrays
+        if (Array.isArray(obj)) return obj.map(sanitize);
+
+        const out = {};
+        for (const [k, v] of Object.entries(obj)) {
+          try {
+            if (v == null) {
+              out[k] = v;
+            } else if (v instanceof Date) {
+              out[k] = v.toISOString();
+            } else if (v && v._bsontype === 'ObjectID') {
+              out[k] = v.toString();
+            } else if (v && v.constructor && v.constructor.name === 'Decimal128') {
+              out[k] = parseFloat(v.toString());
+            } else if (typeof v === 'object') {
+              out[k] = sanitize(v);
+            } else {
+              out[k] = v;
+            }
+          } catch (e) {
+            out[k] = String(v);
+          }
+        }
+        return out;
+      };
+
+      const safeChanges = sanitize(changes);
+
+      const created = await AuditLog.create({
         company_id: companyId || null,
         user_id: userId || null,
         action,
         entity_type: entityType,
         entity_id: entityId || null,
-        changes,
+        changes: safeChanges,
         ip_address: ipAddress,
         user_agent: userAgent,
         status,
         error_message: errorMessage,
         duration_ms: durationMs
       });
+
+      if (process.env.NODE_ENV !== 'production') {
+        try {
+          console.log('AuditLog created:', { action, entityType, entityId, companyId, id: created._id });
+        } catch (ignore) {}
+      }
+
+      // Also mirror into ActionLog for the legacy frontend audit trail UI.
+      try {
+        // Only create ActionLog when a user is present (ActionLog requires a user)
+        if (userId) {
+          // Derive module from action (e.g. 'company.update' -> 'company') or from entityType
+          let module = null;
+          if (action && action.includes('.')) module = action.split('.')[0];
+          if (!module && entityType && typeof entityType === 'string') module = entityType.split('_')[0];
+          if (!module) module = 'report';
+
+          const actionLogDoc = {
+            company: companyId || null,
+            user: userId,
+            action,
+            module,
+            targetId: entityId || null,
+            targetModel: entityType || null,
+            details: { changes: safeChanges },
+            ipAddress: ipAddress || null,
+            userAgent: userAgent || null,
+            status: status === 'failure' ? 'failed' : 'success'
+          };
+
+          // Create but don't let failures bubble up
+          await ActionLog.create(actionLogDoc);
+        }
+      } catch (e) {
+        console.error('Failed to mirror AuditLog into ActionLog:', e.message);
+      }
+
+      return created;
     } catch (err) {
       // Never let audit log failure break the main operation
       console.error('AuditLog write failed:', err.message);

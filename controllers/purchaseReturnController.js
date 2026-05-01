@@ -254,15 +254,14 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     journalLines.push(JournalService.createDebitLine(apAcct, totalReturnNet + totalReturnTax, `Purchase Return ${pr.referenceNo || pr.referenceNo} - GRN#${grn.referenceNo}`));
 
     if (totalReturnTax > 0) {
-      const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatPayable', DEFAULT_ACCOUNTS.vatPayable);
+      // CR VAT Input (2210) — reverses the DR VAT Input from the original GRN
+      const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatInput', DEFAULT_ACCOUNTS.vatInput);
       journalLines.push(JournalService.createCreditLine(vatAcct, totalReturnTax, `VAT reversal ${pr.referenceNo || pr.referenceNo}`));
     }
 
-    // CR Purchase Returns (contra-expense in COGS section of P&L)
-    // This reduces COGS rather than reversing inventory, reflecting that
-    // returned goods were already sold/expensed
-    const prAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'purchaseReturns', DEFAULT_ACCOUNTS.purchaseReturns);
-    journalLines.push(JournalService.createCreditLine(prAcct, totalReturnNet, `Purchase Returns ${pr.referenceNo || pr.referenceNo}`));
+    // CR Inventory (1400) — reverses the asset from the original GRN
+    const inventoryAcct = await JournalService.getMappedAccountCode(companyId, 'inventory', 'inventory', DEFAULT_ACCOUNTS.inventory);
+    journalLines.push(JournalService.createCreditLine(inventoryAcct, totalReturnNet, `Purchase Return - inventory reversal ${pr.referenceNo || pr.referenceNo}`));
 
     // Post journal
     const supplier = await (require('../models/Supplier')).findById(pr.supplier).lean();

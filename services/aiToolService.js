@@ -1,0 +1,724 @@
+/**
+ * AI Tool Service — Data fetchers for the AI assistant (Stacy)
+ */
+
+const Company = require('../models/Company');
+const Product = require('../models/Product');
+const Category = require('../models/Category');
+const Invoice = require('../models/Invoice');
+const Purchase = require('../models/Purchase');
+const PurchaseOrder = require('../models/PurchaseOrder');
+const Client = require('../models/Client');
+const Expense = require('../models/Expense');
+const Supplier = require('../models/Supplier');
+const StockMovement = require('../models/StockMovement');
+const StockTransfer = require('../models/StockTransfer');
+const StockAudit = require('../models/StockAudit');
+const Warehouse = require('../models/Warehouse');
+const ChartOfAccount = require('../models/ChartOfAccount');
+const JournalEntry = require('../models/JournalEntry');
+const BankAccount = require('../models/BankAccount');
+const FixedAsset = require('../models/FixedAsset');
+const Loan = require('../models/Loan');
+const Liability = require('../models/Liability');
+const CreditNote = require('../models/CreditNote');
+const DeliveryNote = require('../models/DeliveryNote');
+const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const ARReceipt = require('../models/ARReceipt');
+const APPayment = require('../models/APPayment');
+const Budget = require('../models/Budget');
+const Department = require('../models/Department');
+const CompanyUser = require('../models/CompanyUser');
+const AuditLog = require('../models/AuditLog');
+const AccountingPeriod = require('../models/AccountingPeriod');
+const Notification = require('../models/Notification');
+const Quotation = require('../models/Quotation');
+const SalesOrder = require('../models/SalesOrder');
+
+function dateFilter(start, end) {
+  const q = {};
+  if (start) q.$gte = new Date(start);
+  if (end) q.$lte = new Date(end);
+  return Object.keys(q).length ? q : undefined;
+}
+
+async function getCompanyInfo(companyId) {
+  const company = await Company.findById(companyId).lean();
+  if (!company) return { error: 'Company not found' };
+  return {
+    name: company.name, tin: company.tin, email: company.email,
+    currency: company.settings?.currency || 'FRW',
+    plan: company.subscription?.plan || 'free',
+    equity: {
+      shareCapital: company.equity?.shareCapital || 0,
+      retainedEarnings: company.equity?.retainedEarnings || 0,
+      accumulatedProfit: company.equity?.accumulatedProfit || 0,
+    },
+  };
+}
+
+async function getProducts(companyId, opts = {}) {
+  const { limit = 50, search = '', lowStock = false, outOfStock = false } = opts;
+  const q = { company: companyId };
+  if (search) q.name = { $regex: search, $options: 'i' };
+  if (lowStock) q.$expr = { $lte: ['$currentStock', '$lowStockThreshold'] };
+  if (outOfStock) q.currentStock = 0;
+  const products = await Product.find(q).lean().limit(Number(limit));
+  const totalValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
+  return {
+    count: products.length, totalValue,
+    products: products.map(p => ({
+      id: p._id.toString(), name: p.name, sku: p.sku,
+      category: p.category?.name || p.category || 'Uncategorized',
+      currentStock: p.currentStock || 0, unit: p.unit || 'units',
+      averageCost: p.averageCost || 0, sellingPrice: p.sellingPrice || 0,
+      taxCode: p.taxCode || 'A', isLowStock: (p.currentStock || 0) <= (p.lowStockThreshold || 0),
+    })),
+  };
+}
+
+async function getInvoices(companyId, opts = {}) {
+  const { status = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.invoiceDate = df;
+  const invoices = await Invoice.find(q).sort({ invoiceDate: -1 }).limit(Number(limit)).populate('client', 'name').lean();
+  const stats = await Invoice.aggregate([
+    { $match: { company: companyId._id || companyId } },
+    { $group: { _id: '$status', count: { $sum: 1 }, total: { $sum: '$total' } } },
+  ]);
+  return {
+    count: invoices.length,
+    stats: stats.reduce((a, s) => { a[s._id] = { count: s.count, total: s.total }; return a; }, {}),
+    invoices: invoices.map(i => ({
+      id: i._id.toString(), invoiceNumber: i.invoiceNumber,
+      customerName: i.client?.name || i.customerName || 'Unknown',
+      total: i.total || 0, status: i.status,
+      invoiceDate: i.invoiceDate ? new Date(i.invoiceDate).toISOString().slice(0, 10) : null,
+      outstanding: (i.total || 0) - (i.amountPaid || 0),
+    })),
+  };
+}
+
+async function getPurchases(companyId, opts = {}) {
+  const { status = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.createdAt = df;
+  const purchases = await Purchase.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  return {
+    count: purchases.length,
+    purchases: purchases.map(p => ({
+      id: p._id.toString(), purchaseNumber: p.purchaseNumber,
+      supplier: p.supplier?.name || 'Unknown', total: p.total || 0,
+      status: p.status, date: p.createdAt ? new Date(p.createdAt).toISOString().slice(0, 10) : null,
+    })),
+  };
+}
+
+async function getClients(companyId, opts = {}) {
+  const { limit = 50, search = '' } = opts;
+  const q = { company: companyId };
+  if (search) q.name = { $regex: search, $options: 'i' };
+  const clients = await Client.find(q).limit(Number(limit)).lean();
+  const outstanding = await Invoice.aggregate([
+    { $match: { company: companyId._id || companyId, status: { $in: ['confirmed', 'partial'] } } },
+    { $group: { _id: null, total: { $sum: { $subtract: ['$total', '$amountPaid'] } } } },
+  ]);
+  return {
+    count: clients.length, totalOutstanding: outstanding[0]?.total || 0,
+    clients: clients.map(c => ({
+      id: c._id.toString(), name: c.name, type: c.type || 'Individual',
+      phone: c.phone, email: c.email, isActive: c.isActive !== false,
+    })),
+  };
+}
+
+async function getExpenses(companyId, opts = {}) {
+  const { type = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (type) q.type = type;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.expenseDate = df;
+  const expenses = await Expense.find(q).sort({ expenseDate: -1 }).limit(Number(limit)).lean();
+  const byType = await Expense.aggregate([
+    { $match: { company: companyId._id || companyId } },
+    { $group: { _id: '$type', total: { $sum: '$amount' } } },
+    { $sort: { total: -1 } },
+  ]);
+  return {
+    count: expenses.length,
+    byType: byType.map(e => ({ type: e._id || 'Other', total: e.total })),
+    expenses: expenses.map(e => ({
+      id: e._id.toString(), type: e.type, amount: e.amount || 0,
+      status: e.status, date: e.expenseDate ? new Date(e.expenseDate).toISOString().slice(0, 10) : null,
+    })),
+  };
+}
+
+async function getStockSummary(companyId) {
+  const products = await Product.find({ company: companyId }).lean();
+  const totalValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
+  return {
+    totalProducts: products.length, totalStockValue: totalValue,
+    outOfStockCount: products.filter(p => (p.currentStock || 0) === 0).length,
+    lowStockCount: products.filter(p => (p.currentStock || 0) > 0 && (p.currentStock || 0) <= (p.lowStockThreshold || 0)).length,
+  };
+}
+
+async function getSalesSummary(companyId, opts = {}) {
+  const { period = 'month', startDate, endDate } = opts;
+  const q = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.invoiceDate = df;
+  const invoices = await Invoice.find(q).lean();
+  const totalRevenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
+  const totalPaid = invoices.reduce((s, i) => s + (i.amountPaid || 0), 0);
+
+  const grouped = {};
+  invoices.forEach(i => {
+    const d = i.invoiceDate ? new Date(i.invoiceDate) : new Date();
+    let key;
+    if (period === 'day') key = d.toISOString().slice(0, 10);
+    else if (period === 'week') { const w = new Date(d); w.setDate(w.getDate() - w.getDay()); key = w.toISOString().slice(0, 10); }
+    else if (period === 'year') key = `${d.getFullYear()}`;
+    else key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!grouped[key]) grouped[key] = { revenue: 0, count: 0 };
+    grouped[key].revenue += (i.total || 0); grouped[key].count += 1;
+  });
+
+  const timeline = Object.entries(grouped).map(([k, v]) => ({ period: k, ...v })).sort((a, b) => a.period.localeCompare(b.period));
+
+  const productRevenue = {};
+  invoices.forEach(i => {
+    (i.items || []).forEach(item => {
+      const name = item.productName || item.name || 'Unknown';
+      productRevenue[name] = (productRevenue[name] || 0) + (item.lineTotal || item.lineSubtotal || 0);
+    });
+  });
+  const topProducts = Object.entries(productRevenue).map(([name, revenue]) => ({ name, revenue })).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+
+  return { totalInvoices: invoices.length, totalRevenue, totalPaid, totalOutstanding: totalRevenue - totalPaid, collectionRate: totalRevenue ? (totalPaid / totalRevenue) * 100 : 0, timeline, topProducts };
+}
+
+async function getReceivablesAging(companyId) {
+  const invoices = await Invoice.find({ company: companyId, status: { $in: ['confirmed', 'partial'] } }).populate('client', 'name').lean();
+  const now = new Date();
+  const buckets = { current: 0, days1_30: 0, days31_60: 0, days61_90: 0, over90: 0 };
+  const clientAging = {};
+
+  invoices.forEach(i => {
+    const due = i.dueDate ? new Date(i.dueDate) : new Date(i.invoiceDate);
+    const diff = Math.floor((now - due) / (1000 * 60 * 60 * 24));
+    const outstanding = (i.total || 0) - (i.amountPaid || 0);
+    if (diff <= 0) buckets.current += outstanding;
+    else if (diff <= 30) buckets.days1_30 += outstanding;
+    else if (diff <= 60) buckets.days31_60 += outstanding;
+    else if (diff <= 90) buckets.days61_90 += outstanding;
+    else buckets.over90 += outstanding;
+
+    const cname = i.client?.name || i.customerName || 'Unknown';
+    if (!clientAging[cname]) clientAging[cname] = { total: 0, oldest: 0 };
+    clientAging[cname].total += outstanding;
+    clientAging[cname].oldest = Math.max(clientAging[cname].oldest, diff);
+  });
+
+  const topDebtors = Object.entries(clientAging).map(([name, data]) => ({ name, ...data })).sort((a, b) => b.total - a.total).slice(0, 10);
+  return { totalOutstanding: Object.values(buckets).reduce((a, b) => a + b, 0), buckets, topDebtors };
+}
+
+async function getBankAccounts(companyId) {
+  const accounts = await BankAccount.find({ company: companyId }).lean();
+  const totalBalance = accounts.reduce((s, a) => s + (a.currentBalance || a.cachedBalance || 0), 0);
+  return {
+    count: accounts.length, totalBalance,
+    accounts: accounts.map(a => ({
+      id: a._id.toString(), name: a.name, type: a.accountType,
+      balance: a.currentBalance || a.cachedBalance || 0,
+    })),
+  };
+}
+
+async function getFixedAssets(companyId) {
+  const assets = await FixedAsset.find({ company: companyId }).lean();
+  const totalCost = assets.reduce((s, a) => s + (a.cost || 0), 0);
+  const totalDep = assets.reduce((s, a) => s + (a.accumulatedDepreciation || 0), 0);
+  return {
+    count: assets.length, totalCost, totalDepreciation: totalDep, netBookValue: totalCost - totalDep,
+    assets: assets.map(a => ({
+      id: a._id.toString(), name: a.name, cost: a.cost || 0,
+      netBookValue: (a.cost || 0) - (a.accumulatedDepreciation || 0),
+      status: a.status,
+    })),
+  };
+}
+
+async function getLoans(companyId) {
+  const loans = await Loan.find({ company: companyId }).lean();
+  const totalOutstanding = loans.reduce((s, l) => s + (l.outstandingBalance || 0), 0);
+  return { count: loans.length, totalOutstanding, loans: loans.map(l => ({ id: l._id.toString(), name: l.name, outstandingBalance: l.outstandingBalance || 0, status: l.status })) };
+}
+
+async function getDashboardMetrics(companyId) {
+  const [company, products, invoices, purchases, expenses, clients, lowStock] = await Promise.all([
+    Company.findById(companyId).lean(),
+    Product.find({ company: companyId }).lean(),
+    Invoice.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean(),
+    Purchase.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean(),
+    Expense.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean().catch(() => []),
+    Client.countDocuments({ company: companyId }).catch(() => 0),
+    Product.find({ company: companyId, $expr: { $lte: ['$currentStock', '$lowStockThreshold'] } }).lean().limit(20),
+  ]);
+
+  const totalStockValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
+  const pendingInvoices = await Invoice.countDocuments({ company: companyId, status: { $in: ['confirmed', 'partial'] } }).catch(() => 0);
+
+  const yearStart = new Date(); yearStart.setMonth(0, 1); yearStart.setHours(0, 0, 0, 0);
+  const monthlyRevenue = await Invoice.aggregate([
+    { $match: { company: companyId._id || companyId, status: { $in: ['confirmed', 'partial', 'paid'] }, invoiceDate: { $gte: yearStart } } },
+    { $group: { _id: { $month: '$invoiceDate' }, revenue: { $sum: '$total' }, count: { $sum: 1 } } },
+    { $sort: { _id: 1 } },
+  ]);
+
+  return {
+    company: { name: company?.name, currency: company?.settings?.currency || 'FRW' },
+    products: { total: products.length, totalValue: totalStockValue, outOfStock: products.filter(p => (p.currentStock || 0) === 0).length, lowStock: lowStock.length },
+    sales: { pendingInvoices, monthlyRevenue: monthlyRevenue.map(m => ({ month: m._id, revenue: m.revenue, count: m.count })) },
+    clients: { total: clients },
+  };
+}
+
+async function generateChartData(companyId, opts = {}) {
+  const { chartType = 'line', dataType = 'revenue', period = 'month', startDate, endDate, limit = 12 } = opts;
+  let labels = [], datasets = [];
+
+  if (dataType === 'revenue') {
+    const q = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
+    const df = dateFilter(startDate, endDate);
+    if (df) q.invoiceDate = df;
+    const invoices = await Invoice.find(q).lean();
+    const grouped = {};
+    invoices.forEach(i => {
+      const d = i.invoiceDate ? new Date(i.invoiceDate) : new Date();
+      let key = period === 'day' ? d.toISOString().slice(0, 10)
+        : period === 'year' ? `${d.getFullYear()}`
+        : `${d.toLocaleString('en', { month: 'short' })} ${d.getFullYear()}`;
+      if (!grouped[key]) grouped[key] = 0;
+      grouped[key] += (i.total || 0);
+    });
+    const sorted = Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0])).slice(-Number(limit));
+    labels = sorted.map(([k]) => k);
+    datasets = [{ label: 'Revenue', data: sorted.map(([, v]) => v), color: '#6366f1' }];
+  }
+
+  if (dataType === 'expenses') {
+    const q = { company: companyId };
+    const df = dateFilter(startDate, endDate);
+    if (df) q.expenseDate = df;
+    const expenses = await Expense.find(q).lean();
+    const grouped = {};
+    expenses.forEach(e => { const t = e.type || 'Other'; grouped[t] = (grouped[t] || 0) + (e.amount || 0); });
+    labels = Object.keys(grouped);
+    datasets = [{ label: 'Expenses', data: Object.values(grouped), color: '#ef4444' }];
+  }
+
+  if (dataType === 'stock') {
+    const products = await Product.find({ company: companyId }).sort({ currentStock: -1 }).limit(Number(limit)).lean();
+    labels = products.map(p => p.name);
+    datasets = [{ label: 'Stock Qty', data: products.map(p => p.currentStock || 0), color: '#10b981' }];
+  }
+
+  if (dataType === 'product_revenue') {
+    const invoices = await Invoice.find({ company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } }).lean();
+    const prodRev = {};
+    invoices.forEach(i => { (i.items || []).forEach(item => { const n = item.productName || item.name || 'Unknown'; prodRev[n] = (prodRev[n] || 0) + (item.total || item.lineTotal || 0); }); });
+    const sorted = Object.entries(prodRev).sort((a, b) => b[1] - a[1]).slice(0, Number(limit));
+    labels = sorted.map(([k]) => k);
+    datasets = [{ label: 'Revenue', data: sorted.map(([, v]) => v), color: '#f59e0b' }];
+  }
+
+  return { chartType, dataType, labels, datasets, title: `${dataType.replace('_', ' ')} ${chartType}`, currency: 'FRW' };
+}
+
+async function getProfitLossSummary(companyId, opts = {}) {
+  const { startDate, endDate } = opts;
+  const df = dateFilter(startDate, endDate);
+  const iq = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
+  const eq = { company: companyId };
+  if (df) { iq.invoiceDate = df; eq.expenseDate = df; }
+
+  const [invoices, expenses] = await Promise.all([
+    Invoice.find(iq).lean(),
+    Expense.find(eq).lean(),
+  ]);
+
+  const revenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
+  const totalExpenses = expenses.reduce((s, e) => s + (e.amount || 0), 0);
+
+  let cogs = 0;
+  invoices.forEach(i => { (i.items || []).forEach(item => { cogs += Number(item.qty || item.quantity || 0) * Number(item.unitCost || item.cogsAmount || 0); }); });
+  if (!cogs) cogs = Math.max(0, revenue * 0.6);
+
+  const grossProfit = revenue - cogs;
+  const operatingProfit = grossProfit - totalExpenses;
+  const tax = Math.max(0, operatingProfit * 0.3);
+  const netProfit = operatingProfit - tax;
+
+  return {
+    revenue, cogs, grossProfit, operatingExpenses: totalExpenses, operatingProfit,
+    tax, netProfit, isProfit: netProfit >= 0, currency: 'FRW',
+  };
+}
+
+async function getCategories(companyId, opts = {}) {
+  opts = opts || {};
+  const { search = '', limit = 50 } = opts;
+  const q = { company: companyId };
+  if (search) q.name = { $regex: search, $options: 'i' };
+  const categories = await Category.find(q).limit(Number(limit)).lean();
+  return { count: categories.length, categories: categories.map(c => ({ id: c._id, name: c.name, description: c.description })) };
+}
+
+async function getWarehouses(companyId, opts = {}) {
+  opts = opts || {};
+  const warehouses = await Warehouse.find({ company: companyId }).lean();
+  return { count: warehouses.length, warehouses: warehouses.map(w => ({ id: w._id, name: w.name, location: w.location, capacity: w.capacity })) };
+}
+
+async function getStockMovements(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.date = df;
+  const movements = await StockMovement.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  return { count: movements.length, movements };
+}
+
+async function getStockTransfers(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, status = '' } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const transfers = await StockTransfer.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  return { count: transfers.length, transfers };
+}
+
+async function getSuppliers(companyId, opts = {}) {
+  opts = opts || {};
+  const { search = '', limit = 50 } = opts;
+  const q = { company: companyId };
+  if (search) q.name = { $regex: search, $options: 'i' };
+  const suppliers = await Supplier.find(q).limit(Number(limit)).lean();
+  return { count: suppliers.length, suppliers: suppliers.map(s => ({ id: s._id, name: s.name, email: s.email, phone: s.phone, balance: s.balance })) };
+}
+
+async function getPurchaseOrders(companyId, opts = {}) {
+  opts = opts || {};
+  const { status = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.orderDate = df;
+  const orders = await PurchaseOrder.find(q).sort({ orderDate: -1 }).limit(Number(limit)).lean();
+  return { count: orders.length, orders };
+}
+
+async function getGoodsReceivedNotes(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.date = df;
+  const grns = await GoodsReceivedNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  return { count: grns.length, grns };
+}
+
+async function getCreditNotes(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.date = df;
+  const notes = await CreditNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  return { count: notes.length, notes };
+}
+
+async function getDeliveryNotes(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.date = df;
+  const notes = await DeliveryNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  return { count: notes.length, notes };
+}
+
+async function getQuotations(companyId, opts = {}) {
+  opts = opts || {};
+  const { status = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.quotationDate = df;
+  const quotations = await Quotation.find(q).sort({ quotationDate: -1 }).limit(Number(limit)).lean();
+  return { count: quotations.length, quotations };
+}
+
+async function getSalesOrders(companyId, opts = {}) {
+  opts = opts || {};
+  const { status = '', limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (status) q.status = status;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.orderDate = df;
+  const orders = await SalesOrder.find(q).sort({ orderDate: -1 }).limit(Number(limit)).lean();
+  return { count: orders.length, orders };
+}
+
+async function getARReceipts(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.receiptDate = df;
+  const receipts = await ARReceipt.find(q).sort({ receiptDate: -1 }).limit(Number(limit)).lean();
+  return { count: receipts.length, receipts };
+}
+
+async function getAPPayments(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.paymentDate = df;
+  const payments = await APPayment.find(q).sort({ paymentDate: -1 }).limit(Number(limit)).lean();
+  return { count: payments.length, payments };
+}
+
+async function getChartOfAccounts(companyId, opts = {}) {
+  opts = opts || {};
+  const { type = '', search = '', limit = 50 } = opts;
+  const q = { company: companyId };
+  if (type) q.accountType = type;
+  if (search) q.name = { $regex: search, $options: 'i' };
+  const accounts = await ChartOfAccount.find(q).limit(Number(limit)).lean();
+  return { count: accounts.length, accounts: accounts.map(a => ({ id: a._id, code: a.code, name: a.name, type: a.accountType, balance: a.balance })) };
+}
+
+async function getJournalEntries(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, startDate, endDate } = opts;
+  const q = { company: companyId };
+  const df = dateFilter(startDate, endDate);
+  if (df) q.date = df;
+  const entries = await JournalEntry.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  return { count: entries.length, entries };
+}
+
+async function getBudgets(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, fiscalYear = '' } = opts;
+  const q = { company: companyId };
+  if (fiscalYear) q.fiscalYear = fiscalYear;
+  const budgets = await Budget.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  return { count: budgets.length, budgets };
+}
+
+async function getDepartments(companyId, opts = {}) {
+  opts = opts || {};
+  const { search = '', limit = 50 } = opts;
+  const q = { company: companyId };
+  if (search) q.name = { $regex: search, $options: 'i' };
+  const departments = await Department.find(q).limit(Number(limit)).lean();
+  return { count: departments.length, departments: departments.map(d => ({ id: d._id, name: d.name, manager: d.manager, budget: d.budget })) };
+}
+
+async function getCompanyUsers(companyId, opts = {}) {
+  opts = opts || {};
+  const { role = '', limit = 50 } = opts;
+  const q = { company: companyId };
+  if (role) q.role = role;
+  const users = await CompanyUser.find(q).limit(Number(limit)).lean();
+  return { count: users.length, users: users.map(u => ({ id: u._id, name: u.name, email: u.email, role: u.role, status: u.status })) };
+}
+
+async function getNotifications(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, unreadOnly = false } = opts;
+  const q = { company: companyId };
+  if (unreadOnly) q.read = false;
+  const notifications = await Notification.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  return { count: notifications.length, notifications: notifications.map(n => ({ id: n._id, title: n.title, message: n.message, read: n.read, type: n.type, createdAt: n.createdAt })) };
+}
+
+async function getAuditLogs(companyId, opts = {}) {
+  opts = opts || {};
+  const { limit = 20, action = '', startDate, endDate } = opts;
+  const q = { company: companyId };
+  if (action) q.action = action;
+  const df = dateFilter(startDate, endDate);
+  if (df) q.timestamp = df;
+  const logs = await AuditLog.find(q).sort({ timestamp: -1 }).limit(Number(limit)).lean();
+  return { count: logs.length, logs: logs.map(l => ({ id: l._id, user: l.userName || l.userEmail, action: l.action, entity: l.entityType, details: l.details, timestamp: l.timestamp })) };
+}
+
+async function getBalanceSheet(companyId, opts = {}) {
+  opts = opts || {};
+  const { asOfDate } = opts;
+  const q = { company: companyId };
+  const accounts = await ChartOfAccount.find(q).lean();
+  const assets = accounts.filter(a => (a.accountType || '').toLowerCase().includes('asset')).reduce((s, a) => s + (a.balance || 0), 0);
+  const liabilities = accounts.filter(a => (a.accountType || '').toLowerCase().includes('liabilit')).reduce((s, a) => s + (a.balance || 0), 0);
+  const equity = accounts.filter(a => (a.accountType || '').toLowerCase().includes('equity') || (a.accountType || '').toLowerCase().includes('capital')).reduce((s, a) => s + (a.balance || 0), 0);
+  return { asOfDate: asOfDate || new Date().toISOString().slice(0, 10), totalAssets: assets, totalLiabilities: liabilities, totalEquity: equity, balanced: Math.abs(assets - liabilities - equity) < 0.01, currency: 'FRW' };
+}
+
+async function getCashFlowSummary(companyId, opts = {}) {
+  opts = opts || {};
+  const { startDate, endDate } = opts;
+  const df = dateFilter(startDate, endDate);
+  const bq = { company: companyId };
+  const jq = { company: companyId };
+  if (df) { jq.date = df; }
+  const [bankAccounts, journalEntries] = await Promise.all([
+    BankAccount.find(bq).lean(),
+    JournalEntry.find(jq).lean(),
+  ]);
+  const bankBalance = bankAccounts.reduce((s, b) => s + (b.currentBalance || 0), 0);
+  const cashIn = journalEntries.filter(j => (j.narration || '').toLowerCase().includes('receipt') || (j.type || '').toLowerCase().includes('income')).reduce((s, j) => s + (j.amount || 0), 0);
+  const cashOut = journalEntries.filter(j => (j.narration || '').toLowerCase().includes('payment') || (j.type || '').toLowerCase().includes('expense')).reduce((s, j) => s + (j.amount || 0), 0);
+  return { bankBalance, cashIn, cashOut, netCashFlow: cashIn - cashOut, period: { startDate, endDate }, currency: 'FRW' };
+}
+
+// Tool definitions for the LLM
+const TOOL_DEFINITIONS = [
+  // Company & System
+  { type: 'function', function: { name: 'get_company_info', description: 'Get company profile, settings, fiscal year, tax settings, and currency configuration', parameters: { type: 'object', properties: {}, required: [] } } },
+  // Dashboard
+  { type: 'function', function: { name: 'get_dashboard_metrics', description: 'High-level business dashboard: KPIs, recent activity, top products, alerts, and quick stats', parameters: { type: 'object', properties: {} } } },
+  // Inventory
+  { type: 'function', function: { name: 'get_products', description: 'List products with stock levels, pricing, reorder points, categories, and warehouse locations', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' }, lowStock: { type: 'boolean', default: false }, outOfStock: { type: 'boolean', default: false } } } } },
+  { type: 'function', function: { name: 'get_categories', description: 'List product categories', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_warehouses', description: 'List warehouses with locations and capacities', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_stock_movements', description: 'List stock movements (in/out/adjustments) by date range', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_stock_transfers', description: 'List stock transfers between warehouses', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, status: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_stock_summary', description: 'Stock overview: totals, low stock, out of stock, and valuation', parameters: { type: 'object', properties: {} } } },
+  // Purchasing
+  { type: 'function', function: { name: 'get_purchases', description: 'List purchase records/bills with filters', parameters: { type: 'object', properties: { status: { type: 'string' }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_purchase_orders', description: 'List purchase orders with status and date filters', parameters: { type: 'object', properties: { status: { type: 'string' }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_suppliers', description: 'List suppliers/vendors with contact info and balance', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_goods_received_notes', description: 'List goods received notes (GRNs) for incoming stock', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  // Sales
+  { type: 'function', function: { name: 'get_invoices', description: 'List sales invoices with status, amount, and date filters', parameters: { type: 'object', properties: { status: { type: 'string', enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled'] }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_quotations', description: 'List sales quotations/estimates', parameters: { type: 'object', properties: { status: { type: 'string' }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_sales_orders', description: 'List sales orders with status and date filters', parameters: { type: 'object', properties: { status: { type: 'string' }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_delivery_notes', description: 'List delivery notes / dispatch records', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_credit_notes', description: 'List credit notes and refunds', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_clients', description: 'List customers/clients with contact info and balance', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_ar_receipts', description: 'List accounts receivable receipts (customer payments)', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_receivables_aging', description: 'Aging analysis of accounts receivable: current, 30, 60, 90, 120+ days overdue', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_sales_summary', description: 'Sales analytics: timeline, top products, customer trends', parameters: { type: 'object', properties: { period: { type: 'string', enum: ['day', 'week', 'month', 'quarter', 'year'], default: 'month' }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  // Finance
+  { type: 'function', function: { name: 'get_expenses', description: 'List expenses by type, category, and period', parameters: { type: 'object', properties: { type: { type: 'string' }, limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_bank_accounts', description: 'List bank and cash accounts with current balances', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_chart_of_accounts', description: 'List chart of accounts (general ledger accounts) with balances', parameters: { type: 'object', properties: { type: { type: 'string' }, search: { type: 'string' }, limit: { type: 'integer', default: 50 } } } } },
+  { type: 'function', function: { name: 'get_journal_entries', description: 'List journal entries / general ledger transactions', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_fixed_assets', description: 'List fixed assets, purchase cost, depreciation, and net book value', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_loans', description: 'List loans, liabilities, outstanding balances, and payment schedules', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_ap_payments', description: 'List accounts payable payments (vendor payments)', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_budgets', description: 'List budgets with actual vs budgeted amounts', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, fiscalYear: { type: 'string' } } } } },
+  // Reports
+  { type: 'function', function: { name: 'get_profit_loss_summary', description: 'Compute Profit & Loss statement: revenue, COGS, gross profit, operating expenses, tax, net profit', parameters: { type: 'object', properties: { startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_balance_sheet', description: 'Compute Balance Sheet: total assets, liabilities, and equity', parameters: { type: 'object', properties: { asOfDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_cash_flow_summary', description: 'Cash flow summary: bank balance, cash in, cash out, net cash flow', parameters: { type: 'object', properties: { startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'generate_chart_data', description: 'Prepare chart data for rendering. Use when user asks for charts, trends, or visualizations. Supports line, bar, pie, doughnut charts.', parameters: { type: 'object', properties: { chartType: { type: 'string', enum: ['line', 'bar', 'pie', 'doughnut'], default: 'line' }, dataType: { type: 'string', enum: ['revenue', 'expenses', 'stock', 'product_revenue'], default: 'revenue' }, period: { type: 'string', enum: ['day', 'week', 'month', 'quarter', 'year'], default: 'month' }, startDate: { type: 'string' }, endDate: { type: 'string' }, limit: { type: 'integer', default: 12 } }, required: ['dataType'] } } },
+  // System & Admin
+  { type: 'function', function: { name: 'get_departments', description: 'List company departments and managers', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_company_users', description: 'List system users, roles, and status', parameters: { type: 'object', properties: { role: { type: 'string' }, limit: { type: 'integer', default: 50 } } } } },
+  { type: 'function', function: { name: 'get_audit_logs', description: 'List recent system audit logs and user activity', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, action: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'get_notifications', description: 'List system notifications and alerts', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, unreadOnly: { type: 'boolean', default: false } } } } },
+];
+
+// Execute a tool by name
+async function executeTool(companyId, toolName, args = {}) {
+  switch (toolName) {
+    // Company & System
+    case 'get_company_info': return getCompanyInfo(companyId);
+    case 'get_dashboard_metrics': return getDashboardMetrics(companyId);
+    // Inventory
+    case 'get_products': return getProducts(companyId, args);
+    case 'get_categories': return getCategories(companyId, args);
+    case 'get_warehouses': return getWarehouses(companyId, args);
+    case 'get_stock_movements': return getStockMovements(companyId, args);
+    case 'get_stock_transfers': return getStockTransfers(companyId, args);
+    case 'get_stock_summary': return getStockSummary(companyId);
+    // Purchasing
+    case 'get_purchases': return getPurchases(companyId, args);
+    case 'get_purchase_orders': return getPurchaseOrders(companyId, args);
+    case 'get_suppliers': return getSuppliers(companyId, args);
+    case 'get_goods_received_notes': return getGoodsReceivedNotes(companyId, args);
+    // Sales
+    case 'get_invoices': return getInvoices(companyId, args);
+    case 'get_quotations': return getQuotations(companyId, args);
+    case 'get_sales_orders': return getSalesOrders(companyId, args);
+    case 'get_delivery_notes': return getDeliveryNotes(companyId, args);
+    case 'get_credit_notes': return getCreditNotes(companyId, args);
+    case 'get_clients': return getClients(companyId, args);
+    case 'get_ar_receipts': return getARReceipts(companyId, args);
+    case 'get_receivables_aging': return getReceivablesAging(companyId);
+    case 'get_sales_summary': return getSalesSummary(companyId, args);
+    // Finance
+    case 'get_expenses': return getExpenses(companyId, args);
+    case 'get_bank_accounts': return getBankAccounts(companyId);
+    case 'get_chart_of_accounts': return getChartOfAccounts(companyId, args);
+    case 'get_journal_entries': return getJournalEntries(companyId, args);
+    case 'get_fixed_assets': return getFixedAssets(companyId);
+    case 'get_loans': return getLoans(companyId);
+    case 'get_ap_payments': return getAPPayments(companyId, args);
+    case 'get_budgets': return getBudgets(companyId, args);
+    // Reports
+    case 'get_profit_loss_summary': return getProfitLossSummary(companyId, args);
+    case 'get_balance_sheet': return getBalanceSheet(companyId, args);
+    case 'get_cash_flow_summary': return getCashFlowSummary(companyId, args);
+    case 'generate_chart_data': return generateChartData(companyId, args);
+    // System & Admin
+    case 'get_departments': return getDepartments(companyId, args);
+    case 'get_company_users': return getCompanyUsers(companyId, args);
+    case 'get_audit_logs': return getAuditLogs(companyId, args);
+    case 'get_notifications': return getNotifications(companyId, args);
+    default: return { error: `Unknown tool: ${toolName}` };
+  }
+}
+
+module.exports = {
+  TOOL_DEFINITIONS,
+  executeTool,
+  getDashboardMetrics,
+  generateChartData,
+  getProfitLossSummary,
+  getCategories,
+  getWarehouses,
+  getStockMovements,
+  getStockTransfers,
+  getSuppliers,
+  getPurchaseOrders,
+  getGoodsReceivedNotes,
+  getCreditNotes,
+  getDeliveryNotes,
+  getQuotations,
+  getSalesOrders,
+  getARReceipts,
+  getAPPayments,
+  getChartOfAccounts,
+  getJournalEntries,
+  getBudgets,
+  getDepartments,
+  getCompanyUsers,
+  getAuditLogs,
+  getNotifications,
+  getBalanceSheet,
+  getCashFlowSummary,
+};

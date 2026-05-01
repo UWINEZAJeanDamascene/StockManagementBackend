@@ -35,7 +35,7 @@ const apPaymentSchema = new mongoose.Schema({
   bankAccount: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'BankAccount',
-    required: true
+    default: null
   },
   
   // Amount paid (DECIMAL(18,2))

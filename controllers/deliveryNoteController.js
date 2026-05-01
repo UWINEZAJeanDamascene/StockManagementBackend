@@ -28,6 +28,16 @@ const ERR_SERIAL_NOT_IN_STOCK = "ERR_SERIAL_NOT_IN_STOCK";
 const ERR_SERIAL_WRONG_WAREHOUSE = "ERR_SERIAL_WRONG_WAREHOUSE";
 const ERR_EXCEEDS_INVOICE_QTY = "ERR_EXCEEDS_INVOICE_QTY";
 const ERR_COST_LOOKUP_FAILED = "ERR_COST_LOOKUP_FAILED";
+
+// Helper to convert MongoDB Decimal128 to number
+const toNumber = (value) => {
+  if (typeof value === 'number') return value;
+  if (value && typeof value === 'object' && value.$numberDecimal) {
+    return parseFloat(value.$numberDecimal);
+  }
+  if (typeof value === 'string') return parseFloat(value) || 0;
+  return 0;
+};
 const ERR_COGS_ADJUSTMENT_FAILED = "ERR_COGS_ADJUSTMENT_FAILED";
 
 // COGS adjustment tolerance (0.01 = 1 cent)
@@ -234,6 +244,7 @@ exports.getDeliveryNotes = async (req, res, next) => {
     let deliveryNotes = await DeliveryNote.find(query)
       .populate("client", "name code contact taxId")
       .populate("quotation", "referenceNo")
+      .populate("salesOrder", "referenceNo quotation")
       .populate("invoice", "referenceNo status grandTotal currencyCode") // include referenceNo
       .populate("warehouse", "name code")
       .populate("lines.product", "name sku unit")
@@ -243,6 +254,13 @@ exports.getDeliveryNotes = async (req, res, next) => {
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
+
+    // Populate nested salesOrder.quotation
+    await Promise.all(deliveryNotes.map(async (dn) => {
+      if (dn.salesOrder?.quotation) {
+        await dn.salesOrder.populate('quotation', 'referenceNo');
+      }
+    }));
 
     // Enhance with computed fields for frontend compatibility
     deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
@@ -272,6 +290,7 @@ exports.getDeliveryNote = async (req, res, next) => {
     })
       .populate("client", "name code contact type taxId address")
       .populate("quotation", "referenceNo status items")
+      .populate("salesOrder", "referenceNo quotation")
       .populate("invoice", "referenceNo status grandTotal currencyCode")
       .populate("warehouse", "name code")
       .populate("lines.product", "name sku unit trackingType")
@@ -279,6 +298,11 @@ exports.getDeliveryNote = async (req, res, next) => {
       .populate("createdBy", "name email")
       .populate("confirmedBy", "name email")
       .populate("cancelledBy", "name email");
+
+    // Populate nested salesOrder.quotation
+    if (deliveryNote.salesOrder?.quotation) {
+      await deliveryNote.salesOrder.populate('quotation', 'referenceNo');
+    }
 
     // Enhance with computed fields for frontend compatibility
     deliveryNote = enhanceDeliveryNotes(deliveryNote);
@@ -368,8 +392,9 @@ exports.createDeliveryNote = async (req, res, next) => {
         }
 
         // Calculate remaining qty that can be delivered
-        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
-        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        const alreadyDelivered = toNumber(invoiceLine.qtyDelivered);
+        const invoiceQty = toNumber(invoiceLine.quantity);
+        const remainingQty = invoiceQty - alreadyDelivered;
         const qtyToDeliver = line.qtyToDeliver || remainingQty;
 
         if (qtyToDeliver > remainingQty) {
@@ -386,16 +411,16 @@ exports.createDeliveryNote = async (req, res, next) => {
           productName: invoiceLine.description,
           productCode: invoiceLine.itemCode,
           unit: invoiceLine.unit,
-          orderedQty: invoiceLine.quantity, // Original ordered qty
+          orderedQty: invoiceQty, // Original ordered qty
           qtyToDeliver: qtyToDeliver,
           deliveredQty: 0,
           pendingQty: qtyToDeliver,
           unitCost:
-            invoiceLine.quantity > 0
+            invoiceQty > 0
               ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
                   ? Number(invoiceLine.cogsAmount.toString())
                   : Number(invoiceLine.cogsAmount || 0)) /
-                Number(invoiceLine.quantity || 1)
+                invoiceQty
               : 0,
           batchId: line.batchId || null,
           serialNumbers: line.serialNumbers || [],
@@ -405,8 +430,9 @@ exports.createDeliveryNote = async (req, res, next) => {
     } else {
       // Auto-create lines for all invoice lines with remaining qty
       for (const invoiceLine of invoice.lines) {
-        const alreadyDelivered = invoiceLine.qtyDelivered || 0;
-        const remainingQty = invoiceLine.quantity - alreadyDelivered;
+        const alreadyDelivered = toNumber(invoiceLine.qtyDelivered);
+        const invoiceQty = toNumber(invoiceLine.quantity);
+        const remainingQty = invoiceQty - alreadyDelivered;
         if (remainingQty > 0) {
           deliveryLines.push({
             invoiceLineId: invoiceLine._id,
@@ -414,16 +440,16 @@ exports.createDeliveryNote = async (req, res, next) => {
             productName: invoiceLine.description,
             productCode: invoiceLine.itemCode,
             unit: invoiceLine.unit,
-            orderedQty: invoiceLine.quantity,
+            orderedQty: invoiceQty,
             qtyToDeliver: remainingQty,
             deliveredQty: 0,
             pendingQty: remainingQty,
             unitCost:
-              invoiceLine.quantity > 0
+              invoiceQty > 0
                 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
                     ? Number(invoiceLine.cogsAmount.toString())
                     : Number(invoiceLine.cogsAmount || 0)) /
-                  Number(invoiceLine.quantity || 1)
+                  invoiceQty
                 : 0,
             batchId: null,
             serialNumbers: [],
@@ -1258,6 +1284,57 @@ exports.dispatchDeliveryNote = async (req, res, next) => {
   }
 };
 
+// @desc    Mark delivery note as delivered
+// @route   PUT /api/delivery-notes/:id/deliver
+// @access  Private
+exports.markDelivered = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const deliveryNoteId = req.params.id;
+    const { receivedBy, receivedDate, notes } = req.body;
+
+    const deliveryNote = await DeliveryNote.findOne({
+      _id: deliveryNoteId,
+      company: companyId,
+    });
+
+    if (!deliveryNote) {
+      return res.status(404).json({
+        success: false,
+        code: ERR_DELIVERY_NOT_FOUND,
+        message: "Delivery note not found",
+      });
+    }
+
+    // Can only mark as delivered if status is dispatched
+    if (deliveryNote.status !== 'dispatched') {
+      return res.status(400).json({
+        success: false,
+        code: ERR_DELIVERY_CONFIRMED,
+        message: `Cannot mark as delivered. Current status: ${deliveryNote.status}`,
+      });
+    }
+
+    // Update delivery information
+    if (receivedBy) deliveryNote.deliveredBy = receivedBy;
+    if (receivedDate) deliveryNote.actualDeliveryDate = new Date(receivedDate);
+    if (notes) deliveryNote.notes = notes;
+
+    // Change status to delivered
+    deliveryNote.status = 'delivered';
+
+    await deliveryNote.save();
+
+    res.status(200).json({
+      success: true,
+      data: deliveryNote,
+      message: "Delivery note marked as delivered successfully",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // @desc    Cancel confirmed delivery note (Module 7 - reverse stock)
 // @route   POST /api/delivery-notes/:id/cancel
 // @access  Private
@@ -1534,7 +1611,8 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
         const product = line.product;
         if (!product) return null;
 
-        const unitPrice = product.sellingPrice || 0;
+        // Use the unitPrice from the delivery note line (set from SO/Quotation), fallback to product.sellingPrice
+        const unitPrice = line.unitPrice || product.sellingPrice || 0;
         const subtotal = quantity * unitPrice;
         const discountPct = 0;
         const netAmount = subtotal;

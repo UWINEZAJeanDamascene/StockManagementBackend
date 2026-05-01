@@ -716,11 +716,11 @@ class JournalService {
       ));
     }
 
-    // Debit: VAT Receivable
+    // Debit: VAT Input (2210) — input tax claimable from RRA
     if (vatAmount > 0) {
-      const vatRecv = await this.getMappedAccountCode(companyId, 'purchases', 'vatReceivable', DEFAULT_ACCOUNTS.vatReceivable);
+      const vatInputAcct = await this.getMappedAccountCode(companyId, 'tax', 'vatInput', DEFAULT_ACCOUNTS.vatInput);
       lines.push(this.createDebitLine(
-        vatRecv,
+        vatInputAcct,
         vatAmount,
         `Purchase ${purchase.purchaseNumber} - VAT`
       ));
@@ -869,10 +869,9 @@ class JournalService {
       ));
     }
 
-    // Debit: VAT Receivable / Input VAT (tax amount)
-    // This properly separates VAT so it's tracked as input VAT
+    // Debit: VAT Input (2210) — input tax on expenses
     if (vatAmount > 0) {
-      const vatAccount = await this.getMappedAccountCode(companyId, 'purchases', 'vatReceivable', DEFAULT_ACCOUNTS.vatReceivable);
+      const vatAccount = await this.getMappedAccountCode(companyId, 'tax', 'vatInput', DEFAULT_ACCOUNTS.vatInput);
       lines.push(this.createDebitLine(
         vatAccount,
         vatAmount,
@@ -935,9 +934,9 @@ class JournalService {
       ));
     }
 
-    // Debit: VAT Receivable / Input VAT (if VAT amount is provided)
+    // Debit: VAT Input (2210) — input tax on asset purchases
     if (vatAmount > 0) {
-      const vatAccount = await this.getMappedAccountCode(companyId, 'purchases', 'vatReceivable', DEFAULT_ACCOUNTS.vatReceivable);
+      const vatAccount = await this.getMappedAccountCode(companyId, 'tax', 'vatInput', DEFAULT_ACCOUNTS.vatInput);
       lines.push(this.createDebitLine(
         vatAccount,
         vatAmount,
@@ -1368,10 +1367,10 @@ class JournalService {
       ));
     }
 
-    // Credit: VAT Receivable
+    // Credit: VAT Input (2210) — reversal of input VAT on purchase return
     if (vatAmount > 0) {
       lines.push(this.createCreditLine(
-        DEFAULT_ACCOUNTS.vatReceivable,
+        DEFAULT_ACCOUNTS.vatInput,
         vatAmount,
         `Purchase Return ${purchaseReturn.returnNumber} - VAT`
       ));
@@ -1430,40 +1429,53 @@ class JournalService {
   // =====================================================
 
   /**
-   * Stock adjustment (increase)
-   * Debit: Inventory
-   * Credit: Stock Adjustment (Revenue) / Cost of Goods Sold
+   * Stock adjustment entry
+   * Uses 7100 Stock Adjustment (Asset) as clearing account for all adjustments.
+   * Surplus: DR Inventory, CR 7100
+   * Shortage: DR 7100, CR Inventory
+   * The 7100 balance is periodically cleared to Stock Adjustment Loss (5150) if needed.
    */
   static async createStockAdjustmentEntry(companyId, userId, adjustment) {
     const lines = [];
     const amount = adjustment.adjustmentAmount || 0;
     const adjustmentType = adjustment.adjustmentType; // 'increase' or 'decrease'
 
+    // Resolve inventory account (support warehouse/product overrides)
+    let inventoryAcct = DEFAULT_ACCOUNTS.inventory;
+    if (adjustment.warehouseId || adjustment.productId) {
+      const context = {};
+      if (adjustment.warehouseId) context.warehouseId = adjustment.warehouseId;
+      if (adjustment.productId) context.productId = adjustment.productId;
+      try {
+        inventoryAcct = await this.getMappedAccountCode(companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory, context);
+      } catch (err) {
+        // fallback to default
+      }
+    }
+
     if (adjustmentType === 'increase') {
-      // Debit: Inventory
+      // Surplus: Debit Inventory, Credit 7100 Stock Adjustment
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.inventory,
+        inventoryAcct,
         amount,
         `Stock adjustment increase: ${adjustment.productName}`
       ));
 
-      // Credit: Stock Adjustment Income
       lines.push(this.createCreditLine(
         DEFAULT_ACCOUNTS.stockAdjustment || '7100',
         amount,
         `Stock adjustment increase: ${adjustment.productName}`
       ));
     } else {
-      // Debit: Cost of Goods Sold
+      // Shortage: Debit 7100 Stock Adjustment, Credit Inventory
       lines.push(this.createDebitLine(
-        DEFAULT_ACCOUNTS.costOfGoodsSold,
+        DEFAULT_ACCOUNTS.stockAdjustment || '7100',
         amount,
         `Stock adjustment decrease: ${adjustment.productName}`
       ));
 
-      // Credit: Inventory
       lines.push(this.createCreditLine(
-        DEFAULT_ACCOUNTS.inventory,
+        inventoryAcct,
         amount,
         `Stock adjustment decrease: ${adjustment.productName}`
       ));

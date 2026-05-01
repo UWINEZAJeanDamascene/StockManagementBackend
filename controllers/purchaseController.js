@@ -3,6 +3,7 @@ const Product = require("../models/Product");
 const Supplier = require("../models/Supplier");
 const StockMovement = require("../models/StockMovement");
 const Company = require("../models/Company");
+const APPayment = require("../models/APPayment");
 const PDFDocument = require("pdfkit");
 const {
   notifyStockReceived,
@@ -898,6 +899,45 @@ exports.recordPayment = async (req, res, next) => {
       } catch (encErr) {
         console.error('Error processing encumbrance liquidation on payment:', encErr);
       }
+    }
+
+    // Auto-create APPayment for system-generated ledger record
+    let autoPayment = null;
+    try {
+      const refNo = `PAY-SYS-${Date.now()}-${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+      autoPayment = new APPayment({
+        company: companyId,
+        supplier: purchase.supplier,
+        paymentDate: new Date(),
+        paymentMethod: paymentMethod === "mobile_money" || paymentMethod === "card"
+          ? "bank_transfer"
+          : ["bank_transfer", "cash", "cheque", "other"].includes(paymentMethod)
+            ? paymentMethod
+            : "other",
+        bankAccount: bankAccountId || null,
+        amountPaid: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
+        currencyCode: purchase.currencyCode || "USD",
+        exchangeRate: mongoose.Types.Decimal128.fromString("1"),
+        referenceNo: refNo,
+        reference: reference || `Payment for Purchase ${purchase.purchaseNumber}`,
+        status: "posted",
+        postedBy: req.user.id,
+        postedAt: new Date(),
+        notes: notes || `System-generated payment for purchase`,
+        createdBy: req.user.id,
+      });
+      await autoPayment.save();
+
+      // Create AP tracking transaction so Dashboard/Transactions tabs show data
+      try {
+        const APTrackingService = require("../services/apTrackingService");
+        await APTrackingService.recordPaymentPosted(autoPayment, req.user.id);
+      } catch (trackingErr) {
+        console.error("AP tracking error for auto payment:", trackingErr);
+      }
+    } catch (apPaymentError) {
+      console.error("Error auto-creating AP payment for purchase payment:", apPaymentError);
+      // Non-fatal — purchase payment already recorded
     }
 
     // Invalidate report cache - payment affects Balance Sheet (cash, payables) and P&L

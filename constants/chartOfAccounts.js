@@ -351,6 +351,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "debit",
     allowDirectPosting: true,
   },
+  3500: {
+    name: "Opening Balance Equity",
+    type: "equity",
+    subtype: "opening_balance",
+    normalBalance: "credit",
+    allowDirectPosting: true,
+  },
 
   // ── REVENUE (4000-4999) ────────
   4000: {
@@ -755,6 +762,7 @@ const DEFAULT_ACCOUNTS = {
   currentProfit: "3200",
   ownerDrawings: "3300",
   dividendsPaid: "3300",
+  openingBalanceEquity: "3500",
 
   // Other
   otherIncome: "4200",

@@ -32,7 +32,8 @@ const systemRoles = [
     is_system_role: true,
     permissions: [
       { resource: 'products', actions: ['read', 'create', 'update'] },
-      { resource: 'invoices', actions: ['read', 'create', 'update'] },
+      { resource: 'sales_invoices', actions: ['read', 'create', 'update'] },
+      { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
       { resource: 'users', actions: ['read', 'create', 'update'] },
       { resource: 'reports', actions: ['read'] }
     ]
@@ -44,7 +45,9 @@ const systemRoles = [
     permissions: [
       { resource: 'products', actions: ['read', 'create', 'update', 'delete'] },
       { resource: 'stock', actions: ['read', 'create', 'update'] },
-      { resource: 'suppliers', actions: ['read', 'create', 'update'] }
+      { resource: 'suppliers', actions: ['read', 'create', 'update'] },
+      { resource: 'warehouses', actions: ['read', 'create', 'update'] },
+      { resource: 'stock_transfers', actions: ['read', 'create', 'update'] }
     ]
   },
   {
@@ -54,18 +57,28 @@ const systemRoles = [
     permissions: [
       { resource: 'products', actions: ['read'] },
       { resource: 'clients', actions: ['read', 'create', 'update'] },
-      { resource: 'invoices', actions: ['read', 'create'] },
-      { resource: 'quotations', actions: ['read', 'create', 'update'] }
+      { resource: 'sales_invoices', actions: ['read', 'create', 'update'] },
+      { resource: 'quotations', actions: ['read', 'create', 'update'] },
+      { resource: 'delivery_notes', actions: ['read', 'create'] },
+      { resource: 'credit_notes', actions: ['read', 'create'] },
+      { resource: 'ar_receipts', actions: ['read', 'create'] }
     ]
   },
   {
     name: 'viewer',
-    description: 'Read-only access',
+    description: 'Read-only access to all modules',
     is_system_role: true,
     permissions: [
       { resource: 'products', actions: ['read'] },
-      { resource: 'invoices', actions: ['read'] },
-      { resource: 'reports', actions: ['read'] }
+      { resource: 'stock', actions: ['read'] },
+      { resource: 'sales_invoices', actions: ['read'] },
+      { resource: 'purchase_orders', actions: ['read'] },
+      { resource: 'clients', actions: ['read'] },
+      { resource: 'suppliers', actions: ['read'] },
+      { resource: 'reports', actions: ['read'] },
+      { resource: 'quotations', actions: ['read'] },
+      { resource: 'journal_entries', actions: ['read'] },
+      { resource: 'chart_of_accounts', actions: ['read'] }
     ]
   },
   {
@@ -74,9 +87,17 @@ const systemRoles = [
     is_system_role: true,
     permissions: [
       { resource: 'journal_entries', actions: ['read', 'create', 'update', 'post'] },
-      { resource: 'invoices', actions: ['read'] },
-      { resource: 'reports', actions: ['read'] },
-      { resource: 'accounting', actions: ['read', 'create', 'update', 'post'] }
+      { resource: 'chart_of_accounts', actions: ['read', 'create', 'update'] },
+      { resource: 'sales_invoices', actions: ['read', 'update'] },
+      { resource: 'purchase_orders', actions: ['read'] },
+      { resource: 'reports', actions: ['read', 'create'] },
+      { resource: 'bank_accounts', actions: ['read', 'create', 'update'] },
+      { resource: 'ar_receipts', actions: ['read', 'create', 'update'] },
+      { resource: 'ap_payments', actions: ['read', 'create', 'update'] },
+      { resource: 'expenses', actions: ['read', 'create', 'update'] },
+      { resource: 'budgets', actions: ['read', 'create', 'update'] },
+      { resource: 'payroll', actions: ['read', 'create', 'update'] },
+      { resource: 'periods', actions: ['read', 'update', 'close'] }
     ]
   },
   {
@@ -86,7 +107,10 @@ const systemRoles = [
     permissions: [
       { resource: 'products', actions: ['read'] },
       { resource: 'suppliers', actions: ['read', 'create', 'update'] },
-      { resource: 'purchases', actions: ['read', 'create', 'update'] }
+      { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
+      { resource: 'grn', actions: ['read', 'create', 'update'] },
+      { resource: 'purchase_returns', actions: ['read', 'create', 'update'] },
+      { resource: 'ap_payments', actions: ['read'] }
     ]
   },
   {
@@ -95,8 +119,11 @@ const systemRoles = [
     is_system_role: true,
     permissions: [
       { resource: 'stock', actions: ['read', 'create', 'update'] },
+      { resource: 'warehouses', actions: ['read', 'create', 'update'] },
       { resource: 'stock_transfers', actions: ['read', 'create', 'update'] },
-      { resource: 'delivery_notes', actions: ['read', 'create', 'update'] }
+      { resource: 'stock_audits', actions: ['read', 'create', 'update'] },
+      { resource: 'delivery_notes', actions: ['read', 'create', 'update'] },
+      { resource: 'pick_packs', actions: ['read', 'create', 'update'] }
     ]
   }
 ];
@@ -109,7 +136,11 @@ async function run() {
   for (const roleData of systemRoles) {
     const existing = await Role.findOne({ name: roleData.name, is_system_role: true });
     if (existing) {
-      console.log(`Role "${roleData.name}" already exists - skipping.`);
+      // Update existing role with new permissions
+      existing.description = roleData.description;
+      existing.permissions = roleData.permissions;
+      await existing.save();
+      console.log(`Updated role: ${roleData.name}`);
       continue;
     }
 

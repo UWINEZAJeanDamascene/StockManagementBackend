@@ -701,8 +701,7 @@ bankAccountSchema.methods.addTransaction = async function (transactionData) {
   const txType = transactionData.type;
   if (
     txType === "deposit" ||
-    txType === "transfer_in" ||
-    txType === "opening"
+    txType === "transfer_in"
   ) {
     newBal += transactionData.amount;
   } else if (
@@ -801,8 +800,9 @@ bankAccountSchema.methods.getBalance = async function (JournalEntry, asOfDate) {
     totalCredits = agg[0].totalCredits || 0;
   }
 
-  // current_balance = opening_balance + DR - CR
-  const computedBalance = openingBalance + totalDebits - totalCredits;
+  // current_balance = DR - CR (opening balance is already in the journal via opening balance entry)
+  // Per spec 3.3: Balance is computed from journal entries, not stored separately
+  const computedBalance = totalDebits - totalCredits;
   const now = new Date();
 
   // Update cache

@@ -196,7 +196,7 @@ const creditNoteSchema = new mongoose.Schema(
     currencyCode: {
       type: String,
       required: true,
-      default: "USD",
+      default: "FRW",
     },
 
     // Amounts

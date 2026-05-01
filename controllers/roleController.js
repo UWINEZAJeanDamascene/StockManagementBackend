@@ -189,15 +189,6 @@ exports.updateRole = async (req, res, next) => {
       });
     }
 
-    // Cannot modify system roles
-    if (role.is_system_role) {
-      return res.status(403).json({
-        success: false,
-        error: 'CANNOT_MODIFY_SYSTEM_ROLE',
-        message: 'System roles cannot be modified'
-      });
-    }
-
     // Check if trying to change name to an existing role
     if (name && name.trim() !== role.name) {
       const existingRole = await Role.findOne({
@@ -214,6 +205,9 @@ exports.updateRole = async (req, res, next) => {
         });
       }
     }
+
+    // Prevent changing is_system_role flag (system roles must stay system, custom must stay custom)
+    // This maintains data integrity while allowing edits to permissions
 
     // Update fields
     if (name) role.name = name.trim();

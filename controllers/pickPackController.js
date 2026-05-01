@@ -545,13 +545,16 @@ exports.completePacking = async (req, res, next) => {
     let deliveryNote = null;
     try {
       const DeliveryNote = require('../models/DeliveryNote');
-      
-      // Fetch product selling prices for delivery note totals
-      const Product = require('../models/Product');
-      
-      const deliveryLines = await Promise.all(pickPack.lines.map(async (line) => {
-        const product = await Product.findById(line.product);
-        const unitPrice = product?.sellingPrice || 0;
+      const SalesOrder = require('../models/SalesOrder');
+
+      // Fetch sales order with lines to get correct unit prices
+      const salesOrder = await SalesOrder.findById(pickPack.salesOrder._id);
+
+      const deliveryLines = pickPack.lines.map((line) => {
+        // Find matching sales order line by lineId
+        const soLine = salesOrder?.lines?.find(l => l.lineId === line.salesOrderLineId);
+        // Use sales order line unitPrice, fallback to product lookup if needed
+        const unitPrice = soLine?.unitPrice || 0;
         const qtyToDeliver = line.qtyPacked;
         return {
           product: line.product,
@@ -564,7 +567,7 @@ exports.completePacking = async (req, res, next) => {
           batchId: line.batchId,
           serialNumbers: line.serialNumbers || []
         };
-      }));
+      });
       
       deliveryNote = await DeliveryNote.create({
         company: companyId,

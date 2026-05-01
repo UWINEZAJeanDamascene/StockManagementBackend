@@ -175,7 +175,6 @@ function buildConfig() {
       provider: (process.env.EMAIL_PROVIDER || 'gmail').toLowerCase(),
       gmailUser: process.env.GMAIL_USER || null,
       gmailAppPassword: process.env.GMAIL_APP_PASSWORD || null,
-      resendApiKey: process.env.RESEND_API_KEY || null,
       smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
       smtpPort: number(process.env.SMTP_PORT, 587),
       smtpUser: process.env.SMTP_USER || null,
@@ -221,6 +220,9 @@ function buildConfig() {
     // =====================
     ai: {
       geminiApiKey: process.env.GEMINI_API_KEY || null,
+      groqApiKey: process.env.GROQ_API_KEY || null,
+      groqBaseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
+      groqModel: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
     },
     
     // =====================

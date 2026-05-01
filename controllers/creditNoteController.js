@@ -34,7 +34,7 @@ const sendCreditNoteEmail = async (note, company, client, action) => {
         <tr>
           <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.productName || line.description || 'Item'}</td>
           <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.quantity || 0}</td>
-          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${note.currencyCode || 'USD'} ${(line.unitPrice || 0).toFixed(2)}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${note.currencyCode || 'FRW'} ${(line.unitPrice || 0).toFixed(2)}</td>
         </tr>
       `).join('');
     }
@@ -63,7 +63,7 @@ const sendCreditNoteEmail = async (note, company, client, action) => {
             <tbody>${itemsHtml}</tbody>
           </table>
           <div style="text-align:right; margin:20px 0;">
-            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#f59e0b;">Total: ${note.currencyCode || 'USD'} ${(note.totalAmount || note.grandTotal || 0).toFixed(2)}</p>
+            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#f59e0b;">Total: ${note.currencyCode || 'FRW'} ${(note.totalAmount || note.grandTotal || 0).toFixed(2)}</p>
           </div>
           ${note.reason ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Reason:</strong><br/>${note.reason}</div>` : ''}
           <div style="text-align:center; margin-top:30px;">
@@ -197,6 +197,7 @@ exports.createCreditNote = async (req, res, next) => {
       ...req.body,
       company: companyId,
       client: invoice.client,
+      currencyCode: req.body.currencyCode || invoice.currencyCode || 'FRW',
       createdBy: req.user.id,
     };
     // Normalize and calculate line totals before creating so tax amounts persist
@@ -919,7 +920,8 @@ exports.updateCreditNote = async (req, res, next) => {
     }
 
     await note.save();
-    await note.populate("client lines.product warehouse createdBy invoice");
+    await note.populate("client lines.product createdBy invoice");
+    await note.populate("lines.returnToWarehouse");
 
     res.json({ success: true, data: note });
   } catch (err) {
@@ -1238,12 +1240,6 @@ exports.confirmCreditNote = async (req, res, next) => {
         totalAmount,
       );
 
-      // Use TaxAutomationService for centralized tax reversal
-      const reversalTax = await TaxAutomationService.reverseSalesTax(
-        companyId,
-        [{ netAmount: totalSubtotal, originalTaxAmount: totalTax }],
-      );
-
       // Credit notes use Sales Returns account (4100), not Sales Revenue (4000)
       // Sales Returns is a contra-revenue account that increases with debit
       let salesReturnsAccount = DEFAULT_ACCOUNTS.salesReturns;
@@ -1268,14 +1264,31 @@ exports.confirmCreditNote = async (req, res, next) => {
         }
       }
 
-      // Build revenue reversal lines — use Sales Returns account (contra-revenue)
-      const revenueLines = reversalTax.journalLines.map((l) => {
-        if (l.accountCode === DEFAULT_ACCOUNTS.salesRevenue) {
-          // Replace sales revenue with sales returns account
-          return { ...l, accountCode: salesReturnsAccount, accountName: 'Sales Returns', description: narration };
-        }
-        return { ...l, description: narration };
-      });
+      // Build revenue reversal lines with proper debit/credit amounts
+      // For credit note: DR Sales Returns (contra-revenue), DR VAT Output, CR Accounts Receivable
+      const revenueLines = [
+        {
+          accountCode: salesReturnsAccount,
+          accountName: 'Sales Returns',
+          description: narration,
+          debit: totalSubtotal,
+          credit: 0,
+        },
+        ...(totalTax > 0 ? [{
+          accountCode: DEFAULT_ACCOUNTS.vatOutput || '2220',
+          accountName: 'VAT Output',
+          description: narration,
+          debit: totalTax,
+          credit: 0,
+        }] : []),
+        {
+          accountCode: DEFAULT_ACCOUNTS.accountsReceivable,
+          accountName: 'Accounts Receivable',
+          description: narration,
+          debit: 0,
+          credit: totalAmount,
+        },
+      ];
 
       // Build COGS lines if goods return
       let cogsLines = null;

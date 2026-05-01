@@ -1,6 +1,7 @@
 const Purchase = require('../models/Purchase');
 const Supplier = require('../models/Supplier');
 const PaymentSchedule = require('../models/PaymentSchedule');
+const APPayment = require('../models/APPayment');
 const cacheService = require('../services/cacheService');
 
 // @desc    Get all payment schedules
@@ -314,6 +315,45 @@ exports.recordSchedulePayment = async (req, res, next) => {
       supplier.outstandingBalance -= paymentAmount;
       if (supplier.outstandingBalance < 0) supplier.outstandingBalance = 0;
       await supplier.save();
+    }
+
+    // Auto-create APPayment for system-generated ledger record
+    let autoPayment = null;
+    try {
+      const refNo = `PAY-SYS-${Date.now()}-${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+      autoPayment = new APPayment({
+        company: companyId,
+        supplier: schedule.supplier,
+        paymentDate: new Date(),
+        paymentMethod: paymentMethod === 'mobile_money' || paymentMethod === 'card'
+          ? 'bank_transfer'
+          : ['bank_transfer', 'cash', 'cheque', 'other'].includes(paymentMethod)
+            ? paymentMethod
+            : 'other',
+        bankAccount: null,
+        amountPaid: mongoose.Types.Decimal128.fromString(paymentAmount.toFixed(2)),
+        currencyCode: purchase.currencyCode || 'USD',
+        exchangeRate: mongoose.Types.Decimal128.fromString('1'),
+        referenceNo: refNo,
+        reference: reference || `Schedule payment for Purchase ${purchase.purchaseNumber}`,
+        status: 'posted',
+        postedBy: req.user.id,
+        postedAt: new Date(),
+        notes: notes || `System-generated payment for schedule installment #${schedule.installmentNumber}`,
+        createdBy: req.user.id,
+      });
+      await autoPayment.save();
+
+      // Create AP tracking transaction so Dashboard/Transactions tabs show data
+      try {
+        const APTrackingService = require("../services/apTrackingService");
+        await APTrackingService.recordPaymentPosted(autoPayment, req.user.id);
+      } catch (trackingErr) {
+        console.error("AP tracking error for auto schedule payment:", trackingErr);
+      }
+    } catch (apPaymentError) {
+      console.error('Error auto-creating AP payment for schedule payment:', apPaymentError);
+      // Non-fatal — schedule payment already recorded
     }
 
     // Invalidate cache

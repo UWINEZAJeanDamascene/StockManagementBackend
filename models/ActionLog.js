@@ -23,7 +23,9 @@ const actionLogSchema = new mongoose.Schema({
       'quotation', 'invoice', 'user', 'category', 'report', 'purchase', 'company', 'department', 'receivable',
       'delivery_note', 'warehouse', 'ar_receipt', 'ar_bad_debt', 'ar_reconciliation', 'pos_sale', 'pos_payment', 
       'drawer_open', 'drawer_close', 'bulk_import', 'payable', 'sales_legacy_direct_sale', 'grn', 'purchase_order', 'purchase_return',
-      'pick_pack', 'sales_order', 'ap_reconciliation', 'ap_payment'
+      'pick_pack', 'sales_order', 'ap_reconciliation', 'ap_payment',
+      // Additional modules observed in audit logs
+      'periods', 'settings'
     ],
     required: true
   },

@@ -99,9 +99,15 @@ exports.createUser = async (req, res, next) => {
     const tempPassword = generateTemp ? generateTempPassword() : req.body.password || generateTempPassword();
     const mustChangePassword = generateTemp || !req.body.password;
 
-    // Look up the Role document by name to link it to the user
+    // Look up the Role document by name - can be system role OR company custom role
     const userRole = role || 'viewer';
-    const roleDoc = await Role.findOne({ name: userRole, is_system_role: true });
+    const roleDoc = await Role.findOne({
+      name: userRole,
+      $or: [
+        { is_system_role: true },
+        { company_id: companyId }
+      ]
+    });
 
     const user = await User.create({
       name,
@@ -145,8 +151,15 @@ exports.updateUser = async (req, res, next) => {
     delete req.body.company;
 
     // If role is being updated, also update the roles array with the corresponding Role document
+    // Can be system role OR company custom role
     if (req.body.role) {
-      const roleDoc = await Role.findOne({ name: req.body.role, is_system_role: true });
+      const roleDoc = await Role.findOne({
+        name: req.body.role,
+        $or: [
+          { is_system_role: true },
+          { company_id: companyId }
+        ]
+      });
       if (roleDoc) {
         req.body.roles = [roleDoc._id];
       }

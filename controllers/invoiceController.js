@@ -4,6 +4,8 @@ const Client = require("../models/Client");
 const StockMovement = require("../models/StockMovement");
 const InventoryBatch = require("../models/InventoryBatch");
 const InvoiceReceiptMetadata = require("../models/InvoiceReceiptMetadata");
+const ARReceipt = require("../models/ARReceipt");
+const ARReceiptAllocation = require("../models/ARReceiptAllocation");
 const PDFDocument = require("pdfkit");
 const notificationService = require("../services/notificationHelper");
 const emailService = require("../services/emailService");
@@ -1522,6 +1524,40 @@ exports.recordPayment = async (req, res, next) => {
       );
     } catch (trackingError) {
       console.error("AR tracking error for payment:", trackingError);
+    }
+
+    // Auto-create ARReceipt and allocation for system-generated ledger record
+    try {
+      const receipt = new ARReceipt({
+        company: companyId,
+        client: invoice.client,
+        receiptDate: new Date(),
+        paymentMethod: paymentMethod,
+        bankAccount: req.body.bankAccountId || null,
+        amountReceived: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
+        currencyCode: invoice.currencyCode || "USD",
+        exchangeRate: mongoose.Types.Decimal128.fromString("1"),
+        reference: reference || `Payment for Invoice ${invoice.invoiceNumber}`,
+        status: "posted",
+        postedBy: req.user.id,
+        postedAt: new Date(),
+        notes: notes || `System-generated receipt for invoice payment`,
+        createdBy: req.user.id,
+      });
+      await receipt.save();
+
+      // Create allocation linking receipt to the invoice
+      const allocation = new ARReceiptAllocation({
+        receipt: receipt._id,
+        invoice: invoice._id,
+        amountAllocated: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
+        company: companyId,
+        createdBy: req.user.id,
+      });
+      await allocation.save();
+    } catch (arReceiptError) {
+      console.error("Error auto-creating AR receipt for invoice payment:", arReceiptError);
+      // Non-fatal — payment already recorded, journal entries posted
     }
 
     res.json({

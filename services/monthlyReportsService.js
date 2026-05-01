@@ -2868,12 +2868,11 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualTaxObligations(companyId, startYear, startMonth, endYear, endMonth) {
     const { start, end } = getSemiAnnualRange(startYear, startMonth, endYear, endMonth);
-    const [Invoice, Purchase, Payslip, JournalEntry, Payment] = await Promise.all([
+    const [Invoice, Purchase, Payslip, JournalEntry] = await Promise.all([
       mongoose.model('Invoice'),
       mongoose.model('Purchase'),
       mongoose.model('Payslip'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('Payment')
+      mongoose.model('JournalEntry')
     ]);
 
     // VAT Analysis
@@ -2940,18 +2939,18 @@ class MonthlyReportsService {
     const totalRSSB = totalRSSBEmployee + totalRSSBEmployer;
     const maternityContribution = rssbData[0]?.maternity || 0;
 
-    // Withholding Tax (from payments to suppliers)
-    const withholdingData = await Payment.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          paymentDate: { $gte: start, $lte: end },
-          withholdingTax: { $gt: 0 }
-        }
-      },
-      { $group: { _id: null, totalWithholding: { $sum: { $toDouble: '$withholdingTax' } } } }
+    // Withholding Tax: derive from invoices and purchases where withholdingTax is recorded
+    const invoiceWHT = await Invoice.aggregate([
+      { $match: { company: new mongoose.Types.ObjectId(companyId), invoiceDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } } } }
     ]);
-    const totalWithholdingTax = withholdingData[0]?.totalWithholding || 0;
+
+    const purchaseWHT = await Purchase.aggregate([
+      { $match: { company: new mongoose.Types.ObjectId(companyId), purchaseDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
+      { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } } } }
+    ]);
+
+    const totalWithholdingTax = (invoiceWHT[0]?.total || 0) + (purchaseWHT[0]?.total || 0);
 
     // Get remittances from journal entries (payments to tax authorities)
     const taxRemittances = await JournalEntry.aggregate([

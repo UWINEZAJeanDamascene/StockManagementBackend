@@ -8,6 +8,7 @@ const {
   deleteDeliveryNote,
   confirmDelivery,
   dispatchDeliveryNote,
+  markDelivered,
   cancelDeliveryNote,
   createInvoiceFromDeliveryNote,
   getInvoiceDeliveryNotes,
@@ -45,6 +46,10 @@ router.route('/:id/confirm')
 
 router.route('/:id/dispatch')
   .put(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), dispatchDeliveryNote);
+
+// Mark delivery note as delivered
+router.route('/:id/deliver')
+  .put(authorize('admin', 'sales', 'stock_manager'), logAction('delivery_note'), markDelivered);
 
 router.route('/:id/cancel')
   .post(authorize('admin'), logAction('delivery_note'), cancelDeliveryNote)

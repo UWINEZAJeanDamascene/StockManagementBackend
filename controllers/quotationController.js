@@ -621,31 +621,31 @@ exports.convertToInvoice = async (req, res, next) => {
     }
 
     // Create invoice from quotation
-    // Ensure lines include invoice's required fields
+    // Ensure lines include invoice's required fields (matching Invoice schema)
     const processedItems = (quotation.lines || []).map((line, idx) => {
-      const quantity = parseFloat(line.qty || line.quantity || 0);
+      const qty = parseFloat(line.qty || line.quantity || 0);
       const unitPrice = parseFloat(line.unitPrice || 0);
-      const discount = parseFloat(line.discountPct || line.discount || 0);
-      const subtotal = quantity * unitPrice;
-      const netAmount = subtotal - (quantity * unitPrice * discount / 100);
+      const discountPct = parseFloat(line.discountPct || line.discount || 0);
+      const lineSubtotal = qty * unitPrice;
+      const netAmount = lineSubtotal - (lineSubtotal * discountPct / 100);
       const taxRate = parseFloat(line.taxRate != null ? line.taxRate : (line.product?.taxRate != null ? line.product.taxRate : 0));
       const taxCode = line.taxCode || line.product?.taxCode || 'A';
-      const taxAmount = netAmount * (taxRate / 100);
-      const totalWithTax = netAmount + taxAmount;
+      const lineTax = netAmount * (taxRate / 100);
+      const lineTotal = netAmount + lineTax;
 
       return {
         product: line.product,
-        itemCode: line.itemCode || `ITEM-${idx + 1}`,
+        productCode: line.itemCode || `ITEM-${idx + 1}`,
         description: line.description || (line.product && line.product.name) || '',
-        quantity,
+        qty,
         unit: line.unit || (line.product && line.product.unit) || '',
         unitPrice,
-        discount,
+        discountPct,
         taxCode,
         taxRate,
-        taxAmount,
-        subtotal,
-        totalWithTax
+        lineTax,
+        lineSubtotal,
+        lineTotal
       };
     });
 

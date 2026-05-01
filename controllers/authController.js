@@ -32,8 +32,8 @@ exports.login = async (req, res, next) => {
       });
     }
 
-    // Check for user
-    const user = await User.findOne({ email: email.toLowerCase() }).select('+password').populate('company', 'name email isActive approvalStatus');
+     // Check for user
+     const user = await User.findOne({ email: email.toLowerCase() }).select('+password').populate('company', 'name email isActive approvalStatus').populate('roles');
 
     if (!user) {
       return res.status(401).json({ 
@@ -132,39 +132,110 @@ exports.login = async (req, res, next) => {
     // Check if account requires password change (first login with temp password)
     const requirePasswordChange = user.mustChangePassword;
 
-    // Update last login
-    user.lastLogin = new Date();
-    await user.save();
+     // Update last login
+     user.lastLogin = new Date();
+     await user.save();
 
-    // Generate token with companyId
-    const token = generateToken(user._id, user.company._id, user.role);
+     // Generate token with companyId
+     const token = generateToken(user._id, user.company._id, user.role);
 
-    // Remove password from user object
-    const userWithoutPassword = user.toJSON();
+     // Remove password from user object
+     const userWithoutPassword = user.toJSON();
 
-    // Create Redis session
-    await sessionService.createSession(
-      user._id.toString(),
-      user.company._id.toString(),
-      user.role,
-      token,
-      { email: user.email, name: user.name, companyName: user.company.name }
-    );
+     // Compute flat permissions array from populated roles
+     // Format: ["products:read", "products:create", "stock:read", ...]
+     const permissionsSet = new Set();
 
-    // Set httpOnly cookie for token
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: config.server.env === 'production',
-      sameSite: 'lax',
-      maxAge: (config.session && config.session.ttl ? config.session.ttl : 24 * 60 * 60) * 1000,
-    });
+     // Admin and platform_admin get wildcard permissions
+     if (user.role === 'admin' || user.role === 'platform_admin') {
+       permissionsSet.add('*');
+     }
 
-    res.json({
-      success: true,
-      data: userWithoutPassword,
-      company: user.company,
-      requirePasswordChange
-    });
+     if (user.roles && user.roles.length > 0) {
+       for (const role of user.roles) {
+         if (role.permissions && role.permissions.length > 0) {
+           for (const perm of role.permissions) {
+             if (perm.resource === '*') {
+               // Wildcard resource - add all common actions
+               const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+               for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+                 permissionsSet.add(`*:${action}`);
+               }
+               if (perm.actions.includes('*')) {
+                 permissionsSet.add('*');
+               }
+             } else {
+               for (const action of perm.actions) {
+                 if (action === '*') {
+                   // Wildcard action - add all actions for this resource
+                   permissionsSet.add(`${perm.resource}:*`);
+                   const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                   for (const a of allActions) {
+                     permissionsSet.add(`${perm.resource}:${a}`);
+                   }
+                 } else {
+                   permissionsSet.add(`${perm.resource}:${action}`);
+                 }
+               }
+             }
+           }
+         }
+       }
+     } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
+       // Fallback: look up the Role document by the legacy role string name
+       const legacyRole = await Role.findOne({ name: user.role, is_system_role: true });
+       if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
+         for (const perm of legacyRole.permissions) {
+           if (perm.resource === '*') {
+             const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+             for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
+               permissionsSet.add(`*:${action}`);
+             }
+             if (perm.actions.includes('*')) {
+               permissionsSet.add('*');
+             }
+           } else {
+             for (const action of perm.actions) {
+               if (action === '*') {
+                 permissionsSet.add(`${perm.resource}:*`);
+                 const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                 for (const a of allActions) {
+                   permissionsSet.add(`${perm.resource}:${a}`);
+                 }
+               } else {
+                 permissionsSet.add(`${perm.resource}:${action}`);
+               }
+             }
+           }
+         }
+       }
+     }
+
+     userWithoutPassword.permissions = Array.from(permissionsSet);
+
+     // Create Redis session
+     await sessionService.createSession(
+       user._id.toString(),
+       user.company._id.toString(),
+       user.role,
+       token,
+       { email: user.email, name: user.name, companyName: user.company.name }
+     );
+
+     // Set httpOnly cookie for token
+     res.cookie('token', token, {
+       httpOnly: true,
+       secure: config.server.env === 'production',
+       sameSite: 'lax',
+       maxAge: (config.session && config.session.ttl ? config.session.ttl : 24 * 60 * 60) * 1000,
+     });
+
+     res.json({
+       success: true,
+       data: userWithoutPassword,
+       company: user.company,
+       requirePasswordChange
+     });
   } catch (error) {
     next(error);
   }
