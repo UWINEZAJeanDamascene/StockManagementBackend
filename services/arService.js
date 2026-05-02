@@ -25,881 +25,6 @@ class ARService {
   /**
    * Create a new AR receipt (draft status)
    */
-  static async createReceipt(companyId, userId, data) {
-    const {
-      clientId,
-      client,
-      receiptDate,
-      paymentMethod,
-      bankAccountId,
-      amountReceived,
-      currencyCode = "USD",
-      exchangeRate = 1,
-      reference,
-      notes,
-      allocations = [],
-    } = data;
-
-    // Support both clientId and client parameters
-    const actualClientId = clientId || client;
-
-    // Validate client
-    const clientDoc = await Client.findOne({
-      _id: actualClientId,
-      company: companyId,
-    });
-    if (!clientDoc) {
-      throw new Error("Client not found");
-    }
-
-    // Validate amount
-    const amountNum = parseFloat(amountReceived);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      throw new Error("Invalid amount received");
-    }
-
-    // Validate allocations if provided
-    let totalAllocated = 0;
-    if (allocations.length > 0) {
-      for (const alloc of allocations) {
-        totalAllocated += parseFloat(alloc.amountAllocated) || 0;
-      }
-      if (totalAllocated > amountNum) {
-        throw new Error("Total allocated amount exceeds receipt amount");
-      }
-    }
-
-    // Create receipt
-    const receipt = new ARReceipt({
-      company: companyId,
-      client: actualClientId,
-      receiptDate: receiptDate || new Date(),
-      paymentMethod,
-      bankAccount: bankAccountId || null,
-      amountReceived: mongoose.Types.Decimal128.fromString(
-        amountNum.toFixed(2),
-      ),
-      currencyCode,
-      exchangeRate: mongoose.Types.Decimal128.fromString(
-        parseFloat(exchangeRate).toString(),
-      ),
-      reference: reference || null,
-      status: "draft",
-      notes: notes || null,
-      createdBy: userId,
-    });
-
-    await receipt.save();
-
-    // Create allocations if provided
-    if (allocations.length > 0) {
-      for (const alloc of allocations) {
-        const allocation = new ARReceiptAllocation({
-          receipt: receipt._id,
-          invoice: alloc.invoiceId,
-          amountAllocated: mongoose.Types.Decimal128.fromString(
-            parseFloat(alloc.amountAllocated).toFixed(2),
-          ),
-          company: companyId,
-          createdBy: userId,
-        });
-        await allocation.save();
-
-        // Update invoice balance
-        await this.updateInvoiceBalance(
-          alloc.invoiceId,
-          parseFloat(alloc.amountAllocated),
-        );
-      }
-    }
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    return receipt;
-  }
-
-  /**
-   * Post an AR receipt (creates journal entry)
-   * Validations per Section 1.3:
-   * 1. SUM(allocations.amount_allocated) <= receipt.amount_received
-   * 2. Each allocation: amount_allocated <= invoice.amount_outstanding
-   * 3. All allocated invoices must belong to same client as receipt
-   * 4. Period must be open for receipt_date
-   */
-  static async postReceipt(companyId, userId, receiptId) {
-    const receipt = await ARReceipt.findOne({
-      _id: receiptId,
-      company: companyId,
-    });
-    if (!receipt) {
-      throw new Error("Receipt not found");
-    }
-
-    if (receipt.status !== "draft") {
-      const err = new Error("INVALID_STATUS");
-      err.status = 400;
-      throw err;
-    }
-
-    // Step 4: Check period is open for receipt_date
-    if (
-      await periodService.isDateInClosedPeriod(companyId, receipt.receiptDate)
-    ) {
-      throw new Error("Target accounting period is closed");
-    }
-
-    // Get allocations for this receipt
-    const allocations = await ARReceiptAllocation.find({
-      receipt: receipt._id,
-    });
-
-    // Step 1: Validate SUM(allocations) <= amount_received
-    const receiptAmount = parseFloat(receipt.amountReceived);
-    let totalAllocated = 0;
-
-    if (allocations.length > 0) {
-      for (const alloc of allocations) {
-        totalAllocated += parseFloat(alloc.amountAllocated);
-      }
-
-      if (totalAllocated > receiptAmount) {
-        throw new Error("Total allocated amount cannot exceed receipt amount");
-      }
-
-      // Step 3: Validate all allocated invoices belong to same client
-      for (const alloc of allocations) {
-        const invoice = await Invoice.findById(alloc.invoice);
-        if (!invoice) {
-          throw new Error("Allocated invoice not found");
-        }
-        if (invoice.client.toString() !== receipt.client.toString()) {
-          throw new Error(
-            "Allocated invoice must belong to the same client as the receipt",
-          );
-        }
-
-        // Step 2: Validate amount_allocated <= invoice.amount_outstanding
-        const invoiceOutstanding =
-          parseFloat(invoice.amountOutstanding) ||
-          parseFloat(invoice.balance) ||
-          0;
-        const allocAmount = parseFloat(alloc.amountAllocated);
-
-        if (allocAmount > invoiceOutstanding) {
-          const err = new Error(
-            `Cannot allocate ${allocAmount.toLocaleString('en-US', {style: 'currency', currency: 'USD'})} to invoice ${invoice.invoiceNumber || invoice._id}: ` +
-            `outstanding balance is only ${invoiceOutstanding.toLocaleString('en-US', {style: 'currency', currency: 'USD'})}`
-          );
-          err.code = "ALLOCATION_EXCEEDS_OUTSTANDING";
-          err.status = 422;
-          throw err;
-        }
-      }
-    }
-
-    // Determine cash account based on payment method
-    let cashAccount;
-    const pm = receipt.paymentMethod;
-
-    if (pm === "bank_transfer" || pm === "cheque") {
-      // Use bank account if specified
-      if (receipt.bankAccount) {
-        const { BankAccount } = require("../models/BankAccount");
-        const bankAcct = await BankAccount.findById(receipt.bankAccount);
-        if (bankAcct && bankAcct.accountCode) {
-          cashAccount = bankAcct.accountCode;
-        }
-      }
-      cashAccount = cashAccount || DEFAULT_ACCOUNTS.cashAtBank;
-    } else if (pm === "card") {
-      cashAccount = DEFAULT_ACCOUNTS.cashAtBank;
-    } else {
-      // cash, other
-      cashAccount = DEFAULT_ACCOUNTS.cashInHand;
-    }
-
-    const amountNum = parseFloat(receipt.amountReceived);
-
-    // Get client name for narration
-    const client = await Client.findById(receipt.client);
-    const clientName = client?.name || "Unknown Client";
-
-    // Journal entries are intentionally NOT created here.
-    // The DR Cash / CR AR entry is already posted when payment is recorded
-    // on the invoice (POST /api/sales-invoices/:id/payment).
-    // This AR receipt is a payment tracking record only — not a GL posting.
-
-    // Calculate unallocated amount
-    const unallocatedAmount = amountNum - totalAllocated;
-
-    // Note: Invoice balances are already updated when allocations are created via allocateToInvoice
-    // Do NOT update them again here to avoid double-counting
-
-    // Update receipt status
-    receipt.status = "posted";
-    // No journal entry — journals are posted via invoice payment recording
-    receipt.postedBy = userId;
-    receipt.postedAt = new Date();
-    receipt.unallocatedAmount = mongoose.Types.Decimal128.fromString(
-      unallocatedAmount.toFixed(2),
-    );
-    await receipt.save();
-
-    // Create BankTransaction on the specific bank account (deposit — money received from customer)
-    if (receipt.bankAccount) {
-      try {
-        const { BankAccount } = require("../models/BankAccount");
-        const bankAcct = await BankAccount.findById(receipt.bankAccount);
-        if (bankAcct) {
-          await bankAcct.addTransaction({
-            type: "deposit",
-            amount: parseFloat(receipt.amountReceived),
-            description: `Customer payment: ${receipt.receiptNumber || receiptId}`,
-            date: receipt.receiptDate || new Date(),
-            referenceNumber: receipt.reference || receipt.receiptNumber,
-            paymentMethod: receipt.paymentMethod || "bank_transfer",
-            status: "completed",
-            reference: receipt._id,
-            referenceType: "Payment",
-            createdBy: userId,
-            notes: `AR Receipt for client: ${clientName}`,
-          });
-        }
-      } catch (btErr) {
-        console.error(
-          "Failed to create BankTransaction for AR receipt:",
-          btErr.message,
-        );
-        // Non-fatal — journal entry already posted
-      }
-    }
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Record AR tracking transaction for receipt posting
-    try {
-      await ARTrackingService.recordReceiptPosted(receipt, allocations, userId);
-    } catch (trackingError) {
-      console.error("AR tracking error for receipt posting:", trackingError);
-    }
-
-    return receipt;
-  }
-
-  /**
-   * Reverse an AR receipt
-   */
-  static async reverseReceipt(companyId, userId, receiptId, reason) {
-    const receipt = await ARReceipt.findOne({
-      _id: receiptId,
-      company: companyId,
-    });
-    if (!receipt) {
-      throw new Error("Receipt not found");
-    }
-
-    if (receipt.status !== "posted") {
-      throw new Error("Only posted receipts can be reversed");
-    }
-
-    // Check period is open
-    if (
-      await periodService.isDateInClosedPeriod(companyId, receipt.receiptDate)
-    ) {
-      throw new Error("Target accounting period is closed");
-    }
-
-    const amountNum = parseFloat(receipt.amountReceived);
-
-    // Determine cash account based on original payment method
-    let cashAccount;
-    const pm = receipt.paymentMethod;
-
-    if (pm === "bank_transfer" || pm === "cheque") {
-      if (receipt.bankAccount) {
-        const { BankAccount } = require("../models/BankAccount");
-        const bankAcct = await BankAccount.findById(receipt.bankAccount);
-        if (bankAcct && bankAcct.accountCode) {
-          cashAccount = bankAcct.accountCode;
-        }
-      }
-      cashAccount = cashAccount || DEFAULT_ACCOUNTS.cashAtBank;
-    } else if (pm === "card") {
-      cashAccount = DEFAULT_ACCOUNTS.cashAtBank;
-    } else {
-      cashAccount = DEFAULT_ACCOUNTS.cashInHand;
-    }
-
-    // No reversal journal entry — AR receipts are tracking-only records.
-    // The GL impact of this reversal is handled by the invoice payment reversal flow.
-
-    // Restore invoice balances from allocations
-    const allocations = await ARReceiptAllocation.find({
-      receipt: receipt._id,
-    });
-    for (const alloc of allocations) {
-      await this.restoreInvoiceBalance(
-        alloc.invoice,
-        parseFloat(alloc.amountAllocated),
-      );
-    }
-
-    // Update receipt status
-    receipt.status = "reversed";
-    receipt.reversedAt = new Date();
-    receipt.reversedBy = userId;
-    receipt.reversalReason = reason || "Reversed";
-
-    await receipt.save();
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Record AR tracking transaction for receipt reversal
-    try {
-      await ARTrackingService.recordReceiptReversed(
-        receipt,
-        allocations,
-        userId,
-        reason,
-      );
-    } catch (trackingError) {
-      console.error("AR tracking error for receipt reversal:", trackingError);
-    }
-
-    return receipt;
-  }
-
-  /**
-   * Allocate receipt to invoice
-   */
-  static async allocateToInvoice(
-    companyId,
-    userId,
-    receiptId,
-    invoiceId,
-    amount,
-  ) {
-    const receipt = await ARReceipt.findOne({
-      _id: receiptId,
-      company: companyId,
-    });
-    if (!receipt) {
-      throw new Error("Receipt not found");
-    }
-
-    if (receipt.status !== "draft" && receipt.status !== "posted") {
-      throw new Error("Receipt cannot be allocated");
-    }
-
-    const invoice = await Invoice.findOne({
-      _id: invoiceId,
-      company: companyId,
-    });
-    if (!invoice) {
-      throw new Error("Invoice not found");
-    }
-
-    // Check if this invoice belongs to the same client
-    if (invoice.client.toString() !== receipt.client.toString()) {
-      throw new Error("Invoice does not belong to the same client");
-    }
-
-    const amountNum = parseFloat(amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      throw new Error("Invalid allocation amount");
-    }
-
-    // Check existing allocations
-    const existingAlloc = await ARReceiptAllocation.findOne({
-      receipt: receiptId,
-      invoice: invoiceId,
-    });
-
-    if (existingAlloc) {
-      throw new Error("This invoice is already allocated to this receipt");
-    }
-
-    // First check invoice outstanding amount
-    const invoiceOutstanding =
-      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-    if (amountNum > invoiceOutstanding) {
-      const err = new Error("ALLOCATION_EXCEEDS_OUTSTANDING");
-      err.status = 422;
-      throw err;
-    }
-
-    // Check available amount to allocate on the receipt
-    const allocatedSum = await aggregateWithTimeout(ARReceiptAllocation, [
-      { $match: { receipt: receipt._id } },
-      { $group: { _id: null, total: { $sum: "$amountAllocated" } } },
-    ]);
-    const alreadyAllocated = allocatedSum[0]?.total || 0;
-    const receiptAmount = parseFloat(receipt.amountReceived);
-    const available = receiptAmount - alreadyAllocated;
-
-    if (amountNum > available) {
-      const err = new Error("ALLOCATION_EXCEEDS_RECEIPT");
-      err.status = 422;
-      throw err;
-    }
-
-    // Create allocation
-    const allocation = new ARReceiptAllocation({
-      receipt: receiptId,
-      invoice: invoiceId,
-      amountAllocated: mongoose.Types.Decimal128.fromString(
-        amountNum.toFixed(2),
-      ),
-      company: companyId,
-      createdBy: userId,
-    });
-
-    await allocation.save();
-
-    // Update invoice balance
-    await this.updateInvoiceBalance(invoiceId, amountNum);
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    return allocation;
-  }
-
-  /**
-   * Update invoice balance after payment allocation (for draft receipts)
-   */
-  static async updateInvoiceBalance(invoiceId, amount) {
-    const invoice = await Invoice.findById(invoiceId);
-    if (!invoice) return;
-
-    const currentPaid = parseFloat(invoice.amountPaid) || 0;
-    const currentBalance =
-      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-    const newPaid = currentPaid + amount;
-    const newBalance = Math.max(
-      0,
-      parseFloat(invoice.roundedAmount || invoice.total || 0) - newPaid,
-    );
-
-    invoice.amountPaid = mongoose.Types.Decimal128.fromString(
-      newPaid.toFixed(2),
-    );
-    invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
-      newBalance.toFixed(2),
-    );
-    invoice.balance = newBalance;
-
-    // Update status
-    const totalAmount = parseFloat(invoice.roundedAmount || invoice.total || 0);
-    if (newPaid >= totalAmount) {
-      invoice.status = "fully_paid";
-      if (!invoice.paidDate) invoice.paidDate = new Date();
-    } else if (newPaid > 0) {
-      invoice.status = "partially_paid";
-    }
-
-    await invoice.save();
-  }
-
-  /**
-   * Update invoice balance on receipt post (per Section 1.3 Step 3)
-   * invoice.amount_paid += allocation.amount_allocated
-   * invoice.amount_outstanding -= allocation.amount_allocated
-   * If amount_outstanding <= 0.01: invoice.status = fully_paid
-   * If amount_outstanding > 0.01 and amount_paid > 0: invoice.status = partially_paid
-   */
-  static async updateInvoiceBalanceOnPost(invoiceId, amount) {
-    const invoice = await Invoice.findById(invoiceId);
-    if (!invoice) return;
-
-    const currentPaid = parseFloat(invoice.amountPaid) || 0;
-    const currentOutstanding =
-      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-
-    const newPaid = currentPaid + amount;
-    const newOutstanding = currentOutstanding - amount;
-
-    invoice.amountPaid = mongoose.Types.Decimal128.fromString(
-      newPaid.toFixed(2),
-    );
-    invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
-      Math.max(0, newOutstanding).toFixed(2),
-    );
-    invoice.balance = Math.max(0, newOutstanding);
-
-    // Update status per Step 3 rules
-    if (newOutstanding <= 0.01) {
-      invoice.status = "fully_paid";
-      if (!invoice.paidDate) invoice.paidDate = new Date();
-    } else if (newPaid > 0) {
-      invoice.status = "partially_paid";
-    }
-
-    await invoice.save();
-  }
-
-  /**
-   * Restore invoice balance after receipt reversal
-   */
-  static async restoreInvoiceBalance(invoiceId, amount) {
-    const invoice = await Invoice.findById(invoiceId);
-    if (!invoice) return;
-
-    const currentPaid = parseFloat(invoice.amountPaid) || 0;
-    const currentBalance =
-      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-    const newPaid = Math.max(0, currentPaid - amount);
-    const totalAmount = parseFloat(invoice.roundedAmount || invoice.total || 0);
-    const newBalance = totalAmount - newPaid;
-
-    invoice.amountPaid = mongoose.Types.Decimal128.fromString(
-      newPaid.toFixed(2),
-    );
-    invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
-      newBalance.toFixed(2),
-    );
-    invoice.balance = newBalance;
-
-    // Restore status
-    if (newPaid >= totalAmount) {
-      invoice.status = "fully_paid";
-      if (!invoice.paidDate) invoice.paidDate = new Date();
-    } else if (newPaid > 0) {
-      invoice.status = "partially_paid";
-    } else {
-      invoice.status = "confirmed";
-      invoice.paidDate = null;
-    }
-
-    await invoice.save();
-  }
-
-  /**
-   * Write off bad debt (per Section 1.5)
-   * Journal entry:
-   *   DR 6xxx Bad Debt Expense     writeoff_amount
-   *   CR 1200 Accounts Receivable  writeoff_amount
-   * source_type: bad_debt_writeoff
-   * Narration: "Bad Debt Write-off - [Client Name] - INV#[ref]"
-   */
-  static async writeOffBadDebt(companyId, userId, data) {
-    const { invoiceId, writeoffDate, amount, reason, notes } = data;
-
-    const invoice = await Invoice.findOne({
-      _id: invoiceId,
-      company: companyId,
-    });
-    if (!invoice) {
-      throw new Error("Invoice not found");
-    }
-
-    // Check if already written off
-    if (invoice.status === "cancelled") {
-      throw new Error("Invoice is already written off as bad debt");
-    }
-
-    const amountNum = parseFloat(amount) || parseFloat(invoice.balance) || 0;
-    if (amountNum <= 0) {
-      throw new Error("Invalid write-off amount");
-    }
-
-    // Check period is open
-    const targetDate = writeoffDate || new Date();
-    if (await periodService.isDateInClosedPeriod(companyId, targetDate)) {
-      throw new Error("Target accounting period is closed");
-    }
-
-    // Get client name for narration
-    const client = await Client.findById(invoice.client);
-    const clientName = client?.name || "Unknown Client";
-    const invoiceRef = invoice.referenceNo || invoice.invoiceNumber || "N/A";
-
-    // Create bad debt write-off record as DRAFT only; posting will be
-    // performed by a separate postBadDebtWriteoff method.
-    const writeoff = new ARBadDebtWriteoff({
-      invoice: invoiceId,
-      client: invoice.client,
-      writeoffDate: targetDate,
-      amount: mongoose.Types.Decimal128.fromString(amountNum.toFixed(2)),
-      reason: reason || "Bad debt write-off",
-      notes: notes || null,
-      status: "draft",
-      createdBy: userId,
-      company: companyId,
-    });
-
-    await writeoff.save();
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    return writeoff;
-  }
-
-  /**
-   * Post a previously created bad debt write-off (create journals and apply)
-   */
-  static async postBadDebtWriteoff(companyId, userId, writeoffId) {
-    const writeoff = await ARBadDebtWriteoff.findOne({
-      _id: writeoffId,
-      company: companyId,
-    });
-    if (!writeoff) throw new Error("Bad debt write-off not found");
-    if (writeoff.status !== "draft") {
-      const err = new Error("INVALID_STATUS");
-      err.status = 400;
-      throw err;
-    }
-
-    const invoice = await Invoice.findById(writeoff.invoice);
-    if (!invoice) throw new Error("Invoice not found");
-
-    const amountNum = parseFloat(writeoff.amount) || 0;
-
-    // Create journal entries now
-    const client = await Client.findById(writeoff.client);
-    const clientName = client?.name || "Unknown Client";
-    const invoiceRef = invoice.referenceNo || invoice.invoiceNumber || "N/A";
-    const narration = `Bad Debt Write-off - ${clientName} - INV#${invoiceRef}`;
-
-    const bdDebitLine = JournalService.createDebitLine(
-      DEFAULT_ACCOUNTS.badDebtExpense || "6100",
-      amountNum,
-      narration,
-    );
-    const bdCreditLine = JournalService.createCreditLine(
-      await JournalService.getMappedAccountCode(
-        companyId,
-        "sales",
-        "accountsReceivable",
-        DEFAULT_ACCOUNTS.accountsReceivable,
-      ),
-      amountNum,
-      narration,
-    );
-
-    const bdEntryA = {
-      date: writeoff.writeoffDate || new Date(),
-      description: narration,
-      sourceType: "bad_debt_writeoff",
-      sourceId: writeoff._id,
-      sourceReference: writeoff.reference || writeoff.referenceNo,
-      lines: [bdDebitLine, bdCreditLine],
-      isAutoGenerated: true,
-    };
-
-    const bdEntries = await JournalService.createEntriesAtomic(
-      companyId,
-      userId,
-      [bdEntryA],
-    );
-    const journalEntry =
-      Array.isArray(bdEntries) && bdEntries.length > 0 ? bdEntries[0] : null;
-
-    // Update write-off status
-    writeoff.status = "posted";
-    if (journalEntry) writeoff.journalEntry = journalEntry._id;
-    writeoff.postedBy = userId;
-    await writeoff.save();
-
-    // Update invoice balance: amount_outstanding -= writeoff_amount
-    const currentOutstanding =
-      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-    const newOutstanding = currentOutstanding - amountNum;
-
-    invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
-      Math.max(0, newOutstanding).toFixed(2),
-    );
-    invoice.balance = Math.max(0, newOutstanding);
-
-    // If fully written off: invoice.status = cancelled
-    if (newOutstanding <= 0.01) {
-      invoice.status = "cancelled";
-      invoice.badDebtWrittenOff = true;
-      invoice.writtenOffAt = new Date();
-      invoice.writtenOffBy = userId;
-      invoice.badDebtReason = writeoff.reason || "Bad debt write-off";
-    }
-    await invoice.save();
-
-    // Update client outstanding balance
-    if (client) {
-      client.outstandingBalance = Math.max(
-        0,
-        (client.outstandingBalance || 0) - amountNum,
-      );
-      await client.save();
-    }
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Record AR tracking transaction for bad debt write-off
-    try {
-      await ARTrackingService.recordBadDebtWriteoff(writeoff, invoice, userId);
-    } catch (trackingError) {
-      console.error("AR tracking error for bad debt write-off:", trackingError);
-    }
-
-    return writeoff;
-  }
-
-  /**
-   * Reverse bad debt write-off
-   */
-  static async reverseBadDebt(companyId, userId, writeoffId, reason) {
-    const writeoff = await ARBadDebtWriteoff.findOne({
-      _id: writeoffId,
-      company: companyId,
-    });
-    if (!writeoff) {
-      throw new Error("Bad debt write-off not found");
-    }
-
-    if (writeoff.status !== "posted") {
-      throw new Error("Only posted write-offs can be reversed");
-    }
-
-    // Check period is open
-    if (
-      await periodService.isDateInClosedPeriod(companyId, writeoff.writeoffDate)
-    ) {
-      throw new Error("Target accounting period is closed");
-    }
-
-    const amountNum = parseFloat(writeoff.amount);
-
-    // Create reversal journal entry
-    // Debit: Accounts Receivable
-    // Credit: Bad Debt Expense
-    const bdRevDebitLine = JournalService.createDebitLine(
-      await JournalService.getMappedAccountCode(
-        companyId,
-        "sales",
-        "accountsReceivable",
-        DEFAULT_ACCOUNTS.accountsReceivable,
-      ),
-      amountNum,
-      `Bad Debt Reversal ${writeoff.reference || writeoff.referenceNo}`,
-    );
-    const bdRevCreditLine = JournalService.createCreditLine(
-      DEFAULT_ACCOUNTS.badDebtExpense || "6100",
-      amountNum,
-      `Bad Debt Reversal ${writeoff.reference || writeoff.referenceNo}`,
-    );
-
-    const bdRevA = {
-      date: new Date(),
-      description: `Bad Debt Reversal ${writeoff.reference || writeoff.referenceNo}: ${reason || "Reversed"}`,
-      sourceType: "ar_bad_debt_reversal",
-      sourceId: writeoff._id,
-      sourceReference: writeoff.reference || writeoff.referenceNo,
-      lines: [bdRevDebitLine, bdRevCreditLine],
-      isAutoGenerated: true,
-    };
-
-    const bdRevEntries = await JournalService.createEntriesAtomic(
-      companyId,
-      userId,
-      [bdRevA],
-    );
-    const reverseEntry =
-      Array.isArray(bdRevEntries) && bdRevEntries.length > 0
-        ? bdRevEntries[0]
-        : null;
-
-    // Update write-off status
-    writeoff.status = "reversed";
-    writeoff.reversedAt = new Date();
-    writeoff.reversedBy = userId;
-    writeoff.reversalReason = reason || "Reversed";
-    writeoff.reverseJournalEntry = reverseEntry._id;
-    await writeoff.save();
-
-    // Restore invoice
-    const invoice = await Invoice.findById(writeoff.invoice);
-    if (invoice) {
-      invoice.status = "confirmed";
-      invoice.badDebtWrittenOff = false;
-      invoice.writtenOffAt = undefined;
-      invoice.writtenOffBy = undefined;
-      invoice.badDebtReason = undefined;
-      invoice.balance =
-        parseFloat(invoice.roundedAmount || invoice.total || 0) -
-        parseFloat(invoice.amountPaid || 0);
-      invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
-        invoice.balance.toString(),
-      );
-      await invoice.save();
-
-      // Restore client outstanding balance
-      const client = await Client.findById(invoice.client);
-      if (client) {
-        client.outstandingBalance =
-          (client.outstandingBalance || 0) + amountNum;
-        await client.save();
-      }
-    }
-
-    // Invalidate cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Record AR tracking transaction for bad debt reversal
-    try {
-      await ARTrackingService.recordBadDebtReversed(
-        writeoff,
-        invoice,
-        userId,
-        reason,
-      );
-    } catch (trackingError) {
-      console.error("AR tracking error for bad debt reversal:", trackingError);
-    }
-
-    return writeoff;
-  }
-
-  /**
-   * Get AR aging report using new allocations
-   * Computed on the fly from live invoice data - not stored in a table
-   * Aging buckets per Section 1.4:
-   * - Not yet due: due_date >= TODAY
-   * - 1-30 days: due_date between (TODAY - 30) and (TODAY - 1)
-   * - 31-60 days: due_date between (TODAY - 60) and (TODAY - 31)
-   * - 61-90 days: due_date between (TODAY - 90) and (TODAY - 61)
-   * - 90+ days: due_date < (TODAY - 90)
-   */
   static async getAgingReport(companyId, options = {}) {
     const { clientId, asOfDate } = options;
     const now = asOfDate ? new Date(asOfDate) : new Date();
@@ -1056,7 +181,183 @@ class ARService {
   /**
    * Get client statement - full details: invoices, credits, receipts, balance
    */
-  static async getClientStatement(companyId, clientId, options = {}) {
+  
+static async writeOffBadDebt(companyId, userId, data) {
+    const { invoiceId, writeoffDate, amount, reason, notes } = data;
+
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      company: companyId,
+    });
+    if (!invoice) {
+      throw new Error("Invoice not found");
+    }
+
+    // Check if already written off
+    if (invoice.status === "cancelled") {
+      throw new Error("Invoice is already written off as bad debt");
+    }
+
+    const amountNum = parseFloat(amount) || parseFloat(invoice.balance) || 0;
+    if (amountNum <= 0) {
+      throw new Error("Invalid write-off amount");
+    }
+
+    // Check period is open
+    const targetDate = writeoffDate || new Date();
+    if (await periodService.isDateInClosedPeriod(companyId, targetDate)) {
+      throw new Error("Target accounting period is closed");
+    }
+
+    // Get client name for narration
+    const client = await Client.findById(invoice.client);
+    const clientName = client?.name || "Unknown Client";
+    const invoiceRef = invoice.referenceNo || invoice.invoiceNumber || "N/A";
+
+    // Create bad debt write-off record as DRAFT only; posting will be
+    // performed by a separate postBadDebtWriteoff method.
+    const writeoff = new ARBadDebtWriteoff({
+      invoice: invoiceId,
+      client: invoice.client,
+      writeoffDate: targetDate,
+      amount: mongoose.Types.Decimal128.fromString(amountNum.toFixed(2)),
+      reason: reason || "Bad debt write-off",
+      notes: notes || null,
+      status: "draft",
+      createdBy: userId,
+      company: companyId,
+    });
+
+    await writeoff.save();
+
+    // Invalidate cache
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+    } catch (e) {
+      console.error("Cache invalidation failed:", e);
+    }
+
+    return writeoff;
+  }
+
+  /**
+   * Post a previously created bad debt write-off (create journals and apply)
+   */
+  
+static async postBadDebtWriteoff(companyId, userId, writeoffId) {
+    const writeoff = await ARBadDebtWriteoff.findOne({
+      _id: writeoffId,
+      company: companyId,
+    });
+    if (!writeoff) throw new Error("Bad debt write-off not found");
+    if (writeoff.status !== "draft") {
+      const err = new Error("INVALID_STATUS");
+      err.status = 400;
+      throw err;
+    }
+
+    const invoice = await Invoice.findById(writeoff.invoice);
+    if (!invoice) throw new Error("Invoice not found");
+
+    const amountNum = parseFloat(writeoff.amount) || 0;
+
+    // Create journal entries now
+    const client = await Client.findById(writeoff.client);
+    const clientName = client?.name || "Unknown Client";
+    const invoiceRef = invoice.referenceNo || invoice.invoiceNumber || "N/A";
+    const narration = `Bad Debt Write-off - ${clientName} - INV#${invoiceRef}`;
+
+    const bdDebitLine = JournalService.createDebitLine(
+      DEFAULT_ACCOUNTS.badDebtExpense || "6100",
+      amountNum,
+      narration,
+    );
+    const bdCreditLine = JournalService.createCreditLine(
+      await JournalService.getMappedAccountCode(
+        companyId,
+        "sales",
+        "accountsReceivable",
+        DEFAULT_ACCOUNTS.accountsReceivable,
+      ),
+      amountNum,
+      narration,
+    );
+
+    const bdEntryA = {
+      date: writeoff.writeoffDate || new Date(),
+      description: narration,
+      sourceType: "bad_debt_writeoff",
+      sourceId: writeoff._id,
+      sourceReference: writeoff.reference || writeoff.referenceNo,
+      lines: [bdDebitLine, bdCreditLine],
+      isAutoGenerated: true,
+    };
+
+    const bdEntries = await JournalService.createEntriesAtomic(
+      companyId,
+      userId,
+      [bdEntryA],
+    );
+    const journalEntry =
+      Array.isArray(bdEntries) && bdEntries.length > 0 ? bdEntries[0] : null;
+
+    // Update write-off status
+    writeoff.status = "posted";
+    if (journalEntry) writeoff.journalEntry = journalEntry._id;
+    writeoff.postedBy = userId;
+    await writeoff.save();
+
+    // Update invoice balance: amount_outstanding -= writeoff_amount
+    const currentOutstanding =
+      parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+    const newOutstanding = currentOutstanding - amountNum;
+
+    invoice.amountOutstanding = mongoose.Types.Decimal128.fromString(
+      Math.max(0, newOutstanding).toFixed(2),
+    );
+    invoice.balance = Math.max(0, newOutstanding);
+
+    // If fully written off: invoice.status = cancelled
+    if (newOutstanding <= 0.01) {
+      invoice.status = "cancelled";
+      invoice.badDebtWrittenOff = true;
+      invoice.writtenOffAt = new Date();
+      invoice.writtenOffBy = userId;
+      invoice.badDebtReason = writeoff.reason || "Bad debt write-off";
+    }
+    await invoice.save();
+
+    // Update client outstanding balance
+    if (client) {
+      client.outstandingBalance = Math.max(
+        0,
+        (client.outstandingBalance || 0) - amountNum,
+      );
+      await client.save();
+    }
+
+    // Invalidate cache
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+    } catch (e) {
+      console.error("Cache invalidation failed:", e);
+    }
+
+    // Record AR tracking transaction for bad debt write-off
+    try {
+      await ARTrackingService.recordBadDebtWriteoff(writeoff, invoice, userId);
+    } catch (trackingError) {
+      console.error("AR tracking error for bad debt write-off:", trackingError);
+    }
+
+    return writeoff;
+  }
+
+  /**
+   * Reverse bad debt write-off
+   */
+  
+static async getClientStatement(companyId, clientId, options = {}) {
     const { startDate, endDate } = options;
 
     // Verify client
@@ -1150,5 +451,6 @@ class ARService {
     };
   }
 }
+
 
 module.exports = ARService;

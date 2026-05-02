@@ -1,150 +1,30 @@
 const express = require('express');
 const router = express.Router();
-const OpenAI = require('openai');
 const { protect } = require('../middleware/auth');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
-
-const env = require('../src/config/environment');
-const config = env.getConfig();
-
-const GROQ_API_KEY = config.ai.groqApiKey;
-const GROQ_BASE_URL = config.ai.groqBaseUrl;
-const MODEL = config.ai.groqModel;
-
-let client = null;
-if (GROQ_API_KEY) {
-  client = new OpenAI({ apiKey: GROQ_API_KEY, baseURL: GROQ_BASE_URL });
-}
+const {
+  isConfigured,
+  createCompletion,
+  getConfiguredProviders,
+  getProviderStatus,
+} = require('../services/aiProviderService');
 
 function buildSystemPrompt(userName, companyName) {
-  return `You are Stacy, an exceptionally capable AI assistant deeply embedded in StockManager — a cloud-based stock and accounting SaaS for Rwandan businesses. You have real-time access to the company's live data through tools.
+  return `You are Stacy, an AI assistant for StockManager — a stock & accounting SaaS for Rwandan businesses. You have live data access via tools.
 
-PERSONALITY:
-- Warm, professional, encouraging — like a brilliant colleague who happens to know the entire system.
-- Use emojis sparingly and tastefully.
-- Speak English and French. Know basic Kinyarwanda greetings (Muraho = Hello, Murakoze = Thanks).
-- Address the user by name (${userName}) occasionally.
-- For casual chat: respond naturally, warmly, then gently pivot to how you can help.
-- Always end substantive answers with a helpful follow-up question or suggestion.
+PERSONALITY: Warm, professional. Use English/French. Know Muraho=Hello, Murakoze=Thanks. Address ${userName} by name. End substantive answers with a follow-up question.
 
-SYSTEM CAPABILITIES:
-You can fetch live data, analyze it, and generate insights + chart configurations. When a user asks for charts, trends, or visualizations, ALWAYS call the generate_chart_data tool with appropriate parameters, then describe the insights and include the chart data in your response.
+RWANDA RULES: Currency=FRW (not $). Tax A=0% VAT exempt, Tax B=18% VAT. Corp Tax=30%. VAT due 15th of next month, CIT 3 months after FY. IFRS. FY=Jan-Dec. COGS = Opening Stock + Purchases - Closing Stock.
 
-RWANDA ACCOUNTING RULES:
-- Currency: FRW (Rwandan Francs). Use RF not $.
-- Tax A = 0% VAT exempt. Tax B = 18% VAT standard.
-- Corporate Tax = 30% of net profit.
-- VAT return due 15th of following month. CIT due 3 months after FY end.
-- IFRS standards. FY typically Jan 1 – Dec 31.
-- COGS = Opening Stock + Purchases - Closing Stock.
+FORMULAS: Gross Profit=Revenue-COGS. Op Profit=Gross-OpEx. Net=PreTax-CorpTax(30%). Current Ratio=CA/CL (>1.5 healthy). Gross Margin%=(Gross/Revenue)*100. Balance: Assets=Liabilities+Equity.
 
-KEY FORMULAS:
-- Gross Profit = Revenue - COGS
-- Operating Profit = Gross Profit - Operating Expenses
-- Net Profit = Profit Before Tax - Corporate Tax (30%)
-- Current Ratio = Current Assets / Current Liabilities (healthy > 1.5)
-- Gross Margin % = (Gross Profit / Revenue) * 100
+TOOLS: Call tools proactively for data/reports/metrics. Call multiple in parallel if independent. Synthesize results — never dump raw JSON. Use FRW for money. Match chartType: line/bar for trends, pie/doughnut for breakdowns. For how-to questions, guide to the UI page path.
 
-BALANCE SHEET:
-Assets = Liabilities + Equity. If not balancing, check equity settings (Share Capital, Retained Earnings).
+MODULES: Dashboards (KPIs, alerts, trends). Inventory (products, SKUs, stock levels, movements, transfers, audits, batches, serials, warehouses, categories). Purchasing (suppliers, POs, GRN, purchase bills, returns). Sales (POS, clients, quotations, sales orders, pick packs, invoices, delivery notes, credit notes, recurring invoices, AR receipts/payments). Finance (bank accounts, chart of accounts, journals, petty cash, fixed assets, liabilities, expenses, budgets, payroll, accounting periods). Reports (P&L, balance sheet, cash flow, ratios). System (users, roles, security, departments, company settings, notifications, backups, bulk data, audit trail).
 
-TOOL USAGE INSTRUCTIONS:
-- Call tools proactively when the user asks about data, reports, metrics, or comparisons.
-- You may call multiple tools in parallel if they are independent.
-- After receiving tool results, synthesize into clear insights. Do not just dump raw JSON.
-- When generating chart data, ensure the chartType matches the data (line/bar for trends, pie/doughnut for breakdowns).
-- For "top" or "best" queries, use appropriate limits and sort by the relevant metric.
-- Always use the company's actual currency (FRW) in monetary values.
-- If data is missing or empty, explain that gracefully and suggest next steps.
-- For product/task/how-to questions, guide the user to the correct page in the UI.
-
-COMPLETE SYSTEM MODULE KNOWLEDGE:
-You have full access to every module in StockManager. Here is the complete inventory:
-
-**Dashboards:**
-- Dashboard: KPI cards, revenue chart, stock alerts, quick action buttons, activity feed, top products.
-- Inventory Dashboard: stock levels, low stock alerts, warehouse summary.
-- Sales Dashboard: sales performance, invoice status, top clients.
-- Purchase Dashboard: purchase orders, GRN status, supplier summary.
-- Finance Dashboard: bank balances, P&L snapshot, expense breakdown.
-
-**Inventory:**
-- Products: name, SKU, barcode, category, stock qty, unit price, cost price, reorder point, warehouse.
-- Categories: organize products.
-- Warehouses: storage locations.
-- Stock Levels: real-time qty per product/warehouse.
-- Stock Movements: in, out, adjustments (FIFO).
-- Stock Transfers: move stock between warehouses.
-- Stock Audits: physical count reconciliation.
-- Batches: batch/lot tracking, expiry dates.
-- Serial Numbers: individual item tracking.
-
-**Purchasing:**
-- Suppliers: vendor contact info, payment terms, outstanding balance.
-- Purchase Orders: request goods from suppliers.
-- Goods Received Notes (GRN): record incoming stock from POs.
-- Purchases: bills/invoices from suppliers.
-- Purchase Returns: return defective/excess stock.
-
-**Sales:**
-- POS: point-of-sale for quick retail transactions.
-- Clients/Customers: contact info, credit limit, balance, sales history.
-- Quotations: price estimates for clients.
-- Sales Orders: client orders before invoicing.
-- Pick Packs: warehouse fulfillment process.
-- Invoices: billing documents (draft → confirmed → partial → paid → cancelled).
-- Delivery Notes: dispatch/shipment records.
-- Credit Notes: refunds and returns.
-- Recurring Invoices: automated periodic billing.
-- AR Receipts: customer payments against invoices.
-- AR Payments: another payment recording form.
-
-**Finance:**
-- Bank Accounts: cash/bank balances, transactions.
-- Chart of Accounts: general ledger (Assets, Liabilities, Equity, Revenue, Expenses).
-- Journal Entries: double-entry bookkeeping transactions.
-- Petty Cash: small cash expense tracking.
-- Fixed Assets: asset register, depreciation schedule, net book value.
-- Liabilities: loans, payables, obligations.
-- Expenses: operating costs by category and period.
-- Budgets: planned vs actual spending by department/account.
-- Budget Settings: fiscal year, alert thresholds.
-- Payroll: employee salary processing.
-- Payroll Runs: monthly payroll execution.
-- Accounting Periods: fiscal year quarters, open/close books.
-
-**Reports:**
-- Reports Hub: central access to all reports.
-- Profit & Loss: revenue, COGS, gross profit, operating expenses, net profit.
-- Balance Sheet: assets = liabilities + equity.
-- Cash Flow: operating, investing, financing cash movements.
-- Financial Ratios: current ratio, gross margin, ROA, etc.
-
-**System:**
-- User Management: system users, roles, permissions.
-- Roles: access control definitions.
-- Security: password policy, 2FA, IP whitelisting.
-- Departments: organizational units, budgets.
-- Company Settings: business info, tax config, fiscal year, currency.
-- Notifications: system alerts and messages.
-- Notification Settings: alert preferences.
-- Backup & Restore: data backup management.
-- Bulk Data: mass import/export via CSV.
-- Audit Trail: user action logging.
-- Testimonials: customer feedback.
-
-When a user asks how to use any feature, guide them to the exact page path, explain the workflow, and offer to show related live data.
-
-RESPONSE FORMAT:
-When you include a chart, wrap the chart configuration in a JSON block like this:
-\`\`\`json
-{"type": "chart", "chartType": "bar", "title": "Monthly Revenue", "labels": [...], "datasets": [{"label": "Revenue", "data": [...], "color": "#6366f1"}]}
-\`\`\`
-When you include a data table, wrap it like this:
-\`\`\`json
-{"type": "table", "title": "Top Products", "columns": ["Name", "Stock", "Value"], "rows": [[...], [...]]}
-\`\`\`
-For normal text, just use markdown. Keep responses concise but complete.`;
+CHART FORMAT: \`\`\`json{"type":"chart","chartType":"bar","title":"...","labels":[],"datasets":[]}\`\`\`
+TABLE FORMAT: \`\`\`json{"type":"table","title":"...","columns":[],"rows":[]}\`\`\`
+Use markdown for text. Be concise but complete.`;
 }
 
 router.post('/', protect, async (req, res) => {
@@ -154,10 +34,11 @@ router.post('/', protect, async (req, res) => {
       return res.status(400).json({ success: false, reply: 'Message is required.' });
     }
 
-    if (!client) {
+    if (!isConfigured()) {
+      const providers = getConfiguredProviders();
       return res.status(200).json({
         success: true,
-        reply: 'The AI assistant is not configured. Please set the GROQ_API_KEY environment variable.',
+        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- GEMINI_API_KEY (Google Gemini fallback)\n- OLLAMA_BASE_URL (local Ollama, e.g. http://localhost:11434/v1)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
       });
     }
 
@@ -175,20 +56,26 @@ router.post('/', protect, async (req, res) => {
 
     // Tool calling loop (max 5 iterations to prevent runaway)
     let finalReply = '';
-    let toolOutputs = [];
+    let usedProvider = 'unknown';
     const maxIterations = 5;
 
     for (let iteration = 0; iteration < maxIterations; iteration++) {
-      const completion = await client.chat.completions.create({
-        model: MODEL,
-        messages,
-        tools: TOOL_DEFINITIONS,
-        tool_choice: 'auto',
-        temperature: 0.6,
-        max_tokens: 4096,
-      });
+      let completionResult;
+      try {
+        completionResult = await createCompletion({
+          messages,
+          tools: TOOL_DEFINITIONS,
+          tool_choice: 'auto',
+          temperature: 0.6,
+          max_tokens: 4096,
+        });
+      } catch (providerErr) {
+        // All providers failed inside the loop — break and let outer catch handle it
+        throw providerErr;
+      }
 
-      const assistantMessage = completion.choices[0].message;
+      const assistantMessage = completionResult.result.choices[0].message;
+      usedProvider = completionResult.provider || usedProvider;
 
       // If there are tool calls, execute them and continue the loop
       if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
@@ -215,7 +102,6 @@ router.post('/', protect, async (req, res) => {
         );
 
         messages.push(...toolResults);
-        toolOutputs.push(...toolResults);
         continue;
       }
 
@@ -228,7 +114,7 @@ router.post('/', protect, async (req, res) => {
       finalReply = 'I apologize, but I was unable to complete the analysis after several attempts. Please try rephrasing your question.';
     }
 
-    res.json({ success: true, reply: finalReply });
+    res.json({ success: true, reply: finalReply, provider: usedProvider });
   } catch (error) {
     console.error('AI chat error:', error.message || String(error));
 
@@ -241,16 +127,41 @@ router.post('/', protect, async (req, res) => {
         error.message.includes('exhausted')
       ));
 
-    if (isQuotaError) {
+    // All providers failed or a hard error
+    const allFailed = error.message && error.message.includes('All AI providers failed');
+
+    if (isQuotaError || allFailed) {
       return res.status(200).json({
         success: true,
-        reply: `The AI service quota has been reached. Please try again later or contact your administrator to check the Groq API key configuration.`,
+        reply: allFailed
+          ? `The AI assistant is temporarily unavailable. All providers failed — please check your internet connection or API keys, then try again.`
+          : `The AI service quota has been reached. Please try again later or contact your administrator to check the API key configuration.`,
       });
     }
 
     res.status(500).json({
       success: false,
       reply: `AI service error: ${(error.message || 'Unknown error').slice(0, 500)}`,
+    });
+  }
+});
+
+// ─── Provider status endpoint ─────────────────────────────────────────────
+router.get('/providers', protect, async (req, res) => {
+  try {
+    const statuses = await getProviderStatus();
+    res.json({
+      success: true,
+      providers: statuses,
+      configured: statuses.filter((p) => p.configured).map((p) => p.name),
+      healthy: statuses.filter((p) => p.healthy).map((p) => p.name),
+      active: statuses.filter((p) => p.reachable).map((p) => p.name),
+    });
+  } catch (error) {
+    console.error('AI provider status error:', error.message || String(error));
+    res.status(500).json({
+      success: false,
+      message: `Failed to check provider status: ${(error.message || 'Unknown error').slice(0, 500)}`,
     });
   }
 });

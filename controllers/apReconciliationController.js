@@ -171,41 +171,81 @@ const apReconciliationController = {
       };
 
       if (supplierId) query.supplier = supplierId;
+      // Include both GRNs and direct Purchases as outstanding payables
+      const Purchase = require('../models/Purchase');
 
-      const total = await GoodsReceivedNote.countDocuments(query);
-      const grns = await GoodsReceivedNote.find(query)
-        .populate('supplier', 'name code')
-        .sort({ receivedDate: -1 })
-        .skip((page - 1) * limit)
-        .limit(parseInt(limit));
+      const grnQuery = { ...query };
+      const purchaseQuery = { ...query };
 
-      // Calculate summary
-      const summary = await GoodsReceivedNote.aggregate([
-        { $match: { company: new mongoose.Types.ObjectId(companyId), balance: { $gt: 0 } } },
-        {
-          $group: {
-            _id: null,
-            totalOutstanding: { $sum: { $toDouble: '$balance' } },
-            totalGRNs: { $sum: 1 }
-          }
-        }
+      // Count both
+      const [grnCount, purchaseCount] = await Promise.all([
+        GoodsReceivedNote.countDocuments(grnQuery),
+        Purchase.countDocuments(purchaseQuery)
       ]);
+
+      const [grns, purchases] = await Promise.all([
+        GoodsReceivedNote.find(grnQuery).populate('supplier', 'name code').lean(),
+        Purchase.find(purchaseQuery).populate('supplier', 'name code').lean()
+      ]);
+
+      // Normalize entries and merge
+      const normalizedGRNs = grns.map(g => ({
+        _id: g._id,
+        type: 'grn',
+        reference: g.referenceNo || g.grnNumber,
+        supplier: g.supplier,
+        date: g.receivedDate,
+        totalAmount: parseFloat(g.totalAmount || 0),
+        amountPaid: parseFloat(g.amountPaid || 0),
+        balance: parseFloat(g.balance || 0),
+        raw: g
+      }));
+
+      const normalizedPurchases = purchases.map(p => ({
+        _id: p._id,
+        type: 'purchase',
+        reference: p.purchaseNumber || p.supplierInvoiceNumber,
+        supplier: p.supplier,
+        date: p.receivedDate || p.purchaseDate,
+        totalAmount: parseFloat(p.grandTotal || p.roundedAmount || 0),
+        amountPaid: parseFloat(p.amountPaid || 0),
+        balance: parseFloat(p.balance || 0),
+        raw: p
+      }));
+
+      const all = [...normalizedGRNs, ...normalizedPurchases];
+
+      // sort by date desc
+      all.sort((a, b) => {
+        const da = a.date ? new Date(a.date).getTime() : 0;
+        const db = b.date ? new Date(b.date).getTime() : 0;
+        return db - da;
+      });
+
+      const total = grnCount + purchaseCount;
+      const pages = Math.max(1, Math.ceil(total / parseInt(limit)));
+      const start = (page - 1) * limit;
+      const pageItems = all.slice(start, start + parseInt(limit));
+
+      const totalOutstanding = all.reduce((s, it) => s + (it.balance || 0), 0);
 
       res.json({
         success: true,
         data: {
-          grns: grns.map(g => ({
-            ...g.toObject(),
-            totalAmount: parseFloat(g.totalAmount || 0),
-            amountPaid: parseFloat(g.amountPaid || 0),
-            balance: parseFloat(g.balance || 0)
+          grns: pageItems.map(i => ({
+            ...i.raw,
+            _apType: i.type,
+            reference: i.reference,
+            totalAmount: i.totalAmount,
+            amountPaid: i.amountPaid,
+            balance: i.balance
           })),
-          summary: summary[0] || { totalOutstanding: 0, totalGRNs: 0 },
+          summary: { totalOutstanding, totalGRNs: total },
           pagination: {
             total,
             page: parseInt(page),
             limit: parseInt(limit),
-            pages: Math.ceil(total / limit)
+            pages
           }
         }
       });

@@ -35,10 +35,38 @@ const Notification = require('../models/Notification');
 const Quotation = require('../models/Quotation');
 const SalesOrder = require('../models/SalesOrder');
 
+function isValidDate(d) {
+  return d instanceof Date && !isNaN(d.getTime());
+}
+
+function parseDateInput(input) {
+  if (!input || typeof input !== 'string') return null;
+  const normalized = input.trim().toLowerCase();
+
+  // Already ISO or standard format
+  const direct = new Date(input);
+  if (isValidDate(direct)) return direct;
+
+  // Relative terms the AI might use
+  const now = new Date();
+  if (normalized === 'today') return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (normalized === 'yesterday') { const d = new Date(now); d.setDate(d.getDate() - 1); return d; }
+  if (normalized === 'this week') { const d = new Date(now); d.setDate(d.getDate() - d.getDay()); return d; }
+  if (normalized === 'this month') return new Date(now.getFullYear(), now.getMonth(), 1);
+  if (normalized === 'this year') return new Date(now.getFullYear(), 0, 1);
+  if (normalized === 'last week') { const d = new Date(now); d.setDate(d.getDate() - d.getDay() - 7); return d; }
+  if (normalized === 'last month') { const d = new Date(now); d.setMonth(d.getMonth() - 1); d.setDate(1); return d; }
+  if (normalized === 'last year') return new Date(now.getFullYear() - 1, 0, 1);
+
+  return null;
+}
+
 function dateFilter(start, end) {
   const q = {};
-  if (start) q.$gte = new Date(start);
-  if (end) q.$lte = new Date(end);
+  const s = parseDateInput(start);
+  const e = parseDateInput(end);
+  if (s) q.$gte = s;
+  if (e) q.$lte = e;
   return Object.keys(q).length ? q : undefined;
 }
 

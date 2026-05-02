@@ -85,9 +85,16 @@ async function initializeServer() {
   require('./models/StockBatch');
   require('./models/StockSerialNumber');
   require('./models/SalesOrder');
-  require('./models/PickPack');
-  require('./models/ARTransactionLedger');
-  require('./src/models/ImportJob');
+   require('./models/PickPack');
+   require('./models/ARTransactionLedger');
+   require('./models/APTransactionLedger');
+   require('./models/APPayment');
+   require('./models/APPaymentAllocation');
+   require('./models/ARReceipt');
+   require('./models/ARReceiptAllocation');
+   require('./models/ARBadDebtWriteoff');
+   require('./models/CreditNote');
+   require('./src/models/ImportJob');
 
   app = express();
 

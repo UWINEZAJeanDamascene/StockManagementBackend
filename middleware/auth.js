@@ -46,6 +46,12 @@ const protect = async (req, res, next) => {
 
       // Get company information and attach to request
       req.company = await Company.findById(req.user.company);
+      // For backward compatibility many controllers expect `req.user.company` to be a populated doc
+      try {
+        req.user.company = req.company;
+      } catch (e) {
+        // ignore if assignment fails
+      }
 
       if (!req.company) {
         return res.status(401).json({ 

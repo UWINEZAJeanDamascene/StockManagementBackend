@@ -8,6 +8,7 @@ const {
   deleteInvoice,
   confirmInvoice,
   recordPayment,
+  writeOffInvoiceBadDebt,
   cancelInvoice,
   saveReceiptMetadata,
   getClientInvoices,
@@ -34,6 +35,9 @@ router.put('/:id/confirm', authorize('admin'), logAction('invoice'), confirmInvo
 
 // Record payment
 router.post('/:id/payment', authorize('admin', 'sales'), logAction('invoice'), recordPayment);
+
+// Write off as bad debt (AR decreases)
+router.post('/:id/write-off', authorize('admin'), logAction('invoice'), writeOffInvoiceBadDebt);
 
 // Cancel invoice (reverses stock)
 router.put('/:id/cancel', authorize('admin'), logAction('invoice'), cancelInvoice);

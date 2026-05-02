@@ -220,9 +220,14 @@ function buildConfig() {
     // =====================
     ai: {
       geminiApiKey: process.env.GEMINI_API_KEY || null,
+      geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
       groqApiKey: process.env.GROQ_API_KEY || null,
       groqBaseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
       groqModel: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      ollamaBaseUrl: process.env.OLLAMA_BASE_URL || null,
+      ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
+      cacheTtlSeconds: number(process.env.AI_CACHE_TTL_SECONDS, 30),
+      timeoutMs: number(process.env.AI_TIMEOUT_MS, 10000),
     },
     
     // =====================

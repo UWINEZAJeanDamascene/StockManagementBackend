@@ -271,6 +271,35 @@ exports.createPurchase = async (req, res, next) => {
         total: purchase.roundedAmount,
         vatAmount: purchase.totalTax,
       });
+      // Record AP ledger entry for the purchase so AP ledger and reconciliation include direct purchases
+      try {
+        const APTransactionLedger = require('../models/APTransactionLedger');
+        const APTrackingService = require('../services/apTrackingService');
+        const amount = parseFloat(purchase.roundedAmount || purchase.grandTotal || 0) || 0;
+        const currentBalance = await APTrackingService.getSupplierBalance(companyId, purchase.supplier);
+        const newBalance = currentBalance + amount;
+
+        await APTransactionLedger.create({
+          company: companyId,
+          supplier: purchase.supplier,
+          transactionType: 'grn_received',
+          transactionDate: purchase.purchaseDate || new Date(),
+          referenceNo: purchase.purchaseNumber || purchase.supplierInvoiceNumber || undefined,
+          description: `Purchase ${purchase.purchaseNumber || ''} created - Amount: ${amount.toFixed(2)}`,
+          amount: amount,
+          direction: 'increase',
+          supplierBalanceAfter: newBalance,
+          sourceType: 'manual',
+          sourceId: purchase._id,
+          sourceReference: purchase.purchaseNumber || purchase.supplierInvoiceNumber,
+          createdBy: req.user.id,
+          reconciliationStatus: 'verified'
+        });
+
+        await APTrackingService.invalidateSupplierBalanceCache(companyId, purchase.supplier);
+      } catch (ledgerErr) {
+        console.error('[Purchase] Failed to create AP ledger entry:', ledgerErr.message);
+      }
     } catch (journalError) {
       console.error("Error creating journal entry for purchase:", journalError);
       // Don't fail the purchase creation if journal entry fails

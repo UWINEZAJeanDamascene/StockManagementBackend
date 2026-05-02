@@ -7,41 +7,18 @@ const { protect } = require('../middleware/authMiddleware');
 router.use(protect);
 
 /**
- * AP Payment Routes
+ * AP Routes - Read-Only Reporting Module
+ *
+ * Core Principle: AP is an auto-generated ledger, NOT a transaction entry module.
+ * All AP movements originate from source documents:
+ *   - Purchase/GRN received          -> AP increases (Dr Inventory/Expense / Cr AP)
+ *   - Payment recorded on GRN/Purchase -> AP decreases (Dr AP / Cr Cash/Bank)
+ *   - Debit note issued             -> AP decreases (Dr AP / Cr Inventory/Expense)
+ *   - Bad debt/write-off            -> AP decreases (Dr Expense / Cr AP)
+ *
+ * These endpoints return reports only. No manual transaction entry here.
  */
-// GET /api/ap/payments - List payments
-router.get('/payments', apController.getPayments);
 
-// GET /api/ap/payments/:id - Get single payment
-router.get('/payments/:id', apController.getPayment);
-
-// POST /api/ap/payments - Create payment draft
-router.post('/payments', apController.createPayment);
-
-// PUT /api/ap/payments/:id - Edit payment (draft only)
-router.put('/payments/:id', apController.updatePayment);
-
-// POST /api/ap/payments/:id/post - Post payment
-router.post('/payments/:id/post', apController.postPayment);
-
-// POST /api/ap/payments/:id/save-and-post - Save and post without journal entry
-router.post('/payments/:id/save-and-post', apController.saveAndPostPayment);
-
-// POST /api/ap/payments/:id/reverse - Reverse payment
-router.post('/payments/:id/reverse', apController.reversePayment);
-
-/**
- * AP Allocation Routes
- */
-// GET /api/ap/allocations - List allocations
-router.get('/allocations', apController.getAllocations);
-
-// POST /api/ap/allocations - Create allocation
-router.post('/allocations', apController.createAllocation);
-
-/**
- * AP Reports
- */
 // GET /api/ap/aging - AP aging report
 router.get('/aging', apController.getAgingReport);
 

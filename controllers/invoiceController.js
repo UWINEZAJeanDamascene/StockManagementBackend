@@ -2274,3 +2274,55 @@ exports.sendInvoiceEmail = async (req, res, next) => {
     next(error);
   }
 };
+
+// @desc    Write off invoice as bad debt (AR decreases)
+// @route   POST /api/invoices/:id/write-off
+// @access  Private (admin)
+exports.writeOffInvoiceBadDebt = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user.id;
+    const { id } = req.params;
+    const { amount, reason, writeoffDate, notes } = req.body;
+
+    // Validate invoice exists and is eligible
+    const Invoice = require('../models/Invoice');
+    const invoice = await Invoice.findOne({ _id: id, company: companyId });
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: 'Invoice not found' });
+    }
+    if (invoice.status === 'cancelled' || invoice.status === 'fully_paid') {
+      return res.status(400).json({ success: false, message: 'Cannot write off a cancelled or fully paid invoice' });
+    }
+    const outstanding = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
+    if (outstanding <= 0) {
+      return res.status(400).json({ success: false, message: 'Invoice has no outstanding balance to write off' });
+    }
+
+    const ARService = require('../services/arService');
+    const writeoffAmount = amount && parseFloat(amount) > 0 ? parseFloat(amount) : outstanding;
+    if (writeoffAmount > outstanding) {
+      return res.status(400).json({ success: false, message: 'Write-off amount cannot exceed outstanding balance' });
+    }
+
+    // Create the write-off record
+    const writeoff = await ARService.writeOffBadDebt(companyId, userId, {
+      invoiceId: id,
+      amount: writeoffAmount,
+      reason: reason || 'Bad debt write-off',
+      writeoffDate: writeoffDate || new Date(),
+      notes: notes || null,
+    });
+
+    // Immediately post it (no draft state for source-document actions)
+    await ARService.postBadDebtWriteoff(companyId, userId, writeoff._id);
+
+    res.json({
+      success: true,
+      message: 'Invoice written off as bad debt',
+      data: writeoff,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
