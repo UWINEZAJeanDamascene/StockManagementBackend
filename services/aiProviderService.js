@@ -1,15 +1,12 @@
 /**
  * AI Provider Service — Multi-provider LLM client with automatic fallback
  *
- * Provider chain: Groq → Gemini → Ollama (local)
+ * Provider chain: Groq → Gemini
  * Each provider gets a configurable timeout (default 10s).
  * Responses are cached for 30s to reduce API costs and improve speed.
  *
  * Cloud compatibility:
  *   - Groq & Gemini work anywhere with an API key.
- *   - Ollama only works where the host is reachable (local dev, or a
- *     dedicated Ollama host exposed via OLLAMA_BASE_URL).
- *   - If Ollama is unreachable, the fallback chain skips it automatically.
  */
 
 const crypto = require('crypto');
@@ -54,20 +51,6 @@ function createProviders() {
     });
   }
 
-  // 3. Ollama (local / self-hosted)
-  if (config.ai.ollamaBaseUrl) {
-    providers.push({
-      name: 'ollama',
-      displayName: 'Ollama',
-      client: new OpenAI({
-        apiKey: 'ollama',
-        baseURL: config.ai.ollamaBaseUrl,
-      }),
-      model: config.ai.ollamaModel || 'llama3.2',
-      timeout: Math.max(TIMEOUT_MS, 30000), // Ollama local — 30s min
-    });
-  }
-
   return providers;
 }
 
@@ -91,24 +74,46 @@ function markProviderUnhealthy(name) {
   unhealthyProviders.set(name, { until: Date.now() + HEALTHY_RETRY_MS });
 }
 
+function markProviderUnhealthyUntil(name, untilTimestampMs) {
+  unhealthyProviders.set(name, { until: untilTimestampMs });
+}
+
+function parseRetryAfterFromError(err) {
+  // Try common locations for retry-after information.
+  try {
+    // Header may be present on some clients
+    const headers = err?.headers || err?.response?.headers || err?.rawHeaders;
+    if (headers) {
+      const raw = headers['retry-after'] || headers['Retry-After'] || headers['retry_after'];
+      if (raw) {
+        const secs = parseFloat(raw);
+        if (!Number.isNaN(secs)) return Date.now() + Math.round(secs * 1000);
+      }
+    }
+
+    // Some providers embed a human-readable wait time in the message, e.g.
+    // "Please try again in 1h1m8.544s." — parse that pattern.
+    const msg = err?.message || '';
+    const m = msg.match(/in\s*((\d+)h)?\s*((\d+)m)?\s*((\d+(?:\.\d+)?)s)?/i);
+    if (m) {
+      const hours = parseInt(m[2] || '0', 10);
+      const mins = parseInt(m[4] || '0', 10);
+      const secs = parseFloat(m[6] || '0');
+      const totalMs = ((hours * 3600) + (mins * 60) + secs) * 1000;
+      if (totalMs > 0) return Date.now() + Math.round(totalMs);
+    }
+  } catch (e) {
+    // ignore parsing errors
+  }
+  return null;
+}
+
 // ─── Provider health check (lightweight ping) ─────────────────────────────
 async function checkProviderHealth(provider) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
 
   try {
-    // For Ollama, try listing models to verify connectivity.
-    // For hosted providers (Groq/Gemini), we skip explicit health checks
-    // because their API keys are validated on first real request.
-    if (provider.name === 'ollama') {
-      const resp = await fetch(`${provider.client.baseURL.replace(/\/$/, '')}/models`, {
-        signal: controller.signal,
-        headers: { Authorization: 'Bearer ollama' },
-      });
-      clearTimeout(timer);
-      return resp.ok;
-    }
-
     clearTimeout(timer);
     return true; // Hosted providers assumed healthy if configured
   } catch (err) {
@@ -177,24 +182,58 @@ async function setCachedResponse(cacheKey, response) {
 }
 
 // ─── Single provider call with AbortController timeout ──────────────────────
-async function callProvider(provider, requestParams) {
+async function callProviderRaw(provider, requestParams) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), provider.timeout);
 
   try {
-    const result = await provider.client.chat.completions.create(
-      {
-        ...requestParams,
-        model: provider.model,
-      },
-      { signal: controller.signal }
-    );
+    const params = { ...requestParams, model: provider.model };
+
+    const result = await provider.client.chat.completions.create(params, { signal: controller.signal });
     clearTimeout(timer);
     return { result, provider: provider.name, displayName: provider.displayName };
   } catch (error) {
     clearTimeout(timer);
     throw error;
   }
+}
+
+async function callProviderWithRetry(provider, requestParams, opts = {}) {
+  const maxRetries = opts.maxRetries ?? 2;
+  let attempt = 0;
+  let delay = 1000;
+
+  while (attempt <= maxRetries) {
+    try {
+      return await callProviderRaw(provider, requestParams);
+    } catch (err) {
+      attempt += 1;
+
+      const status = err?.status || err?.statusCode || 'no-status';
+
+      // If we receive 429, parse Retry-After or message and mark provider unhealthy until then.
+      if (status === 429) {
+        const until = parseRetryAfterFromError(err) || (Date.now() + HEALTHY_RETRY_MS);
+        markProviderUnhealthyUntil(provider.name, until);
+        // Do not block waiting here; escalate to outer loop to try next provider.
+        throw err;
+      }
+
+      // For timeouts / aborts or network errors, do exponential backoff and retry.
+      const isAbort = err.name === 'AbortError' || /timeout|aborted/i.test(err.message || '');
+      if (attempt > maxRetries || !isAbort) {
+        // Give up on other non-transient errors
+        throw err;
+      }
+
+      // transient error — wait and retry
+      await new Promise((res) => setTimeout(res, delay));
+      delay *= 2;
+      continue;
+    }
+  }
+  // If we exit loop without returning, throw generic error
+  throw new Error('Provider retries exhausted');
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────
@@ -222,11 +261,12 @@ function getConfiguredProviders() {
  */
 async function createCompletion(params) {
   let lastError = null;
+  const providerErrors = [];
   const allConfigured = createProviders();
   const activeProviders = getProviders();
 
   if (allConfigured.length === 0) {
-    throw new Error('No AI providers are configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL environment variables.');
+    throw new Error('No AI providers are configured. Set GROQ_API_KEY and GEMINI_API_KEY environment variables.');
   }
 
   if (activeProviders.length === 0) {
@@ -236,7 +276,7 @@ async function createCompletion(params) {
   for (const provider of activeProviders) {
     try {
       const start = Date.now();
-      const response = await callProvider(provider, params);
+      const response = await callProviderWithRetry(provider, params);
       const elapsed = Date.now() - start;
       if (elapsed > 8000) {
         console.warn(`Provider ${provider.name} responded slowly (${elapsed}ms)`);
@@ -246,16 +286,27 @@ async function createCompletion(params) {
       lastError = err;
       const reason = err.name === 'AbortError' ? 'timeout' : (err.message || 'unknown');
       const status = err.status || err.statusCode || 'no-status';
+      providerErrors.push({ name: provider.name, status, reason });
       console.warn(`AI provider ${provider.name} failed (status=${status}, reason=${reason}, type=${err.type || 'n/a'}). Trying next...`);
       if (err.stack) console.warn(`Stack: ${err.stack.split('\n').slice(0, 3).join(' | ')}`);
-      markProviderUnhealthy(provider.name);
+      // For non-429 errors we set a short unhealthy marker to avoid immediate retries.
+      if (status !== 429) markProviderUnhealthy(provider.name);
       // Continue to next provider
     }
   }
 
-  throw new Error(
-    `All AI providers failed. Last error: ${lastError?.message || 'Unknown error'}`
-  );
+  // Build a summary so callers can diagnose whether this is a rate-limit cascade.
+  const anyQuotaError = providerErrors.some(e => e.status === 429 || /quota|rate limit/i.test(e.reason));
+  const errorDetails = providerErrors.map(e => `${e.name}(${e.status}: ${e.reason})`).join(', ');
+  const summary = anyQuotaError
+    ? `All AI providers failed due to rate limits. Details: ${errorDetails}`
+    : `All AI providers failed. Details: ${errorDetails}`;
+
+  const error = new Error(`${summary} | Last error: ${lastError?.message || 'Unknown error'}`);
+  error.providerErrors = providerErrors;
+  error.allProvidersFailed = true;
+  error.anyQuotaError = anyQuotaError;
+  throw error;
 }
 
 /**
@@ -305,6 +356,11 @@ async function getProviderStatus() {
   );
   return statuses;
 }
+
+// ─── Startup diagnostic ─────────────────────────────────────────────────────
+const configured = createProviders();
+console.log(`[AI] Provider config: groq=${config.ai.groqApiKey ? 'set' : 'missing'}, gemini=${config.ai.geminiApiKey ? 'set' : 'missing'}`);
+console.log(`[AI] Active providers: ${configured.map(p => p.name).join(', ') || 'NONE'}`);
 
 module.exports = {
   isConfigured,

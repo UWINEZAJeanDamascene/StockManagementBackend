@@ -38,7 +38,7 @@ router.post('/', protect, async (req, res) => {
       const providers = getConfiguredProviders();
       return res.status(200).json({
         success: true,
-        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- GEMINI_API_KEY (Google Gemini fallback)\n- OLLAMA_BASE_URL (local Ollama, e.g. http://localhost:11434/v1)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
+        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- GEMINI_API_KEY (Google Gemini fallback)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
       });
     }
 
@@ -120,6 +120,7 @@ router.post('/', protect, async (req, res) => {
 
     const isQuotaError =
       error.status === 429 ||
+      error.anyQuotaError === true ||
       (error.message && (
         error.message.includes('429') ||
         error.message.includes('quota') ||
@@ -128,14 +129,14 @@ router.post('/', protect, async (req, res) => {
       ));
 
     // All providers failed or a hard error
-    const allFailed = error.message && error.message.includes('All AI providers failed');
+    const allFailed = error.allProvidersFailed === true || (error.message && error.message.includes('All AI providers failed'));
 
     if (isQuotaError || allFailed) {
       return res.status(200).json({
         success: true,
-        reply: allFailed
-          ? `The AI assistant is temporarily unavailable. All providers failed — please check your internet connection or API keys, then try again.`
-          : `The AI service quota has been reached. Please try again later or contact your administrator to check the API key configuration.`,
+        reply: isQuotaError
+          ? `The AI assistant is temporarily unavailable because all providers are rate-limited. Please try again later, or contact your administrator to check API key quotas.`
+          : `The AI assistant is temporarily unavailable. All providers failed — please check your internet connection or API keys, then try again.`,
       });
     }
 
