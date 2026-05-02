@@ -222,10 +222,15 @@ function getConfiguredProviders() {
  */
 async function createCompletion(params) {
   let lastError = null;
+  const allConfigured = createProviders();
   const activeProviders = getProviders();
 
+  if (allConfigured.length === 0) {
+    throw new Error('No AI providers are configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL environment variables.');
+  }
+
   if (activeProviders.length === 0) {
-    throw new Error('All AI providers are temporarily unhealthy. Please try again in a minute.');
+    throw new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
   }
 
   for (const provider of activeProviders) {
@@ -240,7 +245,9 @@ async function createCompletion(params) {
     } catch (err) {
       lastError = err;
       const reason = err.name === 'AbortError' ? 'timeout' : (err.message || 'unknown');
-      console.warn(`AI provider ${provider.name} failed (${reason}). Trying next...`);
+      const status = err.status || err.statusCode || 'no-status';
+      console.warn(`AI provider ${provider.name} failed (status=${status}, reason=${reason}, type=${err.type || 'n/a'}). Trying next...`);
+      if (err.stack) console.warn(`Stack: ${err.stack.split('\n').slice(0, 3).join(' | ')}`);
       markProviderUnhealthy(provider.name);
       // Continue to next provider
     }
