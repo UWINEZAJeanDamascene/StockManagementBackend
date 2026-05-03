@@ -51,7 +51,21 @@ function createProviders() {
     });
   }
 
-  // 3. Google Gemini (hosted fallback)
+  // 3. OpenRouter (access 100+ models with one key)
+  if (config.ai.openRouterApiKey) {
+    providers.push({
+      name: 'openrouter',
+      displayName: 'OpenRouter',
+      client: new OpenAI({
+        apiKey: config.ai.openRouterApiKey,
+        baseURL: 'https://openrouter.ai/api/v1',
+      }),
+      model: config.ai.openRouterModel || 'openrouter/quasar-alpha',
+      timeout: Math.min(TIMEOUT_MS, 25000), // OpenRouter medium — 25s max
+    });
+  }
+
+  // 4. Google Gemini (hosted fallback)
   if (config.ai.geminiApiKey) {
     providers.push({
       name: 'gemini',
@@ -62,6 +76,34 @@ function createProviders() {
       }),
       model: config.ai.geminiModel || 'gemini-2.0-flash',
       timeout: Math.min(TIMEOUT_MS, 20000), // Gemini medium — 20s max
+    });
+  }
+
+  // 5. DeepSeek (free tier, popular reasoning model)
+  if (config.ai.deepseekApiKey) {
+    providers.push({
+      name: 'deepseek',
+      displayName: 'DeepSeek',
+      client: new OpenAI({
+        apiKey: config.ai.deepseekApiKey,
+        baseURL: 'https://api.deepseek.com/v1',
+      }),
+      model: config.ai.deepseekModel || 'deepseek-chat',
+      timeout: Math.min(TIMEOUT_MS, 25000), // DeepSeek medium — 25s max
+    });
+  }
+
+  // 6. Together AI (free tier, open-source models)
+  if (config.ai.togetherApiKey) {
+    providers.push({
+      name: 'together',
+      displayName: 'Together AI',
+      client: new OpenAI({
+        apiKey: config.ai.togetherApiKey,
+        baseURL: 'https://api.together.xyz/v1',
+      }),
+      model: config.ai.togetherModel || 'meta-llama/Llama-3.2-3B-Instruct-Turbo',
+      timeout: Math.min(TIMEOUT_MS, 25000), // Together medium — 25s max
     });
   }
 

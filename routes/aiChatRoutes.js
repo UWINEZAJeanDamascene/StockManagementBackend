@@ -26,7 +26,7 @@ router.post('/', protect, async (req, res) => {
       const providers = getConfiguredProviders();
       return res.status(200).json({
         success: true,
-        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- MISTRAL_API_KEY (Mistral AI — 1B free tokens/month)\n- GEMINI_API_KEY (Google Gemini fallback)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
+        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- MISTRAL_API_KEY (Mistral AI — 1B free tokens/month)\n- OPENROUTER_API_KEY (OpenRouter — 100+ models, one key)\n- DEEPSEEK_API_KEY (DeepSeek — free reasoning model)\n- TOGETHER_API_KEY (Together AI — free open-source models)\n- GEMINI_API_KEY (Google Gemini fallback)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
       });
     }
 
