@@ -307,44 +307,7 @@ async function initializeServer() {
     }
   });
 
-  // Download generated Excel files with auth
-  console.log('[Server] Registering downloads route');
-  app.get('/downloads/:filename', async (req, res) => {
-    try {
-      const { protect } = require('./middleware/authMiddleware');
-      // Run auth check
-      await new Promise((resolve, reject) => {
-        protect(req, res, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-
-      const filename = req.params.filename;
-      // Validate filename to prevent directory traversal
-      if (!filename.match(/^[a-zA-Z0-9_-]+\.xlsx$/)) {
-        return res.status(400).json({ success: false, message: 'Invalid filename' });
-      }
-
-      const filePath = path.join(__dirname, 'downloads', filename);
-      console.log('[Download] Looking for file:', filePath);
-      console.log('[Download] __dirname:', __dirname);
-      if (!fs.existsSync(filePath)) {
-        console.log('[Download] File not found. Checking if downloads dir exists:', fs.existsSync(path.join(__dirname, 'downloads')));
-        return res.status(404).json({ success: false, message: 'File not found' });
-      }
-
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      fs.createReadStream(filePath).pipe(res);
-    } catch (err) {
-      console.error('[Download] Error:', err.message);
-      res.status(500).json({ success: false, message: 'Download failed' });
-    }
-  });
-
-  // Public download route (short-lived signed tokens) - no auth required
-  console.log('[Server] Registering public-download route');
+  // Public download route for Excel files (token-based)
   app.get('/public-download/:token', async (req, res) => {
     try {
       const token = req.params.token;

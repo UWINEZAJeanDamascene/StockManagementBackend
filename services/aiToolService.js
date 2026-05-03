@@ -937,31 +937,29 @@ async function generateExcel(args) {
     // Ensure no trailing slash
     baseUrl = String(baseUrl).replace(/\/$/, '');
 
-    // Create a short-lived signed token for public download (optional)
-    let jwtSecret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+    // Create a short-lived signed token for public download
     try {
-      const envCfg = require('../src/config/environment');
-      const cfg = envCfg.getConfig ? envCfg.getConfig() : envCfg;
-      if (cfg && cfg.jwt && cfg.jwt.secret) jwtSecret = cfg.jwt.secret;
-    } catch (e) {
-      // ignore and use env
-    }
-
-    let publicDownloadUrl = null;
-    try {
-      const token = jwt.sign({ file: fileNameFull }, jwtSecret, { expiresIn: '15m' });
+      const jwt = require('jsonwebtoken');
+      const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+      const token = jwt.sign(
+        { file: fileNameFull, exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60) },
+        JWT_SECRET
+      );
       publicDownloadUrl = `${baseUrl}/public-download/${token}`;
-    } catch (e) {
-      console.warn('[generateExcel] Could not create public download token', e && e.message ? e.message : e);
+      console.log('[generateExcel] Generated public download URL with token');
+    } catch (jwtErr) {
+      console.error('[generateExcel] JWT signing failed:', jwtErr.message);
+      publicDownloadUrl = null;
     }
 
     // Use public download URL with signed token (no auth required)
-    const finalDownloadUrl = publicDownloadUrl || `${baseUrl}/downloads/${fileNameFull}`;
+    // If JWT signing failed, we don't have a working download URL
+    const finalDownloadUrl = publicDownloadUrl;
 
-    console.log('[generateExcel] Returning downloadUrl:', finalDownloadUrl, 'publicUrl was:', publicDownloadUrl);
+    console.log('[generateExcel] Returning downloadUrl:', publicDownloadUrl);
 
     return {
-      downloadUrl: finalDownloadUrl,
+      downloadUrl: publicDownloadUrl,
       fileName: fileNameFull,
       rows: data.length,
       columns: headers.length,

@@ -383,7 +383,10 @@ async function createCompletion(params) {
     throw new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
   }
 
+  console.log(`[createCompletion] Starting with ${activeProviders.length} active providers: ${activeProviders.map(p => p.name).join(', ')}`);
+
   for (const provider of activeProviders) {
+    console.log(`[createCompletion] Trying provider: ${provider.name}`);
     try {
       const start = Date.now();
       const response = await callProviderWithRetry(provider, params, { maxRetries: 2 });
