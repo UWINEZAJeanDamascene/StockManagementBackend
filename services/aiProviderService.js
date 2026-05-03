@@ -16,7 +16,7 @@ const config = env.getConfig();
 const { redisClient, isRedisConfigured } = require('../config/redis');
 
 // ─── Configuration ──────────────────────────────────────────────────────────
-const CACHE_TTL_SECONDS = config.ai.cacheTtlSeconds || 30;
+const CACHE_TTL_SECONDS = config.ai.cacheTtlSeconds || 300;
 const TIMEOUT_MS = config.ai.timeoutMs || 10000;
 
 // ─── Provider setup ─────────────────────────────────────────────────────────
@@ -32,12 +32,26 @@ function createProviders() {
         apiKey: config.ai.groqApiKey,
         baseURL: config.ai.groqBaseUrl || 'https://api.groq.com/openai/v1',
       }),
-      model: config.ai.groqModel || 'llama-3.3-70b-versatile',
+      model: config.ai.groqModel || 'llama-3.1-8b-instant',
       timeout: Math.min(TIMEOUT_MS, 15000), // Groq is fast — 15s max
     });
   }
 
-  // 2. Google Gemini (hosted fallback)
+  // 2. Mistral AI (generous free tier — 1B tokens/month)
+  if (config.ai.mistralApiKey) {
+    providers.push({
+      name: 'mistral',
+      displayName: 'Mistral',
+      client: new OpenAI({
+        apiKey: config.ai.mistralApiKey,
+        baseURL: 'https://api.mistral.ai/v1',
+      }),
+      model: config.ai.mistralModel || 'mistral-small-latest',
+      timeout: Math.min(TIMEOUT_MS, 20000), // Mistral medium — 20s max
+    });
+  }
+
+  // 3. Google Gemini (hosted fallback)
   if (config.ai.geminiApiKey) {
     providers.push({
       name: 'gemini',
@@ -211,11 +225,11 @@ async function callProviderWithRetry(provider, requestParams, opts = {}) {
 
       const status = err?.status || err?.statusCode || 'no-status';
 
-      // If we receive 429, parse Retry-After or message and mark provider unhealthy until then.
+      // If we receive 429, don't retry — rate limits are not transient.
+      // Immediately mark the provider unhealthy so we move to the next one fast.
       if (status === 429) {
         const until = parseRetryAfterFromError(err) || (Date.now() + HEALTHY_RETRY_MS);
         markProviderUnhealthyUntil(provider.name, until);
-        // Do not block waiting here; escalate to outer loop to try next provider.
         throw err;
       }
 
@@ -270,7 +284,7 @@ async function createCompletion(params) {
   }
 
   if (activeProviders.length === 0) {
-    throw new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
+    throw new Error('All AI providers are rate-limited. Please try again later, or contact your administrator to check API key quotas.');
   }
 
   for (const provider of activeProviders) {
@@ -298,11 +312,9 @@ async function createCompletion(params) {
   // Build a summary so callers can diagnose whether this is a rate-limit cascade.
   const anyQuotaError = providerErrors.some(e => e.status === 429 || /quota|rate limit/i.test(e.reason));
   const errorDetails = providerErrors.map(e => `${e.name}(${e.status}: ${e.reason})`).join(', ');
-  const summary = anyQuotaError
-    ? `All AI providers failed due to rate limits. Details: ${errorDetails}`
-    : `All AI providers failed. Details: ${errorDetails}`;
-
-  const error = new Error(`${summary} | Last error: ${lastError?.message || 'Unknown error'}`);
+  const error = new Error(
+    `All AI providers are rate-limited. Please try again later, or contact your administrator to check API key quotas. (${errorDetails})`
+  );
   error.providerErrors = providerErrors;
   error.allProvidersFailed = true;
   error.anyQuotaError = anyQuotaError;

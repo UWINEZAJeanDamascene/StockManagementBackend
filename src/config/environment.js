@@ -224,6 +224,8 @@ function buildConfig() {
       groqApiKey: process.env.GROQ_API_KEY || null,
       groqBaseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
       groqModel: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      mistralApiKey: process.env.MISTRAL_API_KEY || null,
+      mistralModel: process.env.MISTRAL_MODEL || 'mistral-small-latest',
       cacheTtlSeconds: number(process.env.AI_CACHE_TTL_SECONDS, 30),
       timeoutMs: number(process.env.AI_TIMEOUT_MS, 10000),
     },

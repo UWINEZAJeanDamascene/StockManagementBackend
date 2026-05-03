@@ -10,21 +10,9 @@ const {
 } = require('../services/aiProviderService');
 
 function buildSystemPrompt(userName, companyName) {
-  return `You are Stacy, an AI assistant for StockManager — a stock & accounting SaaS for Rwandan businesses. You have live data access via tools.
+  return `You are Stacy, AI assistant for StockManager (stock & accounting SaaS for Rwanda). Currency=FRW. Tax A=0%, Tax B=18% VAT. Corp tax=30%. FY=Jan-Dec. COGS=Opening+Purchases-Closing. Address ${userName}.
 
-PERSONALITY: Warm, professional. Use English/French. Know Muraho=Hello, Murakoze=Thanks. Address ${userName} by name. End substantive answers with a follow-up question.
-
-RWANDA RULES: Currency=FRW (not $). Tax A=0% VAT exempt, Tax B=18% VAT. Corp Tax=30%. VAT due 15th of next month, CIT 3 months after FY. IFRS. FY=Jan-Dec. COGS = Opening Stock + Purchases - Closing Stock.
-
-FORMULAS: Gross Profit=Revenue-COGS. Op Profit=Gross-OpEx. Net=PreTax-CorpTax(30%). Current Ratio=CA/CL (>1.5 healthy). Gross Margin%=(Gross/Revenue)*100. Balance: Assets=Liabilities+Equity.
-
-TOOLS: Call tools proactively for data/reports/metrics. Call multiple in parallel if independent. Synthesize results — never dump raw JSON. Use FRW for money. Match chartType: line/bar for trends, pie/doughnut for breakdowns. For how-to questions, guide to the UI page path.
-
-MODULES: Dashboards (KPIs, alerts, trends). Inventory (products, SKUs, stock levels, movements, transfers, audits, batches, serials, warehouses, categories). Purchasing (suppliers, POs, GRN, purchase bills, returns). Sales (POS, clients, quotations, sales orders, pick packs, invoices, delivery notes, credit notes, recurring invoices, AR receipts/payments). Finance (bank accounts, chart of accounts, journals, petty cash, fixed assets, liabilities, expenses, budgets, payroll, accounting periods). Reports (P&L, balance sheet, cash flow, ratios). System (users, roles, security, departments, company settings, notifications, backups, bulk data, audit trail).
-
-CHART FORMAT: \`\`\`json{"type":"chart","chartType":"bar","title":"...","labels":[],"datasets":[]}\`\`\`
-TABLE FORMAT: \`\`\`json{"type":"table","title":"...","columns":[],"rows":[]}\`\`\`
-Use markdown for text. Be concise but complete.`;
+Use tools proactively. Call multiple in parallel. Synthesize results, never dump JSON. Use FRW. Charts: line/bar for trends, pie for breakdowns. End answers with a follow-up question.`;
 }
 
 router.post('/', protect, async (req, res) => {
@@ -38,7 +26,7 @@ router.post('/', protect, async (req, res) => {
       const providers = getConfiguredProviders();
       return res.status(200).json({
         success: true,
-        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- GEMINI_API_KEY (Google Gemini fallback)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
+        reply: `The AI assistant is not configured. Please set one of these environment variables and restart the backend:\n\n- GROQ_API_KEY (fastest, recommended)\n- MISTRAL_API_KEY (Mistral AI — 1B free tokens/month)\n- GEMINI_API_KEY (Google Gemini fallback)\n\nCurrently configured providers: ${providers.length > 0 ? providers.map(p => p.displayName).join(', ') : 'none'}`,
       });
     }
 
@@ -134,9 +122,7 @@ router.post('/', protect, async (req, res) => {
     if (isQuotaError || allFailed) {
       return res.status(200).json({
         success: true,
-        reply: isQuotaError
-          ? `The AI assistant is temporarily unavailable because all providers are rate-limited. Please try again later, or contact your administrator to check API key quotas.`
-          : `The AI assistant is temporarily unavailable. All providers failed — please check your internet connection or API keys, then try again.`,
+        reply: `The AI assistant is temporarily unavailable because all providers are rate-limited. Please try again later, or contact your administrator to check API key quotas.`,
       });
     }
 

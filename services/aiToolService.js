@@ -421,8 +421,25 @@ async function getStockMovements(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.date = df;
-  const movements = await StockMovement.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
-  return { count: movements.length, movements };
+  const movements = await StockMovement.find(q)
+    .sort({ date: -1 })
+    .limit(Number(limit))
+    .populate('product', 'name sku')
+    .populate('warehouse', 'name')
+    .lean();
+  return {
+    count: movements.length,
+    movements: movements.map((m) => ({
+      id: m._id,
+      type: m.type,
+      product: m.product?.name || 'Unknown',
+      sku: m.product?.sku || '',
+      warehouse: m.warehouse?.name || 'Unknown',
+      quantity: m.quantity,
+      date: m.date,
+      reason: m.reason || '',
+    })),
+  };
 }
 
 async function getStockTransfers(companyId, opts = {}) {
@@ -430,8 +447,25 @@ async function getStockTransfers(companyId, opts = {}) {
   const { limit = 20, status = '' } = opts;
   const q = { company: companyId };
   if (status) q.status = status;
-  const transfers = await StockTransfer.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
-  return { count: transfers.length, transfers };
+  const transfers = await StockTransfer.find(q)
+    .sort({ createdAt: -1 })
+    .limit(Number(limit))
+    .populate('fromWarehouse', 'name')
+    .populate('toWarehouse', 'name')
+    .lean();
+  return {
+    count: transfers.length,
+    transfers: transfers.map((t) => ({
+      id: t._id,
+      transferNumber: t.transferNumber,
+      status: t.status,
+      date: t.createdAt,
+      fromWarehouse: t.fromWarehouse?.name || 'Unknown',
+      toWarehouse: t.toWarehouse?.name || 'Unknown',
+      totalItems: t.totalItems,
+      totalQuantity: t.totalQuantity,
+    })),
+  };
 }
 
 async function getSuppliers(companyId, opts = {}) {
@@ -450,8 +484,28 @@ async function getPurchaseOrders(companyId, opts = {}) {
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
   if (df) q.orderDate = df;
-  const orders = await PurchaseOrder.find(q).sort({ orderDate: -1 }).limit(Number(limit)).lean();
-  return { count: orders.length, orders };
+  const orders = await PurchaseOrder.find(q)
+    .sort({ orderDate: -1 })
+    .limit(Number(limit))
+    .populate('supplier', 'name')
+    .lean();
+  return {
+    count: orders.length,
+    orders: orders.map((o) => ({
+      id: o._id,
+      purchaseNumber: o.purchaseNumber,
+      status: o.status,
+      date: o.orderDate,
+      supplier: o.supplier?.name || 'Unknown',
+      total: o.total,
+      items: (o.items || []).map((i) => ({
+        name: i.name,
+        quantity: i.qty || i.quantity,
+        unitPrice: i.unitPrice,
+        total: i.total,
+      })),
+    })),
+  };
 }
 
 async function getGoodsReceivedNotes(companyId, opts = {}) {
@@ -460,8 +514,35 @@ async function getGoodsReceivedNotes(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.date = df;
-  const grns = await GoodsReceivedNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
-  return { count: grns.length, grns };
+  const grns = await GoodsReceivedNote.find(q)
+    .sort({ date: -1 })
+    .limit(Number(limit))
+    .populate('purchaseOrder', 'purchaseNumber')
+    .populate('warehouse', 'name')
+    .populate('supplier', 'name')
+    .populate('lines.product', 'name sku')
+    .lean();
+  return {
+    count: grns.length,
+    grns: grns.map((g) => ({
+      referenceNo: g.referenceNo,
+      status: g.status,
+      date: g.date,
+      supplier: g.supplier?.name || 'Unknown',
+      warehouse: g.warehouse?.name || 'Unknown',
+      purchaseOrder: g.purchaseOrder?.purchaseNumber || 'N/A',
+      totalAmount: g.totalAmount,
+      amountPaid: g.amountPaid,
+      balance: g.balance,
+      lines: (g.lines || []).map((l) => ({
+        name: l.product?.name || 'Unknown',
+        sku: l.product?.sku || '',
+        quantity: l.qtyReceived,
+        unitCost: l.unitCost,
+        taxRate: l.taxRate,
+      })),
+    })),
+  };
 }
 
 async function getCreditNotes(companyId, opts = {}) {
@@ -470,8 +551,22 @@ async function getCreditNotes(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.date = df;
-  const notes = await CreditNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
-  return { count: notes.length, notes };
+  const notes = await CreditNote.find(q)
+    .sort({ date: -1 })
+    .limit(Number(limit))
+    .populate('invoice', 'invoiceNumber')
+    .lean();
+  return {
+    count: notes.length,
+    notes: notes.map((n) => ({
+      id: n._id,
+      creditNoteNumber: n.creditNoteNumber,
+      date: n.date,
+      invoice: n.invoice?.invoiceNumber || 'N/A',
+      total: n.total,
+      status: n.status,
+    })),
+  };
 }
 
 async function getDeliveryNotes(companyId, opts = {}) {
@@ -480,8 +575,22 @@ async function getDeliveryNotes(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.date = df;
-  const notes = await DeliveryNote.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
-  return { count: notes.length, notes };
+  const notes = await DeliveryNote.find(q)
+    .sort({ date: -1 })
+    .limit(Number(limit))
+    .populate('salesOrder', 'orderNumber')
+    .lean();
+  return {
+    count: notes.length,
+    notes: notes.map((n) => ({
+      id: n._id,
+      deliveryNoteNumber: n.deliveryNoteNumber,
+      date: n.date,
+      salesOrder: n.salesOrder?.orderNumber || 'N/A',
+      status: n.status,
+      totalItems: n.totalItems,
+    })),
+  };
 }
 
 async function getQuotations(companyId, opts = {}) {
@@ -491,8 +600,25 @@ async function getQuotations(companyId, opts = {}) {
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
   if (df) q.quotationDate = df;
-  const quotations = await Quotation.find(q).sort({ quotationDate: -1 }).limit(Number(limit)).lean();
-  return { count: quotations.length, quotations };
+  const quotations = await Quotation.find(q)
+    .sort({ quotationDate: -1 })
+    .limit(Number(limit))
+    .populate('client', 'name')
+    .populate('salesperson', 'name email')
+    .lean();
+  return {
+    count: quotations.length,
+    quotations: quotations.map((q) => ({
+      id: q._id,
+      quotationNumber: q.quotationNumber,
+      date: q.quotationDate,
+      client: q.client?.name || 'Unknown',
+      salesperson: q.salesperson?.name || q.salesperson?.email || 'Unknown',
+      total: q.total,
+      status: q.status,
+      expiryDate: q.expiryDate,
+    })),
+  };
 }
 
 async function getSalesOrders(companyId, opts = {}) {
@@ -502,8 +628,22 @@ async function getSalesOrders(companyId, opts = {}) {
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
   if (df) q.orderDate = df;
-  const orders = await SalesOrder.find(q).sort({ orderDate: -1 }).limit(Number(limit)).lean();
-  return { count: orders.length, orders };
+  const orders = await SalesOrder.find(q)
+    .sort({ orderDate: -1 })
+    .limit(Number(limit))
+    .populate('client', 'name')
+    .lean();
+  return {
+    count: orders.length,
+    orders: orders.map((o) => ({
+      id: o._id,
+      orderNumber: o.orderNumber,
+      client: o.client?.name || 'Unknown',
+      status: o.status,
+      total: o.total,
+      date: o.orderDate,
+    })),
+  };
 }
 
 async function getARReceipts(companyId, opts = {}) {
@@ -512,8 +652,24 @@ async function getARReceipts(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.receiptDate = df;
-  const receipts = await ARReceipt.find(q).sort({ receiptDate: -1 }).limit(Number(limit)).lean();
-  return { count: receipts.length, receipts };
+  const receipts = await ARReceipt.find(q)
+    .sort({ receiptDate: -1 })
+    .limit(Number(limit))
+    .populate('client', 'name')
+    .populate('bankAccount', 'accountName bankName')
+    .lean();
+  return {
+    count: receipts.length,
+    receipts: receipts.map((r) => ({
+      receiptNumber: r.receiptNumber,
+      receiptDate: r.receiptDate,
+      client: r.client?.name || 'Unknown',
+      bankAccount: r.bankAccount?.accountName || r.bankAccount?.bankName || 'Unknown',
+      amountPaid: r.amountPaid,
+      status: r.status,
+      paymentMethod: r.paymentMethod,
+    })),
+  };
 }
 
 async function getAPPayments(companyId, opts = {}) {
@@ -522,8 +678,24 @@ async function getAPPayments(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.paymentDate = df;
-  const payments = await APPayment.find(q).sort({ paymentDate: -1 }).limit(Number(limit)).lean();
-  return { count: payments.length, payments };
+  const payments = await APPayment.find(q)
+    .sort({ paymentDate: -1 })
+    .limit(Number(limit))
+    .populate('supplier', 'name')
+    .populate('bankAccount', 'accountName bankName')
+    .lean();
+  return {
+    count: payments.length,
+    payments: payments.map((p) => ({
+      paymentNumber: p.paymentNumber,
+      paymentDate: p.paymentDate,
+      supplier: p.supplier?.name || 'Unknown',
+      bankAccount: p.bankAccount?.accountName || p.bankAccount?.bankName || 'Unknown',
+      amountPaid: p.amountPaid,
+      status: p.status,
+      paymentMethod: p.paymentMethod,
+    })),
+  };
 }
 
 async function getChartOfAccounts(companyId, opts = {}) {
