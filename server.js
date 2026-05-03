@@ -180,6 +180,11 @@ async function initializeServer() {
   const path = require('path');
   app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+  // Serve generated downloads (Excel, etc.)
+  const downloadsDir = path.join(__dirname, 'downloads');
+  if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
+  app.use('/downloads', express.static(downloadsDir));
+
   // Cookie parser (needed for httpOnly cookie sessions)
   app.use(cookieParser());
 

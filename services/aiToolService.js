@@ -22,8 +22,11 @@ const FixedAsset = require('../models/FixedAsset');
 const Loan = require('../models/Loan');
 const Liability = require('../models/Liability');
 const CreditNote = require('../models/CreditNote');
-const DeliveryNote = require('../models/DeliveryNote');
+const Quotation = require('../models/Quotation');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const ExcelJS = require('exceljs');
+const fs = require('fs');
+const path = require('path');
 const ARReceipt = require('../models/ARReceipt');
 const APPayment = require('../models/APPayment');
 const Budget = require('../models/Budget');
@@ -32,7 +35,6 @@ const CompanyUser = require('../models/CompanyUser');
 const AuditLog = require('../models/AuditLog');
 const AccountingPeriod = require('../models/AccountingPeriod');
 const Notification = require('../models/Notification');
-const Quotation = require('../models/Quotation');
 const SalesOrder = require('../models/SalesOrder');
 
 function isValidDate(d) {
@@ -835,12 +837,95 @@ const TOOL_DEFINITIONS = [
   { type: 'function', function: { name: 'get_balance_sheet', description: 'Compute Balance Sheet: total assets, liabilities, and equity', parameters: { type: 'object', properties: { asOfDate: { type: 'string' } } } } },
   { type: 'function', function: { name: 'get_cash_flow_summary', description: 'Cash flow summary: bank balance, cash in, cash out, net cash flow', parameters: { type: 'object', properties: { startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
   { type: 'function', function: { name: 'generate_chart_data', description: 'Prepare chart data for rendering. Use when user asks for charts, trends, or visualizations. Supports line, bar, pie, doughnut charts.', parameters: { type: 'object', properties: { chartType: { type: 'string', enum: ['line', 'bar', 'pie', 'doughnut'], default: 'line' }, dataType: { type: 'string', enum: ['revenue', 'expenses', 'stock', 'product_revenue'], default: 'revenue' }, period: { type: 'string', enum: ['day', 'week', 'month', 'quarter', 'year'], default: 'month' }, startDate: { type: 'string' }, endDate: { type: 'string' }, limit: { type: 'integer', default: 12 } }, required: ['dataType'] } } },
+  // Export
+  { type: 'function', function: { name: 'generate_excel', description: 'Generate an Excel file from tabular data and return a download link. Use when the user asks to export, download, or save data as Excel/CSV. The data parameter must be an array of objects (rows) with keys as column headers. The sheetName should describe the data (e.g. "Sales Report", "Stock Levels").', parameters: { type: 'object', properties: { title: { type: 'string', description: 'Workbook title / header row text' }, sheetName: { type: 'string', description: 'Sheet tab name (max 31 chars)' }, data: { type: 'array', items: { type: 'object' }, description: 'Array of objects, each object is a row with keys as column headers' }, fileName: { type: 'string', description: 'Optional custom filename without extension' } }, required: ['title', 'sheetName', 'data'] } } },
   // System & Admin
   { type: 'function', function: { name: 'get_departments', description: 'List company departments and managers', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
   { type: 'function', function: { name: 'get_company_users', description: 'List system users, roles, and status', parameters: { type: 'object', properties: { role: { type: 'string' }, limit: { type: 'integer', default: 50 } } } } },
   { type: 'function', function: { name: 'get_audit_logs', description: 'List recent system audit logs and user activity', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, action: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' } } } } },
   { type: 'function', function: { name: 'get_notifications', description: 'List system notifications and alerts', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 20 }, unreadOnly: { type: 'boolean', default: false } } } } },
 ];
+
+// Generate Excel file from tabular data and return a download link
+async function generateExcel(args) {
+  const { title, sheetName = 'Sheet1', data, fileName } = args || {};
+  if (!Array.isArray(data) || data.length === 0) {
+    return { error: 'No data provided. Pass an array of objects as the "data" parameter.' };
+  }
+
+  try {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet(sheetName.slice(0, 31));
+
+    // Add header row with title
+    if (title) {
+      sheet.addRow([title]);
+      sheet.mergeCells(1, 1, 1, Object.keys(data[0]).length);
+      sheet.getCell(1, 1).font = { bold: true, size: 14 };
+      sheet.getCell(1, 1).alignment = { horizontal: 'center' };
+      sheet.addRow([]);
+    }
+
+    // Column headers
+    const headers = Object.keys(data[0]);
+    sheet.addRow(headers);
+    if (title) {
+      sheet.getRow(3).font = { bold: true };
+      sheet.getRow(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD3D3D3' } };
+    } else {
+      sheet.getRow(1).font = { bold: true };
+      sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD3D3D3' } };
+    }
+
+    // Data rows
+    data.forEach((row) => {
+      const values = headers.map((h) => row[h] ?? '');
+      sheet.addRow(values);
+    });
+
+    // Auto-fit columns
+    sheet.columns.forEach((col) => {
+      let maxLength = 10;
+      col.eachCell({ includeEmpty: false }, (cell) => {
+        const cellValue = cell.value ? String(cell.value) : '';
+        maxLength = Math.max(maxLength, cellValue.length + 2);
+      });
+      col.width = Math.min(maxLength, 60);
+    });
+
+    // Save file
+    const downloadsDir = path.join(__dirname, '..', 'downloads');
+    if (!fs.existsSync(downloadsDir)) {
+      fs.mkdirSync(downloadsDir, { recursive: true });
+    }
+
+    const timestamp = Date.now();
+    const safeFileName = fileName ? fileName.replace(/[^a-zA-Z0-9_-]/g, '_') : `stacy-export-${timestamp}`;
+    const fileNameFull = `${safeFileName}.xlsx`;
+    const filePath = path.join(downloadsDir, fileNameFull);
+    await workbook.xlsx.writeFile(filePath);
+
+    // Clean up files older than 24 hours (background)
+    try {
+      const ONE_DAY = 24 * 60 * 60 * 1000;
+      fs.readdirSync(downloadsDir).forEach((f) => {
+        const fp = path.join(downloadsDir, f);
+        if (fs.statSync(fp).mtimeMs < Date.now() - ONE_DAY) fs.unlinkSync(fp);
+      });
+    } catch (_cleanupErr) {
+      /* ignore cleanup errors */
+    }
+
+    return {
+      downloadUrl: `/downloads/${fileNameFull}`,
+      fileName: fileNameFull,
+      rows: data.length,
+      columns: headers.length,
+    };
+  } catch (err) {
+    return { error: `Failed to generate Excel: ${err.message || 'Unknown error'}` };
+  }
+}
 
 // Execute a tool by name
 async function executeTool(companyId, toolName, args = {}) {
@@ -884,6 +969,7 @@ async function executeTool(companyId, toolName, args = {}) {
     case 'get_balance_sheet': return getBalanceSheet(companyId, args);
     case 'get_cash_flow_summary': return getCashFlowSummary(companyId, args);
     case 'generate_chart_data': return generateChartData(companyId, args);
+    case 'generate_excel': return generateExcel(args);
     // System & Admin
     case 'get_departments': return getDepartments(companyId, args);
     case 'get_company_users': return getCompanyUsers(companyId, args);
@@ -921,4 +1007,5 @@ module.exports = {
   getNotifications,
   getBalanceSheet,
   getCashFlowSummary,
+  generateExcel,
 };
