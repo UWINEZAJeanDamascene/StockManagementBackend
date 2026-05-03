@@ -27,6 +27,7 @@ const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const ExcelJS = require('exceljs');
 const fs = require('fs');
 const path = require('path');
+const jwt = require('jsonwebtoken');
 const ARReceipt = require('../models/ARReceipt');
 const APPayment = require('../models/APPayment');
 const Budget = require('../models/Budget');
@@ -895,8 +896,10 @@ async function generateExcel(args) {
 
     // Save file
     const downloadsDir = path.join(__dirname, '..', 'downloads');
+    console.log('[generateExcel] downloadsDir:', downloadsDir, 'exists:', fs.existsSync(downloadsDir));
     if (!fs.existsSync(downloadsDir)) {
       fs.mkdirSync(downloadsDir, { recursive: true });
+      console.log('[generateExcel] Created downloadsDir');
     }
 
     const timestamp = Date.now();
@@ -904,6 +907,10 @@ async function generateExcel(args) {
     const fileNameFull = `${safeFileName}.xlsx`;
     const filePath = path.join(downloadsDir, fileNameFull);
     await workbook.xlsx.writeFile(filePath);
+
+    // Verify file was created and log details
+    const stats = fs.statSync(filePath);
+    console.log(`[generateExcel] File created: ${filePath}, Size: ${stats.size} bytes`);
 
     // Clean up files older than 24 hours (background)
     try {
@@ -916,11 +923,49 @@ async function generateExcel(args) {
       /* ignore cleanup errors */
     }
 
+    // Build absolute download URL. Prefer explicit SERVER_BASE_URL env var,
+    // otherwise fall back to backend host:port from central config.
+    let baseUrl = process.env.SERVER_BASE_URL;
+    try {
+      const env = require('../src/config/environment');
+      const cfg = env.getConfig ? env.getConfig() : env;
+      if (!baseUrl) baseUrl = `http://localhost:${(cfg && cfg.server && cfg.server.port) || process.env.PORT || 3000}`;
+    } catch (e) {
+      if (!baseUrl) baseUrl = `http://localhost:${process.env.PORT || 3000}`;
+    }
+
+    // Ensure no trailing slash
+    baseUrl = String(baseUrl).replace(/\/$/, '');
+
+    // Create a short-lived signed token for public download (optional)
+    let jwtSecret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+    try {
+      const envCfg = require('../src/config/environment');
+      const cfg = envCfg.getConfig ? envCfg.getConfig() : envCfg;
+      if (cfg && cfg.jwt && cfg.jwt.secret) jwtSecret = cfg.jwt.secret;
+    } catch (e) {
+      // ignore and use env
+    }
+
+    let publicDownloadUrl = null;
+    try {
+      const token = jwt.sign({ file: fileNameFull }, jwtSecret, { expiresIn: '15m' });
+      publicDownloadUrl = `${baseUrl}/public-download/${token}`;
+    } catch (e) {
+      console.warn('[generateExcel] Could not create public download token', e && e.message ? e.message : e);
+    }
+
+    // Use public download URL with signed token (no auth required)
+    const finalDownloadUrl = publicDownloadUrl || `${baseUrl}/downloads/${fileNameFull}`;
+
+    console.log('[generateExcel] Returning downloadUrl:', finalDownloadUrl, 'publicUrl was:', publicDownloadUrl);
+
     return {
-      downloadUrl: `/downloads/${fileNameFull}`,
+      downloadUrl: finalDownloadUrl,
       fileName: fileNameFull,
       rows: data.length,
       columns: headers.length,
+      fileSize: stats.size,
     };
   } catch (err) {
     return { error: `Failed to generate Excel: ${err.message || 'Unknown error'}` };

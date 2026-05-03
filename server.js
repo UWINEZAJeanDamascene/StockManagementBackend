@@ -6,6 +6,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const hpp = require('hpp');
 const morgan = require('morgan');
+const fs = require('fs');
 
 // Load environment variables FIRST, before any other imports
 dotenv.config();
@@ -180,10 +181,9 @@ async function initializeServer() {
   const path = require('path');
   app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-  // Serve generated downloads (Excel, etc.)
+  // Ensure downloads directory exists for Excel exports
   const downloadsDir = path.join(__dirname, 'downloads');
   if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
-  app.use('/downloads', express.static(downloadsDir));
 
   // Cookie parser (needed for httpOnly cookie sessions)
   app.use(cookieParser());
@@ -304,6 +304,78 @@ async function initializeServer() {
       res.json({ success: result, message: `Rate limit reset for IP: ${ip}` });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
+    }
+  });
+
+  // Download generated Excel files with auth
+  console.log('[Server] Registering downloads route');
+  app.get('/downloads/:filename', async (req, res) => {
+    try {
+      const { protect } = require('./middleware/authMiddleware');
+      // Run auth check
+      await new Promise((resolve, reject) => {
+        protect(req, res, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+
+      const filename = req.params.filename;
+      // Validate filename to prevent directory traversal
+      if (!filename.match(/^[a-zA-Z0-9_-]+\.xlsx$/)) {
+        return res.status(400).json({ success: false, message: 'Invalid filename' });
+      }
+
+      const filePath = path.join(__dirname, 'downloads', filename);
+      console.log('[Download] Looking for file:', filePath);
+      console.log('[Download] __dirname:', __dirname);
+      if (!fs.existsSync(filePath)) {
+        console.log('[Download] File not found. Checking if downloads dir exists:', fs.existsSync(path.join(__dirname, 'downloads')));
+        return res.status(404).json({ success: false, message: 'File not found' });
+      }
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      fs.createReadStream(filePath).pipe(res);
+    } catch (err) {
+      console.error('[Download] Error:', err.message);
+      res.status(500).json({ success: false, message: 'Download failed' });
+    }
+  });
+
+  // Public download route (short-lived signed tokens) - no auth required
+  console.log('[Server] Registering public-download route');
+  app.get('/public-download/:token', async (req, res) => {
+    try {
+      const token = req.params.token;
+      if (!token) return res.status(400).json({ success: false, message: 'Token required' });
+
+      const env = require('./src/config/environment');
+      const cfg = env.getConfig ? env.getConfig() : env;
+      const JWT_SECRET = (cfg && cfg.jwt && cfg.jwt.secret) || process.env.JWT_SECRET || 'dev-secret-for-downloads';
+
+      const jwt = require('jsonwebtoken');
+      let payload;
+      try {
+        payload = jwt.verify(token, JWT_SECRET);
+      } catch (err) {
+        return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+      }
+
+      const filename = payload && payload.file;
+      if (!filename || !filename.match(/^[a-zA-Z0-9_-]+\.xlsx$/)) {
+        return res.status(400).json({ success: false, message: 'Invalid filename in token' });
+      }
+
+      const filePath = path.join(__dirname, 'downloads', filename);
+      if (!fs.existsSync(filePath)) return res.status(404).json({ success: false, message: 'File not found' });
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      fs.createReadStream(filePath).pipe(res);
+    } catch (err) {
+      console.error('[PublicDownload] Error:', err && err.message ? err.message : err);
+      res.status(500).json({ success: false, message: 'Public download failed' });
     }
   });
 
