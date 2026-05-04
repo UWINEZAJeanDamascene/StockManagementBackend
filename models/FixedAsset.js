@@ -104,11 +104,36 @@ const fixedAssetSchema = new mongoose.Schema({
     default: null // Required if method = declining_balance
   },
 
-  // Status tracking
+  // Status tracking - Full asset lifecycle
   status: {
     type: String,
-    enum: ['active', 'fully_depreciated', 'disposed'],
-    default: 'active'
+    enum: [
+      'in_transit',        // Ordered but not yet received
+      'in_service',        // Active, depreciating (replaces 'active')
+      'under_maintenance', // Temporarily out of service
+      'idle',              // Not in use but still owned
+      'fully_depreciated', // Book value = salvage value
+      'disposed'           // Sold, scrapped, or retired
+    ],
+    default: 'in_transit'  // Start as in_transit until received
+  },
+
+  // When asset was actually put into service (depreciation start date)
+  inServiceDate: {
+    type: Date,
+    default: null  // If null, defaults to purchaseDate
+  },
+
+  // For RRA compliance - when asset first used for income generation
+  rraInServiceDate: {
+    type: Date,
+    default: null
+  },
+
+  // Track if asset is ready for use but not yet in service
+  isReadyForService: {
+    type: Boolean,
+    default: false
   },
 
   // Disposal details
@@ -118,6 +143,42 @@ const fixedAssetSchema = new mongoose.Schema({
   },
   disposalProceeds: {
     type: mongoose.Schema.Types.Decimal128,
+    default: null
+  },
+  disposalCosts: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null  // Removal, transport, legal fees
+  },
+  disposalNetProceeds: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null  // Proceeds - costs
+  },
+  disposalGainLoss: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null  // Calculated gain or loss
+  },
+  disposalMethod: {
+    type: String,
+    enum: ['sale', 'scrap', 'donation', 'trade_in', 'theft_loss', 'transfer', null],
+    default: null
+  },
+  disposalNotes: {
+    type: String,
+    maxlength: 1000,
+    default: null
+  },
+  disposalAuthNumber: {
+    type: String,
+    default: null  // RRA disposal authorization
+  },
+  disposalCustomerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Customer',
+    default: null  // If sold to customer
+  },
+  disposalEventId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AssetDisposalEvent',
     default: null
   },
   disposalJournalEntryId: {
@@ -185,9 +246,56 @@ const fixedAssetSchema = new mongoose.Schema({
     }
   }],
 
+  // Depreciation settings
+  depreciationFrequency: {
+    type: String,
+    enum: ['monthly', 'quarterly', 'semi_annually', 'annually'],
+    default: 'monthly'
+  },
+
+  // Track when depreciation was last posted for this frequency
+  lastDepreciationPeriod: {
+    type: String,  // Format: YYYY-MM or YYYY-Q# or YYYY
+    default: null
+  },
+
   // Depreciation calculated flag
   lastDepreciationDate: {
     type: Date,
+    default: null
+  },
+
+  // Acquisition method tracking
+  acquisitionMethod: {
+    type: String,
+    enum: [
+      'purchase',            // Bought outright
+      'finance_lease',       // Capital lease (IFRS 16)
+      'operating_lease',     // Short-term lease
+      'donation',            // Gift - record at fair value
+      'construction',        // Self-built, capitalize costs
+      'transfer_in',         // From another entity
+      'business_combination' // Acquisition
+    ],
+    default: 'purchase'
+  },
+
+  // For donated assets
+  donationFairValue: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null
+  },
+
+  // For construction assets
+  constructionCompletionDate: {
+    type: Date,
+    default: null
+  },
+
+  // Physical tracking - custodian
+  custodianId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
     default: null
   },
 
@@ -274,9 +382,9 @@ fixedAssetSchema.pre('save', async function(next) {
     const depreciableAmount = purchaseCost - salvageVal;
     if (accumDep >= depreciableAmount) {
       this.status = 'fully_depreciated';
-    } else if (this.status === 'fully_depreciated') {
-      // Restore to active if depreciation was reversed
-      this.status = 'active';
+    } else if (this.status === 'fully_depreciated' && accumDep < depreciableAmount) {
+      // Restore to in_service if depreciation was reversed
+      this.status = 'in_service';
     }
   }
 
@@ -315,43 +423,132 @@ fixedAssetSchema.virtual('monthlyDepreciation').get(function() {
 
 // Method to calculate depreciation for a period
 fixedAssetSchema.methods.calculateDepreciation = function(periodDate = new Date()) {
-  const purchaseCost = typeof this.purchaseCost === 'object' 
-    ? parseFloat(this.purchaseCost.toString()) 
+  const purchaseCost = typeof this.purchaseCost === 'object'
+    ? parseFloat(this.purchaseCost.toString())
     : this.purchaseCost;
-  const salvage = typeof this.salvageValue === 'object' 
-    ? parseFloat(this.salvageValue.toString()) 
+  const salvage = typeof this.salvageValue === 'object'
+    ? parseFloat(this.salvageValue.toString())
     : this.salvageValue;
-  const accumDep = typeof this.accumulatedDepreciation === 'object' 
-    ? parseFloat(this.accumulatedDepreciation.toString()) 
+  const accumDep = typeof this.accumulatedDepreciation === 'object'
+    ? parseFloat(this.accumulatedDepreciation.toString())
     : this.accumulatedDepreciation;
-  
+
   const depreciableAmount = purchaseCost - salvage;
-  
+
   // Already fully depreciated (NBV has reached salvage value)
   if (accumDep >= depreciableAmount) {
     return 0;
   }
-  
+
+  // CRITICAL: Use inServiceDate, not purchaseDate for depreciation start
+  const effectiveStartDate = this.inServiceDate || this.purchaseDate;
+
+  // If asset not yet in service, no depreciation
+  if (!effectiveStartDate || periodDate < effectiveStartDate) {
+    return 0;
+  }
+
   let depreciationAmount = 0;
-  
+
   if (this.depreciationMethod === 'straight_line') {
     // Monthly depreciation
     depreciationAmount = depreciableAmount / this.usefulLifeMonths;
+
+    // Apply partial-month convention for first month
+    const isFirstMonth = this._isFirstDepreciationMonth(periodDate, effectiveStartDate);
+    if (isFirstMonth) {
+      depreciationAmount = this._applyPartialMonthConvention(depreciationAmount, effectiveStartDate);
+    }
   } else if (this.depreciationMethod === 'declining_balance') {
     // Declining balance based on current NBV
-    const rate = this.decliningRate 
+    const rate = this.decliningRate
       ? (typeof this.decliningRate === 'object' ? parseFloat(this.decliningRate.toString()) : this.decliningRate)
       : 0.2; // Default 20% if not specified
     const nbvVal = purchaseCost - accumDep;
     depreciationAmount = nbvVal * rate / 12; // Monthly amount
   }
-  
+
   // CRITICAL: Cap depreciation so NBV never goes below salvage value
   // Use Math.min to prevent over-depreciation in final month(s)
   const remainingDepreciable = depreciableAmount - accumDep;
   depreciationAmount = Math.min(depreciationAmount, remainingDepreciable);
-  
+
   return Math.round(depreciationAmount * 100) / 100;
+};
+
+// Check if this is the first depreciation month
+fixedAssetSchema.methods._isFirstDepreciationMonth = function(periodDate, startDate) {
+  const periodYear = periodDate.getFullYear();
+  const periodMonth = periodDate.getMonth();
+  const startYear = startDate.getFullYear();
+  const startMonth = startDate.getMonth();
+
+  return periodYear === startYear && periodMonth === startMonth;
+};
+
+// Apply partial-month convention (mid-month convention)
+// If placed in service by 15th: full month depreciation
+// If placed in service after 15th: half month depreciation
+fixedAssetSchema.methods._applyPartialMonthConvention = function(fullMonthAmount, inServiceDate) {
+  const serviceDay = inServiceDate.getDate();
+
+  // Mid-month convention
+  if (serviceDay <= 15) {
+    return fullMonthAmount;  // Full month
+  } else {
+    return fullMonthAmount / 2;  // Half month
+  }
+};
+
+// Alternative: Actual days convention (more precise, for future use)
+fixedAssetSchema.methods._applyActualDaysConvention = function(fullMonthAmount, inServiceDate, periodDate) {
+  const daysInMonth = new Date(
+    periodDate.getFullYear(),
+    periodDate.getMonth() + 1,
+    0
+  ).getDate();
+
+  const serviceDay = inServiceDate.getDate();
+  const daysInService = daysInMonth - serviceDay + 1;
+
+  return (fullMonthAmount / daysInMonth) * daysInService;
+};
+
+// Calculate partial month depreciation for disposal
+fixedAssetSchema.methods.calculatePartialMonthDepreciation = function(disposalDate) {
+  const effectiveStartDate = this.inServiceDate || this.purchaseDate;
+
+  // If disposed in same month as placed in service, calculate based on actual days
+  const isSameMonth =
+    disposalDate.getFullYear() === effectiveStartDate.getFullYear() &&
+    disposalDate.getMonth() === effectiveStartDate.getMonth();
+
+  if (isSameMonth) {
+    // Calculate based on days in service
+    const daysInMonth = new Date(
+      disposalDate.getFullYear(),
+      disposalDate.getMonth() + 1,
+      0
+    ).getDate();
+
+    const serviceDay = effectiveStartDate.getDate();
+    const disposalDay = disposalDate.getDate();
+    const daysInService = disposalDay - serviceDay + 1;
+
+    const purchaseCost = typeof this.purchaseCost === 'object'
+      ? parseFloat(this.purchaseCost.toString())
+      : this.purchaseCost;
+    const salvage = typeof this.salvageValue === 'object'
+      ? parseFloat(this.salvageValue.toString())
+      : this.salvageValue;
+    const depreciableAmount = purchaseCost - salvage;
+    const monthlyDep = depreciableAmount / this.usefulLifeMonths;
+
+    return (monthlyDep / daysInMonth) * daysInService;
+  }
+
+  // Otherwise use standard calculation for the final month
+  return this.calculateDepreciation(disposalDate);
 };
 
 // Static method to generate reference number

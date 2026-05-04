@@ -43,4 +43,16 @@ router.get('/:id/depreciation-entries', fixedAssetController.getDepreciationEntr
 // POST /api/fixed-assets/:id/depreciation/:entryId/reverse - Reverse depreciation (LIFO only)
 router.post('/:id/depreciation/:entryId/reverse', fixedAssetController.reverseDepreciation);
 
+// POST /api/fixed-assets/:id/place-in-service - Place asset in service (from in_transit to in_service)
+router.post('/:id/place-in-service', fixedAssetController.placeInService);
+
+// POST /api/fixed-assets/:id/transition - Transition asset status
+router.post('/:id/transition', fixedAssetController.transitionStatus);
+
+// GET /api/fixed-assets/:id/status-history - Get asset status history
+router.get('/:id/status-history', fixedAssetController.getStatusHistory);
+
+// GET /api/fixed-assets/:id/disposal-event - Get disposal event for asset
+router.get('/:id/disposal-event', fixedAssetController.getDisposalEvent);
+
 module.exports = router;

@@ -48,15 +48,83 @@ const assetCategorySchema = new mongoose.Schema({
   // Default account codes (can be overridden per asset)
   defaultAssetAccountCode: {
     type: String,
-    default: '1500' // Default to Fixed Assets
+    default: '1700' // Default to Fixed Assets (1700-series per chart of accounts)
   },
   defaultAccumDepreciationAccountCode: {
     type: String,
-    default: '1510' // Default to Accumulated Depreciation
+    default: '1810' // Default to Accumulated Depreciation
   },
   defaultDepreciationExpenseAccountCode: {
     type: String,
-    default: '6050' // Default to Depreciation Expense
+    default: '5800' // Default to Depreciation Expense
+  },
+
+  // Rwanda Revenue Authority (RRA) asset classification
+  rraAssetClass: {
+    type: String,
+    enum: [
+      'class_1_buildings',           // 5% straight line (20 years)
+      'class_2_improvements',        // 10% straight line (10 years)
+      'class_3_plant_machinery',     // 20% declining balance
+      'class_4_computers_equipment', // 25% declining balance
+      'class_5_motor_vehicles',      // 25% declining balance
+      'class_6_furniture_fittings',  // 20% declining balance
+      'class_7_intangible',          // Amortization over useful life
+      'land_non_depreciable'         // No depreciation
+    ],
+    default: null
+  },
+
+  // RRA tax useful life (may differ from book useful life)
+  rraUsefulLifeYears: {
+    type: Number,
+    default: null
+  },
+
+  // RRA tax depreciation method
+  rraDepreciationMethod: {
+    type: String,
+    enum: ['straight_line', 'declining_balance', 'none'],
+    default: null
+  },
+
+  // RRA declining balance rate (if applicable)
+  rraDecliningRate: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: null
+  },
+
+  // Category hierarchy
+  parentCategoryId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AssetCategory',
+    default: null
+  },
+
+  // Category code for reporting
+  categoryCode: {
+    type: String,
+    maxlength: 20,
+    default: null
+  },
+
+  // Whether this category allows componentization (IFRS)
+  isComponentizable: {
+    type: Boolean,
+    default: false
+  },
+
+  // Whether this category is depreciable (false for Land)
+  isDepreciable: {
+    type: Boolean,
+    default: true
+  },
+
+  // Depreciation frequency default for this category
+  defaultDepreciationFrequency: {
+    type: String,
+    enum: ['monthly', 'quarterly', 'semi_annually', 'annually'],
+    default: 'monthly'
   },
 
   // Whether this is a system category (cannot be deleted)
@@ -99,88 +167,164 @@ assetCategorySchema.pre('save', function(next) {
 
 // Static method to seed default categories for a company
 assetCategorySchema.statics.seedDefaults = async function(companyId, createdBy = null) {
-  const defaultCategories = [
+  // Rwandan Revenue Authority (RRA) standard asset categories
+  const rwaStandardCategories = [
     {
-      name: 'Buildings',
-      description: 'Buildings and structures',
-      defaultUsefulLifeMonths: 360, // 30 years
+      name: 'Land',
+      categoryCode: 'LAND',
+      description: 'Land (non-depreciable per RRA and IFRS)',
+      isDepreciable: false,
+      rraAssetClass: 'land_non_depreciable',
+      rraUsefulLifeYears: 0,
+      rraDepreciationMethod: 'none',
+      defaultUsefulLifeMonths: 0,
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1500',
-      defaultAccumDepreciationAccountCode: '1510',
-      defaultDepreciationExpenseAccountCode: '6050',
+      defaultAssetAccountCode: '1700',
+      defaultAccumDepreciationAccountCode: null,
+      defaultDepreciationExpenseAccountCode: null,
       isSystem: true,
       createdBy
     },
     {
-      name: 'Vehicles',
-      description: 'Cars, trucks, and other vehicles',
-      defaultUsefulLifeMonths: 60, // 5 years
+      name: 'Buildings & Structures',
+      categoryCode: 'BLDG',
+      description: 'Buildings, warehouses, factories (RRA Class 1: 5% SL, 20 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_1_buildings',
+      rraUsefulLifeYears: 20,
+      rraDepreciationMethod: 'straight_line',
+      defaultUsefulLifeMonths: 240, // 20 years book (IFRS allows longer)
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1510',
-      defaultAccumDepreciationAccountCode: '1511',
-      defaultDepreciationExpenseAccountCode: '6051',
+      defaultAssetAccountCode: '1710',
+      defaultAccumDepreciationAccountCode: '1810',
+      defaultDepreciationExpenseAccountCode: '5800',
       isSystem: true,
       createdBy
     },
     {
-      name: 'Computer Equipment',
-      description: 'Computers, laptops, servers, networking equipment',
-      defaultUsefulLifeMonths: 36, // 3 years
+      name: 'Leasehold Improvements',
+      categoryCode: 'LSIMP',
+      description: 'Improvements to leased property (RRA Class 2: 10% SL, 10 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_2_improvements',
+      rraUsefulLifeYears: 10,
+      rraDepreciationMethod: 'straight_line',
+      defaultUsefulLifeMonths: 120,
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1520',
-      defaultAccumDepreciationAccountCode: '1521',
-      defaultDepreciationExpenseAccountCode: '6052',
+      defaultAssetAccountCode: '1715',
+      defaultAccumDepreciationAccountCode: '1810',
+      defaultDepreciationExpenseAccountCode: '5800',
       isSystem: true,
       createdBy
     },
     {
-      name: 'Office Furniture',
-      description: 'Desks, chairs, filing cabinets, etc.',
-      defaultUsefulLifeMonths: 84, // 7 years
+      name: 'Plant & Machinery',
+      categoryCode: 'MACH',
+      description: 'Production equipment, heavy machinery (RRA Class 3: 20% DB, 5 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_3_plant_machinery',
+      rraUsefulLifeYears: 5,
+      rraDepreciationMethod: 'declining_balance',
+      rraDecliningRate: mongoose.Types.Decimal128.fromString('0.20'),
+      defaultUsefulLifeMonths: 120, // 10 years book
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1530',
-      defaultAccumDepreciationAccountCode: '1531',
-      defaultDepreciationExpenseAccountCode: '6053',
+      defaultDecliningRate: mongoose.Types.Decimal128.fromString('0.20'),
+      defaultAssetAccountCode: '1720',
+      defaultAccumDepreciationAccountCode: '1811',
+      defaultDepreciationExpenseAccountCode: '5801',
       isSystem: true,
       createdBy
     },
     {
-      name: 'Machinery',
-      description: 'Production and manufacturing equipment',
-      defaultUsefulLifeMonths: 120, // 10 years
+      name: 'Computer Equipment & Software',
+      categoryCode: 'COMP',
+      description: 'Computers, servers, software licenses (RRA Class 4: 25% DB, 4 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_4_computers_equipment',
+      rraUsefulLifeYears: 4,
+      rraDepreciationMethod: 'declining_balance',
+      rraDecliningRate: mongoose.Types.Decimal128.fromString('0.25'),
+      defaultUsefulLifeMonths: 48, // 4 years
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1540',
-      defaultAccumDepreciationAccountCode: '1541',
-      defaultDepreciationExpenseAccountCode: '6054',
+      defaultDecliningRate: mongoose.Types.Decimal128.fromString('0.25'),
+      defaultAssetAccountCode: '1725',
+      defaultAccumDepreciationAccountCode: '1812',
+      defaultDepreciationExpenseAccountCode: '5802',
+      isSystem: true,
+      createdBy
+    },
+    {
+      name: 'Motor Vehicles',
+      categoryCode: 'VEH',
+      description: 'Cars, trucks, motorcycles (RRA Class 5: 25% DB, 4 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_5_motor_vehicles',
+      rraUsefulLifeYears: 4,
+      rraDepreciationMethod: 'declining_balance',
+      rraDecliningRate: mongoose.Types.Decimal128.fromString('0.25'),
+      defaultUsefulLifeMonths: 60, // 5 years book
+      defaultDepreciationMethod: 'straight_line',
+      defaultDecliningRate: mongoose.Types.Decimal128.fromString('0.25'),
+      defaultAssetAccountCode: '1730',
+      defaultAccumDepreciationAccountCode: '1813',
+      defaultDepreciationExpenseAccountCode: '5803',
+      isSystem: true,
+      createdBy
+    },
+    {
+      name: 'Office Furniture & Fittings',
+      categoryCode: 'FURN',
+      description: 'Desks, chairs, cabinets (RRA Class 6: 20% DB, 5 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_6_furniture_fittings',
+      rraUsefulLifeYears: 5,
+      rraDepreciationMethod: 'declining_balance',
+      rraDecliningRate: mongoose.Types.Decimal128.fromString('0.20'),
+      defaultUsefulLifeMonths: 84, // 7 years book
+      defaultDepreciationMethod: 'straight_line',
+      defaultDecliningRate: mongoose.Types.Decimal128.fromString('0.20'),
+      defaultAssetAccountCode: '1735',
+      defaultAccumDepreciationAccountCode: '1814',
+      defaultDepreciationExpenseAccountCode: '5804',
       isSystem: true,
       createdBy
     },
     {
       name: 'Intangible Assets',
-      description: 'Patents, trademarks, software licenses',
-      defaultUsefulLifeMonths: 60, // 5 years (or shorter based on license)
+      categoryCode: 'INTANG',
+      description: 'Patents, trademarks, licenses (RRA Class 7: amortize over life)',
+      isDepreciable: true,
+      rraAssetClass: 'class_7_intangible',
+      rraUsefulLifeYears: null, // Varies by asset
+      rraDepreciationMethod: 'straight_line',
+      defaultUsefulLifeMonths: 60, // 5 years default
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1600',
-      defaultAccumDepreciationAccountCode: '1601',
-      defaultDepreciationExpenseAccountCode: '6055',
+      defaultAssetAccountCode: '1740',
+      defaultAccumDepreciationAccountCode: '1815',
+      defaultDepreciationExpenseAccountCode: '5805',
       isSystem: true,
       createdBy
     },
     {
       name: 'Land Improvements',
-      description: 'Parking lots, landscaping, fencing',
+      categoryCode: 'LDIMP',
+      description: 'Parking lots, fencing, landscaping (RRA Class 2: 10% SL, 10 years)',
+      isDepreciable: true,
+      rraAssetClass: 'class_2_improvements',
+      rraUsefulLifeYears: 10,
+      rraDepreciationMethod: 'straight_line',
       defaultUsefulLifeMonths: 180, // 15 years
       defaultDepreciationMethod: 'straight_line',
-      defaultAssetAccountCode: '1505',
-      defaultAccumDepreciationAccountCode: '1506',
-      defaultDepreciationExpenseAccountCode: '6056',
+      defaultAssetAccountCode: '1705',
+      defaultAccumDepreciationAccountCode: '1810',
+      defaultDepreciationExpenseAccountCode: '5800',
       isSystem: true,
       createdBy
     }
   ];
 
   const created = [];
-  for (const cat of defaultCategories) {
+  for (const cat of rwaStandardCategories) {
     const existing = await this.findOne({ 
       company: companyId, 
       name: cat.name,

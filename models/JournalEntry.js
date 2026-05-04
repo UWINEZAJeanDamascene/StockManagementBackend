@@ -99,6 +99,35 @@ const journalEntrySchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+
+  // Bank Reconciliation tracking (real-world workflow)
+  // These fields track if this entry was created/matched during reconciliation
+  reconciliationStatus: {
+    type: String,
+    enum: ['unreconciled', 'reconciled', 'adjusting_entry'],
+    default: 'unreconciled',
+    index: true,
+  },
+  reconciledAt: {
+    type: Date,
+    default: null,
+  },
+  reconciledInReconciliationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'BankReconciliation',
+    default: null,
+    index: true,
+  },
+  reconciledBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  // Whether this was an adjusting entry created during reconciliation
+  isReconciliationAdjustingEntry: {
+    type: Boolean,
+    default: false,
+  },
   reversedAt: {
     type: Date,
     default: null
@@ -112,6 +141,28 @@ const journalEntrySchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'JournalEntry',
     default: null
+  },
+
+  // Locking fields for reconciliation audit trail
+  // When a journal entry is matched during reconciliation, it gets locked
+  // to prevent editing or deletion, maintaining accounting integrity
+  isLocked: {
+    type: Boolean,
+    default: false,
+    index: true,
+  },
+  lockedAt: {
+    type: Date,
+    default: null,
+  },
+  lockedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  lockedReason: {
+    type: String,
+    default: null,
   }
 }, {
   // timestamps handled by auditSoftDeletePlugin to avoid duplicate field definitions
@@ -259,11 +310,14 @@ journalEntrySchema.pre('save', function(next) {
   }
 });
 
-// Prevent updates to posted entries via findOneAndUpdate / updateOne
+// Prevent updates to posted or locked entries via findOneAndUpdate / updateOne
 journalEntrySchema.pre('findOneAndUpdate', async function(next) {
   try {
     const query = this.getQuery();
     const doc = await this.model.findOne(query).lean();
+    if (doc && doc.isLocked) {
+      return next(new Error('Cannot modify a locked journal entry. This entry has been reconciled and is locked for audit trail integrity.'));
+    }
     if (doc && doc.status === 'posted') {
       return next(new Error('Cannot modify a posted journal entry'));
     }
@@ -273,11 +327,31 @@ journalEntrySchema.pre('findOneAndUpdate', async function(next) {
   }
 });
 
-// Prevent deletions of posted entries via deleteOne / deleteMany
+// Prevent updates to locked entries on save
+journalEntrySchema.pre('save', async function(next) {
+  // Skip for new documents
+  if (this.isNew) return next();
+
+  try {
+    // Check if document exists and is locked
+    const existing = await this.constructor.findById(this._id).lean();
+    if (existing && existing.isLocked) {
+      return next(new Error('Cannot modify a locked journal entry. This entry has been reconciled and is locked for audit trail integrity.'));
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Prevent deletions of posted or locked entries via deleteOne / deleteMany
 journalEntrySchema.pre('deleteOne', { document: false, query: true }, async function(next) {
   try {
     const query = this.getQuery();
     const doc = await this.model.findOne(query).lean();
+    if (doc && doc.isLocked) {
+      return next(new Error('Cannot delete a locked journal entry. This entry has been reconciled and is locked for audit trail integrity.'));
+    }
     if (doc && doc.status === 'posted') {
       return next(new Error('Cannot delete a posted journal entry'));
     }

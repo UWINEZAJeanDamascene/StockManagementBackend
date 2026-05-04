@@ -3,6 +3,7 @@ const {
   PettyCashExpense,
   PettyCashReplenishment,
   PettyCashTransaction,
+  PettyCashReconciliation,
 } = require("../models/PettyCash");
 const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const ChartOfAccountsService = require("../services/chartOfAccountsService");
@@ -31,7 +32,8 @@ async function getCurrentBalance(floatId) {
     { transactionDate: 1, createdAt: 1 },
   );
 
-  let balance = float.openingBalance;
+  // Sum all transaction amounts (opening transaction already includes the opening balance)
+  let balance = 0;
   for (const tx of transactions) {
     balance += tx.amount;
   }
@@ -48,6 +50,30 @@ async function getCurrentBalance(floatId) {
 // Helper to invalidate cache
 async function invalidateCache(floatId) {
   await PettyCashFloat.findByIdAndUpdate(floatId, { cacheValid: false });
+}
+
+// Helper to calculate imprest replenishment amount
+// In imprest system, replenishment restores float to the fixed floatAmount
+async function calculateImprestReplenishmentAmount(floatId) {
+  const float = await PettyCashFloat.findById(floatId);
+  if (!float) return null;
+
+  // If not in imprest mode, return null (use regular replenishment)
+  if (!float.imprestMode) {
+    return null;
+  }
+
+  const currentBalance = await getCurrentBalance(floatId);
+
+  // Calculate amount needed to restore to fixed float amount
+  const replenishmentAmount = float.floatAmount - currentBalance;
+
+  return {
+    floatAmount: float.floatAmount,
+    currentBalance,
+    replenishmentAmount: Math.max(0, replenishmentAmount),
+    isImprest: true,
+  };
 }
 
 // @desc    Get all petty cash floats for a company
@@ -70,32 +96,13 @@ exports.getFloats = async (req, res, next) => {
     // Calculate current balance for each float
     const floatsWithBalance = await Promise.all(
       floats.map(async (float) => {
-        const expenses = await PettyCashExpense.find({
-          float: float._id,
-          status: { $in: ["approved", "reimbursed"] },
-        });
-        const totalExpenses = expenses.reduce(
-          (sum, exp) => sum + (exp.amount || 0),
-          0,
-        );
-
-        const replenishments = await PettyCashReplenishment.find({
-          float: float._id,
-          status: "completed",
-        });
-        const totalReplenishments = replenishments.reduce(
-          (sum, rep) => sum + (rep.actualAmount || rep.amount || 0),
-          0,
-        );
-
-        const currentBalance =
-          float.openingBalance - totalExpenses + totalReplenishments;
+        // Calculate balance from transactions
+        const transactions = await PettyCashTransaction.find({ float: float._id });
+        const currentBalance = transactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
 
         return {
           ...float.toObject(),
           currentBalance,
-          totalExpenses,
-          totalReplenishments,
         };
       }),
     );
@@ -129,34 +136,14 @@ exports.getFloat = async (req, res, next) => {
     }
 
     // Calculate current balance
-    const expenses = await PettyCashExpense.find({
-      float: float._id,
-      status: { $in: ["approved", "reimbursed"] },
-    });
-    const totalExpenses = expenses.reduce(
-      (sum, exp) => sum + (exp.amount || 0),
-      0,
-    );
-
-    const replenishments = await PettyCashReplenishment.find({
-      float: float._id,
-      status: "completed",
-    });
-    const totalReplenishments = replenishments.reduce(
-      (sum, rep) => sum + (rep.actualAmount || rep.amount || 0),
-      0,
-    );
-
-    const currentBalance =
-      float.openingBalance - totalExpenses + totalReplenishments;
+    const transactions = await PettyCashTransaction.find({ float: float._id });
+    const currentBalance = transactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
 
     res.json({
       success: true,
       data: {
         ...float.toObject(),
         currentBalance,
-        totalExpenses,
-        totalReplenishments,
       },
     });
   } catch (error) {
@@ -513,26 +500,8 @@ exports.approveExpense = async (req, res, next) => {
 
     // Create transaction record
     const float = await PettyCashFloat.findById(expense.float);
-    const expenses = await PettyCashExpense.find({
-      float: expense.float,
-      status: { $in: ["approved", "reimbursed"] },
-    });
-    const totalExpenses = expenses.reduce(
-      (sum, exp) => sum + (exp.amount || 0),
-      0,
-    );
-
-    const replenishments = await PettyCashReplenishment.find({
-      float: expense.float,
-      status: "completed",
-    });
-    const totalReplenishments = replenishments.reduce(
-      (sum, rep) => sum + (rep.actualAmount || rep.amount || 0),
-      0,
-    );
-
-    const balanceAfter =
-      float.openingBalance - totalExpenses + totalReplenishments;
+    const currentBalance = await getCurrentBalance(float._id);
+    const balanceAfter = currentBalance - expense.amount;
 
     await PettyCashTransaction.create({
       company: companyId,
@@ -540,6 +509,7 @@ exports.approveExpense = async (req, res, next) => {
       type: "expense",
       reference: expense._id,
       referenceType: "PettyCashExpense",
+      voucherNumber: expense.voucherNumber, // Link to expense voucher
       amount: -expense.amount,
       balanceAfter,
       description: `Expense: ${expense.description}`,
@@ -834,28 +804,11 @@ exports.completeReplenishment = async (req, res, next) => {
 
     await replenishment.save();
 
-    // Create transaction record
+    // Get current balance before replenishment
     const float = await PettyCashFloat.findById(replenishment.float);
-    const expenses = await PettyCashExpense.find({
-      float: replenishment.float,
-      status: { $in: ["approved", "reimbursed"] },
-    });
-    const totalExpenses = expenses.reduce(
-      (sum, exp) => sum + (exp.amount || 0),
-      0,
-    );
-
-    const allReplenishments = await PettyCashReplenishment.find({
-      float: replenishment.float,
-      status: "completed",
-    });
-    const totalReplenishments = allReplenishments.reduce(
-      (sum, rep) => sum + (rep.actualAmount || rep.amount || 0),
-      0,
-    );
-
-    const balanceAfter =
-      float.openingBalance - totalExpenses + totalReplenishments;
+    const currentBalance = await getCurrentBalance(float._id);
+    const replenishAmount = replenishment.actualAmount || replenishment.amount;
+    const balanceAfter = currentBalance + replenishAmount;
 
     await PettyCashTransaction.create({
       company: companyId,
@@ -872,7 +825,6 @@ exports.completeReplenishment = async (req, res, next) => {
     // Create journal entry when replenishment is completed
     // DR: Petty Cash float's ledgerAccountId
     // CR: Source bank account ledgerAccountId (if known) else Cash in Hand
-    const replenishAmount = replenishment.actualAmount || replenishment.amount;
     if (replenishAmount > 0) {
       const floatForJournal = await PettyCashFloat.findById(
         replenishment.float,
@@ -1107,9 +1059,9 @@ exports.getReport = async (req, res, next) => {
           0,
         );
 
-        // Calculate balance
-        const currentBalance =
-          float.openingBalance - totalExpenses + totalReplenishments;
+        // Calculate balance from transactions
+        const allTransactions = await PettyCashTransaction.find({ float: float._id });
+        const currentBalance = allTransactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
 
         // Get recent transactions
         const transactions = await PettyCashTransaction.find({
@@ -1233,8 +1185,9 @@ exports.getSummary = async (req, res, next) => {
           (sum, rep) => sum + (rep.actualAmount || rep.amount || 0),
           0,
         );
-        const currentBalance =
-          float.openingBalance - totalExpenses + totalReplenishments;
+        // Calculate balance from transactions
+        const transactions = await PettyCashTransaction.find({ float: float._id });
+        const currentBalance = transactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
         const todayTotal = todayExpenses.reduce(
           (sum, exp) => sum + (exp.amount || 0),
           0,
@@ -1368,14 +1321,21 @@ exports.getFunds = async (req, res, next) => {
         const currentBalance = await getCurrentBalance(float._id);
         const replenishmentNeeded = float.floatAmount - currentBalance;
 
+        // Calculate imprest replenishment if applicable
+        const imprestData = float.imprestMode
+          ? await calculateImprestReplenishmentAmount(float._id)
+          : null;
+
         return {
           _id: float._id,
           name: float.name,
           ledgerAccountId: float.ledgerAccountId,
           custodian: float.custodian,
           floatAmount: float.floatAmount,
+          imprestMode: float.imprestMode,
           currentBalance,
           replenishmentNeeded: Math.max(0, replenishmentNeeded),
+          imprestReplenishmentAmount: imprestData?.replenishmentAmount || null,
           isActive: float.isActive,
           createdAt: float.createdAt,
         };
@@ -1404,6 +1364,7 @@ exports.createFund = async (req, res, next) => {
       custodianId,
       floatAmount,
       openingBalance,
+      imprestMode,
       notes,
     } = req.body;
 
@@ -1427,6 +1388,7 @@ exports.createFund = async (req, res, next) => {
       openingBalance: openingBalance || 0,
       floatAmount: floatAmount,
       currentBalance: openingBalance || 0,
+      imprestMode: imprestMode !== undefined ? imprestMode : true, // Default to imprest mode
       isActive: true,
       notes,
     });
@@ -1441,7 +1403,7 @@ exports.createFund = async (req, res, next) => {
         float: pettyCashFloat._id,
         type: "opening",
         amount: openingBalance,
-        balanceAfter: openingBalance,
+        balanceAfter: openingBalance, // The balance after opening is the opening balance itself
         description: "Opening balance",
         createdBy: req.user._id,
       });
@@ -1759,11 +1721,32 @@ exports.recordExpense = async (req, res, next) => {
       });
     }
 
-    // Create transaction record
+    // Create expense record with auto-generated voucher number
+    const expense = await PettyCashExpense.create({
+      company: companyId,
+      float: float._id,
+      description: description || "Petty cash expense",
+      amount,
+      expenseAccountId,
+      category: "miscellaneous",
+      date: txDate,
+      receiptNumber: receiptRef,
+      status: "approved", // Auto-approved for direct expense recording
+      approvedBy: req.user._id,
+      approvedAt: new Date(),
+    });
+
+    // Re-fetch expense to get the auto-generated voucherNumber from pre-save hook
+    const expenseWithVoucher = await PettyCashExpense.findById(expense._id);
+
+    // Create transaction record linked to expense voucher
     const transaction = await PettyCashTransaction.create({
       company: companyId,
       float: float._id,
       type: "expense",
+      reference: expenseWithVoucher._id,
+      referenceType: "PettyCashExpense",
+      voucherNumber: expenseWithVoucher.voucherNumber, // Link to expense voucher
       amount: -amount, // Negative for expense
       balanceAfter: newBalance,
       description: description || "Petty cash expense",
@@ -1830,6 +1813,8 @@ exports.recordExpense = async (req, res, next) => {
       data: {
         _id: transaction._id,
         referenceNo: transaction.referenceNo,
+        voucherNumber: expenseWithVoucher.voucherNumber,
+        expenseId: expenseWithVoucher._id,
         type: "expense",
         amount,
         balanceAfter: newBalance,
@@ -1964,11 +1949,342 @@ exports.getFundTransactions = async (req, res, next) => {
           name: float.name,
           ledgerAccountId: float.ledgerAccountId,
           floatAmount: float.floatAmount,
+          imprestMode: float.imprestMode,
           currentBalance,
           replenishmentNeeded: Math.max(0, replenishmentNeeded),
         },
         transactions: transactionsWithRunningBalance,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// =====================================================
+// CASH COUNT RECONCILIATION METHODS
+// =====================================================
+
+// @desc    Create cash count reconciliation
+// @route   POST /api/petty-cash/funds/:id/cash-count
+// @access  Private
+exports.createCashCount = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { countDate, cashDenominations, notes } = req.body;
+
+    // Find the float
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Petty cash fund not found" });
+    }
+
+    if (!float.isActive) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot count inactive petty cash fund",
+      });
+    }
+
+    // Get system balance at time of count
+    const systemBalance = await getCurrentBalance(float._id);
+
+    // Calculate physical cash total from denominations
+    const physicalCashTotal = cashDenominations.reduce(
+      (sum, denom) => sum + (denom.total || 0),
+      0,
+    );
+
+    // Calculate difference
+    const difference = physicalCashTotal - systemBalance;
+
+    // Determine difference type
+    let differenceType = "balanced";
+    if (difference < 0) {
+      differenceType = "shortage";
+    } else if (difference > 0) {
+      differenceType = "overage";
+    }
+
+    // Create reconciliation record
+    const reconciliation = await PettyCashReconciliation.create({
+      company: companyId,
+      float: float._id,
+      countDate: countDate ? new Date(countDate) : new Date(),
+      systemBalance,
+      cashDenominations,
+      physicalCashTotal,
+      difference,
+      differenceType,
+      countedBy: req.user._id,
+      status: "pending",
+      notes,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        _id: reconciliation._id,
+        reconciliationNumber: reconciliation.reconciliationNumber,
+        countDate: reconciliation.countDate,
+        systemBalance,
+        physicalCashTotal,
+        difference,
+        differenceType,
+        status: reconciliation.status,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get all reconciliations for a float
+// @route   GET /api/petty-cash/funds/:id/reconciliations
+// @access  Private
+exports.getReconciliations = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+    const { status, page = 1, limit = 20 } = req.query;
+
+    // Find the float
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Petty cash fund not found" });
+    }
+
+    const query = { company: companyId, float: id };
+    if (status) query.status = status;
+
+    const reconciliations = await PettyCashReconciliation.find(query)
+      .populate("countedBy", "name email")
+      .populate("approvedBy", "name email")
+      .sort({ countDate: -1 })
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+
+    const total = await PettyCashReconciliation.countDocuments(query);
+
+    res.json({
+      success: true,
+      count: reconciliations.length,
+      total,
+      pages: Math.ceil(total / limit),
+      data: reconciliations,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get single reconciliation
+// @route   GET /api/petty-cash/reconciliations/:id
+// @access  Private
+exports.getReconciliation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+
+    const reconciliation = await PettyCashReconciliation.findOne({
+      _id: req.params.id,
+      company: companyId,
+    })
+      .populate("float", "name")
+      .populate("countedBy", "name email")
+      .populate("approvedBy", "name email");
+
+    if (!reconciliation) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Reconciliation not found" });
+    }
+
+    res.json({
+      success: true,
+      data: reconciliation,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Approve/reject cash count and post shortage/overage
+// @route   PUT /api/petty-cash/reconciliations/:id/approve
+// @access  Private
+exports.approveReconciliation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { status, discrepancyExplanation } = req.body;
+
+    if (!["approved", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be approved or rejected",
+      });
+    }
+
+    const reconciliation = await PettyCashReconciliation.findOne({
+      _id: req.params.id,
+      company: companyId,
+    }).populate("float");
+
+    if (!reconciliation) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Reconciliation not found" });
+    }
+
+    if (reconciliation.status !== "pending") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot ${status} reconciliation with status '${reconciliation.status}'`,
+      });
+    }
+
+    reconciliation.status = status;
+    reconciliation.approvedBy = req.user._id;
+    reconciliation.approvedAt = new Date();
+    if (discrepancyExplanation) {
+      reconciliation.discrepancyExplanation = discrepancyExplanation;
+    }
+
+    // If approving and there's a shortage or overage, create journal entry
+    if (status === "approved" && reconciliation.differenceType !== "balanced") {
+      const float = reconciliation.float;
+      const difference = Math.abs(reconciliation.difference);
+
+      if (difference > 0) {
+        try {
+          const lines = [];
+
+          if (reconciliation.differenceType === "shortage") {
+            // Shortage: DR Shortage/Overage Expense, CR Petty Cash
+            lines.push(
+              JournalService.createDebitLine(
+                reconciliation.shortageOverageAccountId || DEFAULT_ACCOUNTS.otherExpenses,
+                difference,
+                `Petty cash shortage - ${reconciliation.reconciliationNumber}`,
+              ),
+              JournalService.createCreditLine(
+                float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash,
+                difference,
+                `Petty cash shortage - ${reconciliation.reconciliationNumber}`,
+              ),
+            );
+
+            // Create adjustment transaction (negative amount for shortage)
+            await PettyCashTransaction.create({
+              company: companyId,
+              float: float._id,
+              type: "adjustment",
+              amount: -difference,
+              balanceAfter: reconciliation.systemBalance - difference,
+              description: `Shortage adjustment - ${reconciliation.reconciliationNumber}`,
+              createdBy: req.user._id,
+            });
+          } else {
+            // Overage: DR Petty Cash, CR Shortage/Overage Income
+            // Use 4900 (Other Income) for overage
+            const overageAccountId = "4900";
+            lines.push(
+              JournalService.createDebitLine(
+                float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash,
+                difference,
+                `Petty cash overage - ${reconciliation.reconciliationNumber}`,
+              ),
+              JournalService.createCreditLine(
+                overageAccountId,
+                difference,
+                `Petty cash overage - ${reconciliation.reconciliationNumber}`,
+              ),
+            );
+
+            // Create adjustment transaction (positive amount for overage)
+            await PettyCashTransaction.create({
+              company: companyId,
+              float: float._id,
+              type: "adjustment",
+              amount: difference,
+              balanceAfter: reconciliation.systemBalance + difference,
+              description: `Overage adjustment - ${reconciliation.reconciliationNumber}`,
+              createdBy: req.user._id,
+            });
+          }
+
+          const journalEntry = await JournalService.createEntry(
+            companyId,
+            req.user._id,
+            {
+              date: new Date(),
+              description: `Petty Cash ${reconciliation.differenceType === "shortage" ? "Shortage" : "Overage"} - ${reconciliation.reconciliationNumber}`,
+              sourceType: "petty_cash_reconciliation",
+              sourceId: reconciliation._id,
+              sourceReference: reconciliation.reconciliationNumber,
+              lines,
+              isAutoGenerated: true,
+            },
+          );
+
+          reconciliation.journalEntryId = journalEntry._id;
+
+          // Invalidate cache
+          await invalidateCache(float._id);
+        } catch (journalError) {
+          console.error(
+            "Failed to create journal entry for reconciliation:",
+            journalError,
+          );
+          // Don't fail the approval if journal entry fails
+        }
+      }
+    }
+
+    await reconciliation.save();
+
+    res.json({
+      success: true,
+      data: reconciliation,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Get imprest replenishment calculation
+// @route   GET /api/petty-cash/funds/:id/imprest-calculation
+// @access  Private
+exports.getImprestCalculation = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { id } = req.params;
+
+    const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
+    if (!float) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Petty cash fund not found" });
+    }
+
+    const calculation = await calculateImprestReplenishmentAmount(float._id);
+
+    if (!calculation) {
+      return res.json({
+        success: true,
+        data: {
+          isImprest: false,
+          message: "Fund is not in imprest mode",
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      data: calculation,
     });
   } catch (error) {
     next(error);

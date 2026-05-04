@@ -28,6 +28,12 @@ const {
   topUp,
   recordExpense,
   getFundTransactions,
+  // Imprest and reconciliation endpoints
+  getImprestCalculation,
+  createCashCount,
+  getReconciliations,
+  getReconciliation,
+  approveReconciliation,
 } = require("../controllers/pettyCashController");
 
 const { protect } = require("../middleware/auth");
@@ -49,6 +55,18 @@ router.route("/funds/:id/top-up").post(topUp);
 router.route("/funds/:id/expense").post(recordExpense);
 
 router.route("/funds/:id/transactions").get(getFundTransactions);
+
+// Imprest replenishment calculation
+router.route("/funds/:id/imprest-calculation").get(getImprestCalculation);
+
+// Cash count reconciliation routes
+router.route("/funds/:id/cash-count").post(createCashCount);
+
+router.route("/funds/:id/reconciliations").get(getReconciliations);
+
+router.route("/reconciliations/:id").get(getReconciliation);
+
+router.route("/reconciliations/:id/approve").put(approveReconciliation);
 
 // =====================================================
 // LEGACY/EXISTING ROUTES

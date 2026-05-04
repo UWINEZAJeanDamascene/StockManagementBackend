@@ -60,6 +60,12 @@ const pettyCashExpenseSchema = new mongoose.Schema(
       url: String,
     },
     notes: String,
+    // Voucher number for tracking (format: PCV-YYYY-NNNNN)
+    voucherNumber: {
+      type: String,
+      unique: true,
+      sparse: true,
+    },
     status: {
       type: String,
       enum: ["pending", "approved", "rejected", "reimbursed"],
@@ -75,6 +81,18 @@ const pettyCashExpenseSchema = new mongoose.Schema(
     timestamps: true,
   },
 );
+
+// Auto-generate voucher number for expenses
+pettyCashExpenseSchema.pre("save", async function (next) {
+  if (this.isNew && !this.voucherNumber) {
+    const year = new Date().getFullYear();
+    const count = await mongoose.model("PettyCashExpense").countDocuments({
+      company: this.company,
+    });
+    this.voucherNumber = `PCV-${year}-${String(count + 1).padStart(5, "0")}`;
+  }
+  next();
+});
 
 // Petty Cash Float/Balance Schema (per Module 4 spec)
 const pettyCashFloatSchema = new mongoose.Schema(
@@ -117,6 +135,11 @@ const pettyCashFloatSchema = new mongoose.Schema(
       required: true,
       min: 0,
       default: 0,
+    },
+    // Imprest mode - fixed float system (true = imprest, false = fluctuating)
+    imprestMode: {
+      type: Boolean,
+      default: true, // Default to imprest for proper petty cash control
     },
     // Minimum threshold for replenishment (kept for backwards compatibility)
     minimumBalance: {
@@ -176,14 +199,16 @@ pettyCashFloatSchema.statics.invalidateCacheForLedgerAccount = async function (
 pettyCashExpenseSchema.index({ company: 1, float: 1, date: -1 });
 pettyCashExpenseSchema.index({ company: 1, status: 1 });
 
-// Pre-save middleware to calculate current balance
+// Pre-save middleware to initialize new floats
 pettyCashFloatSchema.pre("save", async function (next) {
   if (this.isNew) {
-    this.currentBalance = this.openingBalance;
+    // Set floatAmount default if not provided
     this.floatAmount = this.floatAmount || this.openingBalance;
-    this.cachedBalance = this.openingBalance;
-    this.cacheValid = true;
-    this.cacheLastComputed = new Date();
+    // currentBalance will be calculated from transactions
+    this.currentBalance = 0;
+    this.cachedBalance = 0;
+    this.cacheValid = false;
+    this.cacheLastComputed = null;
   }
   next();
 });
@@ -193,31 +218,13 @@ pettyCashFloatSchema.statics.getCurrentBalance = async function (floatId) {
   const pettyCashFloat = await this.findById(floatId);
   if (!pettyCashFloat) return 0;
 
-  // Get all approved expenses for this float
-  const PettyCashExpense = mongoose.model("PettyCashExpense");
-  const expenses = await PettyCashExpense.find({
-    float: floatId,
-    status: { $in: ["approved", "reimbursed"] },
-  });
+  // Calculate from transactions (opening transaction already includes the opening balance)
+  const PettyCashTransaction = mongoose.model("PettyCashTransaction");
+  const transactions = await PettyCashTransaction.find({ float: floatId });
 
-  const totalExpenses = expenses.reduce(
-    (sum, exp) => sum + (exp.amount || 0),
-    0,
-  );
+  const balance = transactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
 
-  // Calculate: Current Balance = Opening Balance - Total Expenses + Replenishments
-  const PettyCashReplenishment = mongoose.model("PettyCashReplenishment");
-  const replenishments = await PettyCashReplenishment.find({
-    float: floatId,
-    status: "completed",
-  });
-
-  const totalReplenishments = replenishments.reduce(
-    (sum, rep) => sum + (rep.amount || 0),
-    0,
-  );
-
-  return pettyCashFloat.openingBalance - totalExpenses + totalReplenishments;
+  return balance;
 };
 
 // Petty Cash Replenishment Request Schema
@@ -303,6 +310,118 @@ pettyCashReplenishmentSchema.index({ company: 1, float: 1, status: 1 });
 pettyCashReplenishmentSchema.index({ company: 1, status: 1 });
 pettyCashReplenishmentSchema.index({ company: 1, createdAt: -1 });
 
+// Petty Cash Cash Count / Reconciliation Schema
+// For periodic physical cash verification (daily/monthly)
+const cashCountDenominationSchema = new mongoose.Schema({
+  denomination: { type: Number, required: true }, // e.g., 100, 50, 20, 10, 5, 1, 0.5, 0.25
+  count: { type: Number, required: true, min: 0, default: 0 },
+  total: { type: Number, required: true, min: 0 }, // denomination * count
+});
+
+const pettyCashReconciliationSchema = new mongoose.Schema(
+  {
+    // Company reference
+    company: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      required: true,
+    },
+    // Float reference
+    float: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PettyCashFloat",
+      required: true,
+    },
+    // Reconciliation number (auto-generated)
+    reconciliationNumber: {
+      type: String,
+      unique: true,
+    },
+    // Count date
+    countDate: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+    // System balance at time of count
+    systemBalance: {
+      type: Number,
+      required: true,
+    },
+    // Physical cash count by denomination
+    cashDenominations: [cashCountDenominationSchema],
+    // Total physical cash counted
+    physicalCashTotal: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    // Calculated difference
+    difference: {
+      type: Number,
+      required: true,
+    },
+    // Difference type for categorization
+    differenceType: {
+      type: String,
+      enum: ["balanced", "shortage", "overage"],
+      required: true,
+    },
+    // Status of reconciliation
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "pending",
+    },
+    // Who performed the count (custodian)
+    countedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    // Who verified/approved the count (supervisor)
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    approvedAt: Date,
+    // Notes on the count
+    notes: String,
+    // Unexplained shortage/overage explanation
+    discrepancyExplanation: String,
+    // GL account for posting shortage/overage
+    shortageOverageAccountId: {
+      type: String,
+      default: "5900", // Miscellaneous Expenses for shortage, Income for overage
+    },
+    // Journal entry reference for shortage/overage adjustment
+    journalEntryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "JournalEntry",
+    },
+  },
+  {
+    timestamps: true,
+  },
+);
+
+// Indexes for efficient querying
+pettyCashReconciliationSchema.index({ company: 1, float: 1, countDate: -1 });
+pettyCashReconciliationSchema.index({ company: 1, status: 1 });
+pettyCashReconciliationSchema.index({ company: 1, reconciliationNumber: 1 });
+
+// Auto-generate reconciliation number (PCR-YYYY-NNNNN)
+pettyCashReconciliationSchema.pre("save", async function (next) {
+  if (this.isNew && !this.reconciliationNumber) {
+    const year = new Date().getFullYear();
+    const count = await mongoose
+      .model("PettyCashReconciliation")
+      .countDocuments({ company: this.company });
+    this.reconciliationNumber = `PCR-${year}-${String(count + 1).padStart(5, "0")}`;
+  }
+  next();
+});
+
 // Auto-generate replenishment number
 pettyCashReplenishmentSchema.pre("save", async function (next) {
   if (this.isNew && !this.replenishmentNumber) {
@@ -338,6 +457,12 @@ const pettyCashTransactionSchema = new mongoose.Schema(
       type: String,
       unique: true,
       sparse: true, // allows null during creation before pre-save hook runs
+    },
+    // Voucher number (PCV-YYYY-NNNNN) - links to expense voucher
+    voucherNumber: {
+      type: String,
+      unique: true,
+      sparse: true,
     },
     // Transaction type (top_up, expense per Module 4 spec)
     type: {
@@ -463,6 +588,10 @@ const PettyCashTransaction = mongoose.model(
   "PettyCashTransaction",
   pettyCashTransactionSchema,
 );
+const PettyCashReconciliation = mongoose.model(
+  "PettyCashReconciliation",
+  pettyCashReconciliationSchema,
+);
 
 // Export all models
 module.exports = {
@@ -470,4 +599,5 @@ module.exports = {
   PettyCashExpense,
   PettyCashReplenishment,
   PettyCashTransaction,
+  PettyCashReconciliation,
 };
